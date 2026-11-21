@@ -513,8 +513,13 @@ class Pipeline:
             self._view = view
             self._on_screen = list(on_screen)
         self._last_drawn = drawn
+        came_back = self._lost_line is not None and index > 0    # this camera had dropped out and returned
         self._lost_line = None
         self._fps.tick(now)
+        if came_back:
+            # Seen on the real phone: when its camera app restarts, it sends its own
+            # picture size again (1920 x 1080), so the chosen size is asked for once more.
+            self._check_phone_picture()
 
     def _too_many_failures(self, error: Exception, generation: int) -> bool:
         """Log a skipped frame. True when too many failed in a row and the loop must stop."""

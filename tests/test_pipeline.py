@@ -933,6 +933,23 @@ def test_the_offered_sizes_survive_a_phone_that_lists_one_size_while_its_camera_
     assert picture_of(pipeline) == {"current": "640x360", "offered": BY_AREA, "choice": "auto"}
 
 
+def test_the_chosen_size_is_asked_for_again_when_the_phone_drops_out_and_returns(make):
+    """Seen on the real phone: its camera app restarted and sent 1920 x 1080 again."""
+    app = FakePhoneApp()
+    source = phone_source(frames=3)
+    pipeline = make(source=source, phone_fetch=app, config=picture_config("auto")).start()
+    assert wait_until(lambda: picture_of(pipeline) and picture_of(pipeline)["current"] == "640x360")
+    assert app.sizes_asked == ["640x360"]
+
+    source.connected = False                                  # the app restarts ...
+    assert wait_until(lambda: pipeline._lost_line is not None)
+    app.current = "1920x1080"                                 # ... and comes back with its own size
+    source.connected = True
+    source.frames += 3
+    assert wait_until(lambda: app.sizes_asked == ["640x360", "640x360"])
+    assert wait_until(lambda: picture_of(pipeline)["current"] == "640x360")
+
+
 def test_auto_asks_once_for_each_connect(make):
     app = FakePhoneApp()
     pipeline = make(source=FakeSource(frames=3), phone_fetch=app,

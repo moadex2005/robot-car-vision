@@ -1678,7 +1678,7 @@ def test_template_runs_the_clock_only_while_the_delay_test_is_on():
 def test_template_full_screen_wraps_video_banners_pills_and_panel():
     page = rendered_page()
     around = ids_around(page)
-    for inside in ("video", "warning", "greetings", "things", "details", "followQuestion", "fullButton", "delay"):
+    for inside in ("video", "greetings", "things", "details", "followQuestion", "fullButton", "delay"):
         assert "watch" in around[inside], inside
     assert 'id="fullButton" type="button" aria-label="Full screen"' in page
     assert "stage.requestFullscreen()" in page and 'stage = byId("watch")' in page
@@ -1897,15 +1897,30 @@ def test_template_feature_detects_speaking_and_listening():
     assert 'recognizer.lang = "en-US";' in page
 
 
-def test_template_speaks_reactions_on_the_change_not_on_every_poll():
+def test_template_never_speaks_the_greetings_and_has_no_close_warning():
+    """The owner wants the voice only after the visitor acts, and no close warning at all:
+    the greetings stay as silent banners, any other kind of reaction is ignored."""
     page = TEMPLATE.read_text(encoding="utf-8")
     reactions = between(page, "function drawReactions(", "let online = null;")
-    assert 'if (!changed("reactions", reactions)) return;' in reactions      # the same poll again: silence
-    assert 'if (alarm && warning.hidden) say(WARNING_SPEECH, "warning");' in reactions
-    assert reactions.index("say(WARNING_SPEECH") < reactions.index("warning.hidden = !alarm;")
-    assert "const added = wanted.filter((text) => !present.has(text));" in reactions
-    assert 'if (added.length) say(added.join(" "), "greeting");' in reactions
-    assert 'WARNING_SPEECH = "Careful. A person is close in front of the car."' in page
+    assert 'if (!changed("reactions", reactions)) return;' in reactions      # the same poll again: nothing new
+    assert 'reactions.filter((r) => r.kind === "greeting")' in reactions    # only greetings are shown
+    assert 'greetings.append(make("div", "capsule greeting", text))' in reactions
+    assert "say(" not in reactions and "speak(" not in reactions
+    assert "WARNING_SPEECH" not in page and "Careful. A person is close" not in page
+    # The red capsule is gone with its markup, styles and script; errors keep their colour.
+    for gone in ('id="warning"', 'id="warningText"', 'role="alert"', "warningText", "warning.hidden",
+                 ".warning {", 'kind === "warning"'):
+        assert gone not in page, gone
+    assert "color: var(--warn)" in css_rule(page, ".msg.error")
+    # Nothing that comes with a status poll is spoken: say() is called only from these places.
+    calls = re.findall(r"(?<!function )\bsay\(([^;]*)\);", page)
+    assert sorted(calls) == sorted([
+        'text, "answer"',                                        # answerArrived: chat, follow-up, scene
+        'sentences(name, info.summary), "answer"',               # an object's description after a click
+        'sentences(data.person.name, data.person.role), "answer"',   # a person's panel after a click
+    ]), calls
+    poll = between(page, "async function poll(", "\n}\n")
+    assert "say(" not in poll and "speak(" not in poll
 
 
 def test_template_speaks_each_answer_once_and_never_an_error():
@@ -1920,9 +1935,8 @@ def test_template_speaks_each_answer_once_and_never_an_error():
     assert follow.index("if (mine !== lookup || id !== followId) return;") < follow.index("showFollowReply(reply)")
     describe = between(page, "async function describe(", "// ---- the brush")
     assert describe.index("if (mine !== lookup) return;") < describe.index("showInfo(data)")
-    # One thing at a time; the warning is cut off only by another warning or hush().
+    # One thing at a time: a new one replaces the old one.
     speak = between(page, "function speak(", "function startTalking(")
-    assert 'if (talking && talking.kind === "warning" && kind !== "warning") return;' in speak
     assert "if (!speech || hearing) return;" in speak                    # never while listening
     assert speak.index("hush();") < speak.index("setTimeout(() => startTalking(talk), SPEAK_DELAY_MS)")
     assert "MAX_SPOKEN_CHARS = 600" in page and "PIECE_CHARS = 160" in page
@@ -1996,6 +2010,168 @@ def test_template_caption_and_voice_box_are_solid_and_out_of_the_way():
     assert "display: none" in css_rule(page, ".stage:not(.is-full) .stage-mic")
     assert "backdrop-filter: none" in css_rule(page, ".glass.voice-box")
     assert "CAPTION_MS = 12000" in page
+
+
+def test_template_picks_one_voice_per_answer_and_speaks_pieces_one_after_another():
+    """Heard: one answer in two voices. The first piece must not get the browser's default
+    voice while the list of voices is still empty, and pieces must never overlap."""
+    page = TEMPLATE.read_text(encoding="utf-8")
+    start = between(page, "function startTalking(", "function speakPiece(")
+    assert "whenVoicesListed(() => {" in start
+    assert start.count("chosenVoice()") == 1 and "talk.voice = chosenVoice();" in start   # once per answer
+    assert "synth.speak(" not in start                                    # no piece before the voice is known
+    piece = between(page, "function speakPiece(", "function utterance(")
+    assert piece.count("speech.synth.speak(") == 1 and "talk.pieces[talk.next]" in piece   # one piece at a time
+    words = between(page, "function utterance(", "function pieceStarted(")
+    assert "const voice = talk.voice;" in words                           # every piece: the answer's voice
+    assert "talk.next += 1;" in words and "speakPiece(talk)" in words     # the next only after this one ended
+    assert "if (ended || talking !== talk) return;" in words              # an "end" fired twice moves on once
+    assert page.count("speech.synth.speak(") == 1
+    wait = between(page, "function whenVoicesListed(", "// ---- speaking ----")
+    assert "setTimeout(go, VOICES_WAIT_MS)" in wait and "voicesWaitedFor = true;" in wait
+    assert "VOICES_WAIT_MS = 1500" in page
+    assert 'addEventListener("voiceschanged", voicesChanged)' in page
+    assert "for (const go of waiting) go();" in between(page, "function voicesChanged()", "function listenForVoices()")
+
+
+# ---- voice: conversation mode ----------------------------------------------------------------
+
+
+def conversation_part(page):
+    return between(page, "// ---- conversation: one press", "function setUpVoice()")
+
+
+def test_template_has_the_conversation_switch_only_where_listening_exists():
+    page = rendered_page()
+    around = ids_around(page)
+    assert "voiceBox" in around["conversationSwitch"] and "voiceBox" in around["conversationRow"]
+    assert '<label class="switch voice-conversation" id="conversationRow" hidden>' in page
+    assert '<input type="checkbox" id="conversationSwitch" role="switch">' in page
+    assert "Conversation: keep listening after each answer" in page
+    script = TEMPLATE.read_text(encoding="utf-8")
+    assert 'let conversationWanted = readStored(CONVERSATION_KEY) === "on";' in script   # off by default
+    assert 'store(CONVERSATION_KEY, on ? "on" : "off");' in script
+    setup = between(script, "function setUpVoice()", "setUpVoice();\n")
+    assert "conversationRow.hidden = Recognition === null;" in setup
+    lose = between(script, "function loseListening()", "\n}\n")
+    assert "conversationRow.hidden = true;" in lose and 'conversationNext(conversation, "stop")' in lose
+
+
+def test_template_conversation_decides_its_next_state_in_one_place():
+    page = TEMPLATE.read_text(encoding="utf-8")
+    part = conversation_part(page)
+    # The state changes only in conversationNext and the three steps it calls.
+    assigned = [m.start() for m in re.finditer(r"conv\.state = ", page)]
+    allowed = [between(page, "function " + name, "\n}\n") for name in
+               ("conversationNext(", "toListening(", "toSpeaking(")]
+    assert len(assigned) == 3
+    for position in assigned:
+        assert any(page.index(body) <= position < page.index(body) + len(body) for body in allowed), position
+    for helper in ("toListening(conv", "toSpeaking(conv", "endConversation(conv", "waitThenListen(conv"):
+        assert helper in between(page, "function conversationNext(", "\n}\n"), helper
+    assert part.count("\n  conversation = null;") == 1                     # only endConversation goes idle
+    assert "\n  conversation = null;" in between(page, "function endConversation(", "\n}\n")
+    assert "drawConversation(conv);" in between(page, "function conversationNext(", "\n}\n")
+    # The rest of the page only reports events to it.
+    for event in ('"press", button', '"stop"', '"quiet"', '"ready"', '"heard"', '"silence"', '"failed"'):
+        assert f"conversationNext(" in page and event in page, event
+
+
+def test_template_conversation_ends_leave_the_page_as_it_was():
+    page = TEMPLATE.read_text(encoding="utf-8")
+    end = between(page, "function endConversation(", "\n}\n")
+    assert "if (hearing && hearing.conversation === conv) cancelListening();" in end   # no microphone left open
+    assert "if (conv.talk && talking === conv.talk) hush();" in end                    # no answer left speaking
+    assert "clearTimeout(conv.timer);" in end and "drawConversation(conv);" in end
+    draw = between(page, "function drawConversation(", "\n}\n")
+    assert "conv.label" in draw and "conv.title" in draw and "delete button.dataset.talk;" in draw
+    # A turn that was not sent leaves the field as it was; the placeholder comes back with each turn.
+    turn = between(page, "function turnEnded(", "\n}\n")
+    assert "if (!sendable) target.field.value = session.before;" in turn
+    assert "showListening(session, false);" in between(page, "function endListening(", "function sendHeard(")
+    # Every way out: the same microphone, Escape, the panel, the full view, the switch, a lost API.
+    assert 'conversationNext(conversation, "press", button)' in between(page, "function pressMic(", "\n}\n")
+    stop = between(page, "function stopVoice()", "\n}\n")
+    assert 'conversationNext(conversation, "stop");' in stop and "hush();" in stop
+    assert stop.index("if (conversation)") < stop.index("return cancelListening() || hush();")
+    assert 'conversation.where === "follow") conversationNext(conversation, "stop")' in page
+    assert "voiceViewChanged();" in between(page, "function enterFullView()", "function leaveFullView()")
+    assert "voiceViewChanged();" in between(page, "function leaveFullView()", "function toggleFullView()")
+    assert "conversation.button === stageMic" in between(page, "function voiceViewChanged()", "\n}\n")
+    assert 'conversationNext(conversation, "stop")' in between(page, "function setConversationWanted(", "\n}\n")
+
+
+def test_template_conversation_never_listens_while_the_page_speaks():
+    page = TEMPLATE.read_text(encoding="utf-8")
+    decide = between(page, "function conversationNext(", "\n}\n")
+    assert 'if (conv.state === "speaking") waitThenListen(conv);' in decide            # "quiet": wait
+    assert 'if (conv.state === "speaking" && !talking) toListening(conv);' in decide   # "ready": look again
+    wait = between(page, "function waitThenListen(", "\n}\n")
+    assert "speech ? AFTER_SPEECH_MS : NO_SPEECH_WAIT_MS" in wait and "NO_SPEECH_WAIT_MS = 1500" in page
+    # Every way speech stops tells the conversation: the end, hush() (also the last-resort timer)
+    # and a speaking API that broke.
+    for function in ("function talkEnded(", "function hush(", "function loseSpeech("):
+        assert "talkStopped();" in between(page, function, "\n}\n"), function
+    speaking = between(page, "function toSpeaking(", "\n}\n")
+    assert 'if (speech) speak(answer, "answer");' in speaking               # even with "Speak the answers" off
+    assert "if (!talking) waitThenListen(conv);" in speaking
+    # The answer is spoken by the conversation, never a second time by say().
+    arrived = between(page, "function answerArrived(", "\n}\n")
+    assert 'if (conversationWaitsFor(where)) {' in arrived
+    assert '} else if (!isProblem) say(text, "answer");' in arrived
+    # Each turn is an ordinary listening session, with its own once-only end.
+    assert "startListening(conv.button, target, conv);" in page
+    assert "conversation: conv || null" in page
+    end = between(page, "function endListening(", "function sendHeard(")
+    assert end.index("if (session.done) return;") < end.index("turnEnded(session);")
+
+
+def stop_words_pattern(page):
+    match = re.search(r"const STOP_WORDS = /(.+)/;", page)
+    assert match
+    return re.compile(match.group(1))
+
+
+@pytest.mark.parametrize("said", ["stop", "Stop.", "STOP", "goodbye", "Goodbye.", "bye", "Bye.",
+                                  "that's all", "That's all.", "thank you", "Thank you.", "Thank you!"])
+def test_conversation_stop_words_are_the_whole_sentence(said):
+    page = TEMPLATE.read_text(encoding="utf-8")
+    cleaned = " ".join(said.lower().split())            # what isStopWords does before the test
+    assert stop_words_pattern(page).fullmatch(cleaned)
+
+
+@pytest.mark.parametrize("said", ["how do I stop the car", "stop the car", "please stop", "bye bye now",
+                                  "thank you for the answer", "that's all I wanted to ask about the wheels"])
+def test_conversation_stop_words_inside_a_question_do_not_stop_it(said):
+    page = TEMPLATE.read_text(encoding="utf-8")
+    assert not stop_words_pattern(page).fullmatch(" ".join(said.lower().split()))
+
+
+def test_template_conversation_stop_words_and_silence_end_it_with_a_plain_message():
+    page = TEMPLATE.read_text(encoding="utf-8")
+    assert 'const STOP_REPLY = "Okay.";' in page and "MAX_MISSES = 2" in page
+    assert "asText(words).toLowerCase()" in between(page, "function isStopWords(", "\n}\n")
+    decide = between(page, "function conversationNext(", "\n}\n")
+    heard = decide[decide.index('case "heard":'):decide.index('case "silence":')]
+    assert heard.index("isStopWords(") < heard.index("sendHeard(")       # never sent as a question
+    assert "detail.target.reply(STOP_REPLY);" in heard and "conv.misses = 0;" in heard
+    silence = decide[decide.index('case "silence":'):decide.index('case "failed":')]
+    assert "detail.target.problem(NOTHING_HEARD);" in silence
+    assert 'SILENT_ERRORS = ["no-speech", "no-match"]' in page
+    for target in ("function chatTarget()", "function followTarget()", "function stageTarget()"):
+        assert "reply" in between(page, target, "\n}\n"), target
+
+
+def test_template_conversation_marks_follow_the_animation_rule():
+    page = TEMPLATE.read_text(encoding="utf-8")
+    for state in ("listening", "thinking", "speaking"):
+        rule = css_rule(page, f'.mic-button[data-talk="{state}"], .frame-button[data-talk="{state}"]')
+        assert "outline:" in rule and "animation" not in rule, state
+    rules = [line for line in page.splitlines() if line.strip().startswith(".") and "data-talk" in line]
+    assert len(rules) == 4 and not [line for line in rules if "animation" in line]
+    labels = between(page, "const CONVERSATION_LABELS = {", "};")
+    for state in ("listening", "thinking", "speaking"):
+        assert f"{state}: \"Conversation: {state}." in labels, state
 
 
 # ---- which files may use flask --------------------------------------------------------------

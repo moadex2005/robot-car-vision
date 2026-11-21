@@ -13,9 +13,8 @@ picture size to ask the phone for to /api/camera/picture.
 The People section of the page adds, edits and removes the person folders
 (/api/people, through people.PeopleBook) and takes a person's photos from the
 live camera (/api/people/<id>/photos, then /api/people/photos for the
-progress). The Notes section reads and writes the assistant's notes file
-(/api/notes). /api/scene asks the assistant to describe the whole picture.
-After every such change the assistant reads its notes and briefs again.
+progress); after every such change the assistant reads its notes and briefs
+again. /api/scene asks the assistant to describe the whole picture.
 Start it with
 
     .venv\\Scripts\\python.exe -m car_vision.app
@@ -32,9 +31,7 @@ import argparse
 import base64
 import logging
 import math
-import os
 import secrets
-import shutil
 import socket
 import sys
 import threading
@@ -89,12 +86,10 @@ TOO_MANY_FOLLOW_UPS = (f"That is {MAX_FOLLOW_UPS} questions about this one alrea
 UNKNOWN_PERSON = "There is nothing to ask about a person the camera does not recognise."
 CAMERA_FILE = "data/camera.json" # the last phone address asked for (git-ignored)
 
-MAX_NOTES_CHARS = 50_000         # the notes file the page may save
 MAX_ID_CHARS = 100               # a person id in an address is never longer
 PHOTO_COUNT = 5                  # photos taken when the page does not say how many
 NO_PEOPLE = ("Adding people from the page is not available: "
              "recognizer.photos_dir is not set in config.yaml.")
-NO_NOTES = "Editing the notes from the page is not available: assistant.notes_file is not set in config.yaml."
 NO_SUCH_PERSON = "There is no such person. Reload the page to see who is there."
 NO_PICTURE = "There is no picture from the camera yet. Please try again in a moment."
 PERSON_SHAPE = ('Send the person as JSON, like {"name": "Sara Ahmed", "role": "Team lead", '
@@ -385,7 +380,7 @@ def read_point(point: Any) -> tuple[float, float] | None:
     return None if x is None or y is None else (x, y)
 
 
-# ---- people, notes and the assistant reading them again ------------------------------------
+# ---- people, and the assistant reading its notes and briefs again ---------------------------
 
 
 def is_person_id(person_id: str) -> bool:
@@ -475,47 +470,6 @@ class PhotoWatch:
             return state == "done"
 
 
-def notes_problem(text: Any) -> str | None:
-    """Why this text cannot be saved as the notes, or None when it is fine."""
-    if not isinstance(text, str):
-        return 'Send the notes as JSON, like {"text": "# Our robot car ..."}.'
-    if len(text) > MAX_NOTES_CHARS:
-        return f"The notes may be at most {MAX_NOTES_CHARS} characters long; these are {len(text)}."
-    try:
-        text.encode("utf-8")
-    except UnicodeEncodeError:                 # e.g. half of a character pair from a broken paste
-        return "The notes contain a character that cannot be saved. Please remove it and save again."
-    return None
-
-
-def read_notes(path: Path) -> str:
-    """The notes file's text; "" when there is no file yet."""
-    if not path.exists():
-        return ""
-    return path.read_text(encoding="utf-8-sig")
-
-
-def write_notes(path: Path, text: str) -> None:
-    """Write the notes as UTF-8 so the file is never half written, keeping the old file as .bak.
-
-    The new text goes to a temporary file in the same folder first; only when that
-    is complete is the old file copied to <name>.bak and replaced in one step.
-    """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.partial")
-    try:
-        with open(temporary, "w", encoding="utf-8", newline="") as file:
-            file.write(text)
-            file.flush()
-            os.fsync(file.fileno())
-        if path.exists():
-            shutil.copy2(path, path.with_name(path.name + ".bak"))
-        os.replace(temporary, path)
-    finally:
-        if temporary.exists():
-            temporary.unlink()
-
-
 # ---- the web server ------------------------------------------------------------
 
 
@@ -530,13 +484,13 @@ def question_problem(question: str) -> str | None:
 
 
 def create_app(pipeline: Any, assistant: Any, camera_file: Path | None = None,
-               people: PeopleBook | None = None, notes_file: Path | None = None) -> Flask:
+               people: PeopleBook | None = None) -> Flask:
     """The Flask app for one pipeline and one assistant (real ones, or fakes in the tests).
 
     `camera_file` is where /api/camera remembers the phone's address; with None
     (as in most tests) the address is used but not remembered. `people` is the
-    book of person folders and `notes_file` the assistant's notes; with None the
-    page hides its People or Notes section and those routes answer with a plain error.
+    book of person folders; with None the page hides its People section and those
+    routes answer with a plain error.
     """
     app = Flask(__name__)
     inspections = InspectionStore()
@@ -547,8 +501,7 @@ def create_app(pipeline: Any, assistant: Any, camera_file: Path | None = None,
     @app.get("/")
     def page() -> str:
         return render_template("index.html", max_question_chars=MAX_QUESTION_CHARS,
-                               has_people=people is not None, has_notes=notes_file is not None,
-                               max_notes_chars=MAX_NOTES_CHARS, max_name=MAX_NAME, max_role=MAX_ROLE,
+                               has_people=people is not None, max_name=MAX_NAME, max_role=MAX_ROLE,
                                max_story=MAX_STORY, max_lines=MAX_LINES, max_line=MAX_LINE)
 
     @app.get("/video")
@@ -812,38 +765,6 @@ def create_app(pipeline: Any, assistant: Any, camera_file: Path | None = None,
         pipeline.cancel_photos()
         return jsonify(ok=True)
 
-    # ---- the notes ------------------------------------------------------------------
-
-    @app.get("/api/notes")
-    def notes_read() -> Any:
-        if notes_file is None:
-            return jsonify(error=NO_NOTES), 503
-        try:
-            text = read_notes(notes_file)
-        except (OSError, UnicodeDecodeError) as error:
-            log.warning("Could not read the notes file %s: %s", notes_file, error)
-            return jsonify(error="The notes file could not be read as UTF-8 text."), 500
-        response = jsonify(text=text)
-        response.headers["Cache-Control"] = "no-store"
-        return response
-
-    @app.put("/api/notes")
-    def notes_write() -> Any:
-        if notes_file is None:
-            return jsonify(error=NO_NOTES), 503
-        body = request.get_json(silent=True)
-        text = body.get("text") if isinstance(body, dict) else None
-        problem = notes_problem(text)
-        if problem is not None:                       # nothing is written
-            return jsonify(error=problem), 400
-        try:
-            write_notes(notes_file, text)
-        except OSError as error:
-            log.warning("Could not write the notes file %s: %s", notes_file, error)
-            return jsonify(error="The notes could not be saved. Is the file open in another program?"), 500
-        log.info("The notes were saved from the page (%d characters)", len(text))
-        return jsonify(with_warnings({"ok": True}, reload_assistant(assistant)))
-
     # ---- describe the scene --------------------------------------------------------------
 
     @app.post("/api/scene")
@@ -1074,15 +995,6 @@ def build_people_book(config: dict[str, Any]) -> PeopleBook | None:
     return PeopleBook(photos_dir, photos_dir.with_name(photos_dir.name + ".removed"))
 
 
-def notes_path(config: dict[str, Any]) -> Path | None:
-    """The assistant's notes file (assistant.notes_file); None when the setting is missing."""
-    try:
-        return resolve_path(require(section(config, "assistant"), "notes_file", str))
-    except ConfigError as error:
-        log.warning("Editing the notes from the page is off: %s", error)
-        return None
-
-
 def already_serving(host: str, port: int, timeout: float = PORT_CHECK_SECONDS) -> bool:
     """True when something already answers on host:port, e.g. a copy of this program.
 
@@ -1131,7 +1043,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Cannot start: {error}")
         return 1
     assistant = build_assistant(config, pipeline)
-    app = create_app(pipeline, assistant, camera_file, build_people_book(config), notes_path(config))
+    app = create_app(pipeline, assistant, camera_file, build_people_book(config))
 
     pipeline.start()
     print(f"Demo page: {url}   (Ctrl+C stops the program)")

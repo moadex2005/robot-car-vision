@@ -16,18 +16,18 @@ Files: `car_vision/templates/index.html` and `tests/test_app.py` only.
 
 - A **Voice** button in the navigation bar (a small speaker drawn inline, with a label for screen readers) switches speaking on and off. Off by default; the choice is remembered in `localStorage` (wrapped in `try`/`catch`). Remembered-on only takes effect after the visitor's first click or key press on the page, because browsers refuse speech before that.
 - One small module in the script owns speaking: `say(text, kind)` and `hush()`. Rules:
-  - A new thing to say replaces what is being said (cancel, then speak), except that a warning is never cut off by anything but another warning or `hush()`.
+  - A new thing to say replaces what is being said (cancel, then speak).
+  - One answer is spoken in one voice: the voice is settled before the first piece is spoken (waiting a moment for a voice list that has not arrived yet), and the pieces follow one another, never overlapping.
   - Text is cleaned for the ear before it is spoken: no URLs, no `From the web` mark, no Markdown signs; at most about 600 characters, cut at a sentence end.
   - The voice: the best English voice the browser lists (prefer names containing `Natural` or `Online`, then any `en-` voice, then the default). Voices arrive late in some browsers (`voiceschanged`).
   - `Escape` hushes before it closes anything (first press hushes, the next behaves as today). Switching voice off hushes.
-- What is spoken while voice is on:
-  - A chat answer.
-  - An object's description when it arrives in the details panel: its name, then its summary. Not the specifications list, not the sources.
+- What is spoken while voice is on. **Only things that answer something the visitor just did on this page** (the owner's decision after hearing the first build: "i need the voice just in the chat when i clicked the photo or when i text with it"):
+  - A chat answer, typed or asked by microphone.
+  - The scene description.
+  - An object's description when the visitor clicked it: its name, then its summary. Not the specifications list, not the sources.
   - A follow-up answer in the panel.
-  - A recognised person's panel: their name and role.
-  - A greeting when it appears (`Hello, Sara Ahmed!`), once per greeting.
-  - The close warning when it appears: `Careful. A person is close in front of the car.` Once each time the warning comes on, not while it stays on.
-  - Errors are not spoken.
+  - A recognised person's name and role, when the visitor opened that person's panel by clicking.
+  - **Not spoken:** greetings and the close warning (their banners stay, silent), anything that arrives through the status poll, and errors. The first build spoke greetings and the warning; the owner did not want the warning at all, and with the page open in two places the greeting was spoken twice at once in two different voices.
 - While something is being spoken, the Voice button shows it (a quiet pulsing mark made of `transform`/`opacity` on that small button only, stopped the moment speech ends; this is not an endless animation and must not run when nothing is spoken).
 
 ## Asking by voice
@@ -37,6 +37,18 @@ Files: `car_vision/templates/index.html` and `tests/test_app.py` only.
 - While listening: the button shows it, the field's placeholder says `Listening ...`, and any speaking is hushed (so the page does not hear itself). Recognition language `en-US`.
 - Plain messages, in the field's usual error place: the microphone was not allowed; nothing was heard; no internet for speech; the browser stopped listening.
 - Asking by voice works whether or not speaking is switched on.
+
+## Conversation mode (added after the first build)
+
+The owner asked for voice "like in the Claude app". The Claude API has no speech (checked: its reference has no audio input or output, and the app's voice mode is not offered to developers), so the listening and the speaking stay with the browser. What can be matched is the back-and-forth: one press, then a spoken conversation without pressing a button for every question.
+
+- In the Voice box, a switch **Conversation: keep listening after each answer** (off by default, remembered like the other voice choices; shown only where listening exists).
+- With it on, a press on any microphone starts a conversation: listen, send the question, show and **speak** the answer (the conversation speaks even when `Speak the answers` is off; with no speech synthesis in the browser the answer is shown and the page waits 1.5 seconds), then listen again by itself. The question goes where that microphone's questions go today (main chat, the open panel's thing, or from the stage: the panel's thing when one is open, else the main chat).
+- It ends when: the same microphone or Escape is pressed; the visitor says only `stop`, `goodbye`, `bye`, `that's all` or `thank you` (any letter case, with or without a full stop; these words are not sent as a question, and the page answers `Okay.` in the caption or chat and stops); nothing is heard two turns in a row; any recognition error; the details panel it was talking about closes; the page leaves or enters the full view while the stage microphone drives it.
+- A press on the microphone while the page is speaking stops the speech and listens at once (the visitor interrupts).
+- The page never listens while it speaks. After speech ends it waits the same short pause as today before listening.
+- While a conversation runs, the microphone that drives it shows which of the three states it is in (listening, thinking, speaking) by its label for screen readers and a visible mark; the marks follow the page's animation rule (they run only during the conversation and the template test must still pass or be extended honestly).
+- Tests with the recording fakes, as for the rest of voice: three turns in a row with one press; each way of ending; an interruption; silence twice; a greeting and a warning arriving mid-conversation are not spoken; the switch off behaves exactly as before.
 
 ## Privacy line
 

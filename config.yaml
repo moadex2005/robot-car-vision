@@ -46,8 +46,6 @@ assistant:
 
 reactions:
   greet_cooldown_seconds: 60        # greet the same person at most this often
-  close_box_height_ratio: 0.75      # a person whose box is taller than this share of the frame is "close"
-  close_hold_seconds: 0.5           # they must stay close this long before the warning shows
   message_seconds: 4.0              # how long a greeting stays on screen
 
 app:

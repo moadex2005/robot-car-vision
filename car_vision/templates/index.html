@@ -273,6 +273,15 @@
     background: var(--accent); color: var(--accent-text); border-color: transparent;
   }
   .voice-privacy { margin: 0; color: var(--grey); font-size: 0.85rem; line-height: 1.45; }
+  .voice-box .voice-conversation { display: flex; margin-top: 0.85rem; }
+
+  /* During a conversation the microphone that drives it shows its state with a ring that
+     does not move: solid while listening, dotted while thinking, double while speaking.
+     No animation: the ring exists only while the script has data-talk on the button. */
+  .mic-button[data-talk], .frame-button[data-talk] { outline-offset: 3px; }
+  .mic-button[data-talk="listening"], .frame-button[data-talk="listening"] { outline: 3px solid var(--accent); }
+  .mic-button[data-talk="thinking"], .frame-button[data-talk="thinking"] { outline: 3px dotted var(--accent); }
+  .mic-button[data-talk="speaking"], .frame-button[data-talk="speaking"] { outline: 5px double var(--accent); }
 
   /* ---- the camera box under the bar ----
      Almost solid instead of blurred: it may lie over the moving video. */
@@ -410,14 +419,6 @@
     font-weight: 650; letter-spacing: -0.01em; line-height: 1.2;
     animation: capsule-in 0.6s var(--spring);
   }
-  .warning {
-    background: rgba(215, 0, 21, 0.9);
-    color: #fff;
-    font-size: clamp(1.4rem, 2.2vw, 2.1rem);
-    border: 1px solid rgba(255, 255, 255, 0.35);
-    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.35), 0 16px 40px rgba(215, 0, 21, 0.45);
-  }
-  .warning svg { width: 1.15em; height: 1.15em; flex: none; }
   .greetings { display: flex; flex-direction: column; align-items: center; gap: 8px; }
   .greeting {
     color: #fff; font-size: clamp(1.2rem, 1.8vw, 1.7rem);
@@ -800,14 +801,14 @@
   .form-result { margin: 0; min-height: 1.4em; font-size: 0.92rem; font-weight: 500; text-align: center; }
   .form-result.problem { color: var(--warn); }
   .form-result .warn-text { color: var(--warn); }
-  .person-form, .photo-progress, .notes-card {
+  .person-form, .photo-progress {
     border-radius: var(--radius-big);
     padding: clamp(18px, 2.2vw, 30px);
   }
   .person-form { display: grid; gap: 0.45rem; }
   .form-title { margin: 0 0 0.5rem; font-size: 1.35rem; letter-spacing: -0.015em; }
   .person-form .field-label { margin: 0.5rem 0 0; }
-  .person-form input, .person-form textarea, .notes-card textarea {
+  .person-form input, .person-form textarea {
     width: 100%;
     background: var(--surface);
     color: var(--text);
@@ -816,8 +817,8 @@
     padding: 0.65rem 1rem;
     font: inherit; font-size: 1rem;
   }
-  .person-form textarea, .notes-card textarea { resize: vertical; line-height: 1.45; }
-  .person-form input:focus-visible, .person-form textarea:focus-visible, .notes-card textarea:focus-visible {
+  .person-form textarea { resize: vertical; line-height: 1.45; }
+  .person-form input:focus-visible, .person-form textarea:focus-visible {
     outline: 3px solid var(--accent); outline-offset: 1px;
   }
   .person-form .camera-help { margin: 0; }
@@ -831,12 +832,6 @@
   .photo-notes { margin: 0; padding: 0; list-style: none; color: var(--grey); font-size: 0.9rem; }
   .photo-notes:empty { display: none; }
 
-  /* ---- notes: one large text area ---- */
-  .notes-card { max-width: 920px; margin: 0 auto; display: grid; gap: 0.8rem; }
-  .notes-card textarea { min-height: 50svh; font-size: 0.95rem; font-family: ui-monospace, "Cascadia Mono", Consolas, monospace; }
-  .notes-warning { margin: 0; color: var(--grey); font-size: 0.9rem; }
-  .notes-warning::before { content: "Note: "; font-weight: 600; color: var(--text); }
-
   /* ---- footer ---- */
   .footer {
     max-width: 1240px; margin: 0 auto;
@@ -847,12 +842,13 @@
   }
   .footer p { margin: 0; max-width: 42rem; }
 
-  /* Narrow windows are not the target, but stay usable. With four section links, below 1200 px
-     the bar has no room for them next to the status (measured: 28 px too wide at 1000 px, and
-     "Reconnecting" is wider than "Live"), the Camera, Voice and theme buttons. The sections
-     are still reached by scrolling and by the hero's buttons. */
+  /* Narrow windows are not the target, but stay usable. The three section links need a window
+     about 1025 px wide next to the status (measured with "Reconnecting", which is wider than
+     "Live"), the Camera, Voice and theme buttons; below 1080 px they fold away, which leaves
+     some room for other fonts. The sections are still reached by scrolling and by the hero's
+     buttons. */
   .nav-links a { white-space: nowrap; }
-  @media (max-width: 1199.98px) {
+  @media (max-width: 1079.98px) {
     .nav-links { display: none; }
     .brand { margin-right: auto; }
   }
@@ -879,7 +875,6 @@
     <a href="#watch">Live view</a>
     <a href="#ask">Ask</a>
     <a href="#people" id="peopleLink"{% if not has_people %} hidden{% endif %}>People</a>
-    <a href="#knowledge" id="notesLink"{% if not has_notes %} hidden{% endif %}>Notes</a>
   </nav>
   <div class="status-pill" id="status" aria-live="off">
     <span class="dot" aria-hidden="true"></span>
@@ -953,6 +948,12 @@
     <span class="switch-track" aria-hidden="true"></span>
     <span>Speak the answers</span>
   </label>
+  <!-- Shown only where the browser can listen. -->
+  <label class="switch voice-conversation" id="conversationRow" hidden>
+    <input type="checkbox" id="conversationSwitch" role="switch">
+    <span class="switch-track" aria-hidden="true"></span>
+    <span>Conversation: keep listening after each answer</span>
+  </label>
   <label class="field-label voice-label" for="voiceChoice">Voice</label>
   <div class="picture-line voice-line">
     <select id="voiceChoice" aria-describedby="voiceHelp">
@@ -1022,14 +1023,6 @@
             <p class="caption-answer" id="captionAnswer"></p>
           </div>
           <div class="banners">
-            <div class="capsule warning" id="warning" role="alert" hidden>
-              <svg viewBox="0 0 24 24" aria-hidden="true">
-                <path d="M12 3 2 21h20L12 3z" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linejoin="round"/>
-                <path d="M12 10v5" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/>
-                <circle cx="12" cy="18" r="1.3" fill="currentColor"/>
-              </svg>
-              <span id="warningText"></span>
-            </div>
             <div class="greetings" id="greetings" aria-live="polite"></div>
             <!-- While photos of a person are taken: what they should do, also in the full view. -->
             <div class="capsule photo-capsule" id="photoCapsule" hidden></div>
@@ -1179,23 +1172,6 @@
       </div>
     </div>
   </section>
-
-  <!-- Notes: what the assistant knows about the project (data/knowledge.md). -->
-  <section class="section" id="knowledge" aria-label="Notes"{% if not has_notes %} hidden{% endif %}>
-    <div class="section-head reveal">
-      <h2>Notes</h2>
-      <p>What the assistant knows about the project. The chat answers from these notes.</p>
-    </div>
-    <form class="notes-card glass reveal" id="notesForm" autocomplete="off">
-      <label class="visually-hidden" for="notesText">The notes</label>
-      <textarea id="notesText" maxlength="{{ max_notes_chars }}" rows="18" spellcheck="true" disabled></textarea>
-      <p class="notes-warning" id="notesPlaceholder" hidden>The notes still contain [REPLACE] placeholders: the assistant may repeat them as if they were true.</p>
-      <div class="form-row">
-        <button class="pill primary" id="notesSave" type="submit" disabled>Save</button>
-        <p class="form-result" id="notesResult" aria-live="polite"></p>
-      </div>
-    </form>
-  </section>
 </main>
 
 <footer class="footer">
@@ -1220,7 +1196,7 @@ const UNKNOWN_HINT = "Add a folder with photos and an about.md for them in data/
 
 const byId = (id) => document.getElementById(id);
 const video = byId("video"), frame = byId("frame"), waiting = byId("waiting"), offline = byId("offline");
-const warning = byId("warning"), warningText = byId("warningText"), greetings = byId("greetings");
+const greetings = byId("greetings");
 const statusPill = byId("status"), liveText = byId("liveText"), notes = byId("notes");
 const sourceText = byId("source"), fpsText = byId("fps"), deviceText = byId("device"), facesText = byId("faces");
 const things = byId("things"), nothing = byId("nothing"), stage = byId("watch");
@@ -1575,20 +1551,16 @@ function drawReactions(status) {
   const reactions = asList(status.reactions).map((r) => ({ kind: asText(r.kind), text: asText(r.text) }));
   if (!changed("reactions", reactions)) return;
 
-  const alarm = reactions.find((r) => r.kind === "warning");
-  if (alarm) setText(warningText, alarm.text);
-  if (alarm && warning.hidden) say(WARNING_SPEECH, "warning");   // once each time it comes on
-  warning.hidden = !alarm;
-
+  // Only greetings are shown (and never spoken); a reaction of any other kind is ignored.
   // Keep the greetings already on screen, so they do not jump when another one arrives.
   const wanted = reactions.filter((r) => r.kind === "greeting").map((r) => r.text);
   for (const node of [...greetings.children]) {
     if (!wanted.includes(node.textContent)) node.remove();
   }
   const present = new Set([...greetings.children].map((node) => node.textContent));
-  const added = wanted.filter((text) => !present.has(text));
-  for (const text of added) greetings.append(make("div", "capsule greeting", text));
-  if (added.length) say(added.join(" "), "greeting");   // once, when they appear; two at once in one go
+  for (const text of wanted) {
+    if (!present.has(text)) greetings.append(make("div", "capsule greeting", text));
+  }
 }
 
 let online = null;          // null until the first answer, then true or false
@@ -1606,7 +1578,6 @@ function setOnline(isOnline) {
   forgetDrawn();
   clearObjects();
   greetings.replaceChildren();
-  warning.hidden = true;
   notes.replaceChildren();
   pictureRow.hidden = true;
   setState("is-offline", "Program not running");
@@ -2594,6 +2565,7 @@ function enterFullView() {
   fullView = true;
   closeCameraBox(false);               // the boxes are outside the live view
   closeVoiceBox(false);
+  voiceViewChanged();                  // a conversation driven by the stage microphone ends
   stage.classList.add("is-full");
   document.documentElement.classList.add("full-view");
   setPageBehindInert();
@@ -2607,6 +2579,7 @@ function enterFullView() {
 
 function leaveFullView() {
   fullView = false;
+  voiceViewChanged();                  // the stage microphone goes, and its conversation with it
   stage.classList.remove("is-full");
   document.documentElement.classList.remove("full-view");
   putPageBehindBack();
@@ -2644,15 +2617,24 @@ fullButton.addEventListener("click", toggleFullView);
 // no sound is ever sent to this program.
 //
 // SPEAKING (window.speechSynthesis). say(text, kind) speaks one thing; hush() stops.
-//   - A new thing replaces what is being said, except that the close warning is cut off
-//     only by another warning or by hush(). Nothing queues up: there is one "talking".
+//   - Only what the visitor asked for in this page is spoken: a chat answer, the scene
+//     description, an object's description after a click, a follow-up answer, and a
+//     recognised person's name and role after a click on them. Nothing that arrives with the
+//     status is spoken: the greetings are silent banners.
+//   - A new thing replaces what is being said. Nothing queues up: there is one "talking".
 //   - The text is cleaned for the ear first (no web addresses, no "From the web", no
 //     Markdown signs, at most about 600 characters, cut at a sentence end) and split into
 //     short pieces, because Chrome and Edge can fall silent in the middle of a long one.
+//     The pieces are spoken strictly one after another: the next is handed to the browser
+//     only when the one before has ended.
 //   - The voice: the visitor's choice from the voice box, else the most natural English
 //     voice (names with "Natural", then "Online" or "Google", then any English voice; en-US
 //     before en-GB). The language is always set to English, so a Windows set to another
-//     language cannot take over. The list of voices may arrive late ("voiceschanged").
+//     language cannot take over. The list of voices may arrive late ("voiceschanged"):
+//     while it is still empty the page waits for it a little (VOICES_WAIT_MS), then picks
+//     the voice once and uses that one voice for every piece of the answer. Without the
+//     wait, the first piece could get the browser's default voice (on Windows often a
+//     man's, "David") and the later ones the chosen natural voice.
 //   - Right after cancel(), a speak() can be swallowed, so speaking waits one short tick.
 //   - After cancel() the "end" event may never come, and some browsers have the API but
 //     never speak. So the page keeps its own record of what it says (talking), and a timer
@@ -2670,16 +2652,20 @@ fullButton.addEventListener("click", toggleFullView);
 //   - In Edge and Chrome the sound goes to Microsoft's or Google's speech service; the
 //     privacy line says so.
 //
+// CONVERSATION (the switch in the voice box). One press, then: listen, send, speak the answer,
+//   listen again, until the visitor stops it. A small state machine on top of the two halves,
+//   in its own part of the script further down; see "conversation" there.
+//
 // Every use of either API is checked first and wrapped in try/catch: where one is missing
 // or throws, its buttons are hidden and the rest of the page works as before.
 
 const VOICE_KEY = "voice";               // "on" or "off" in localStorage
 const VOICE_NAME_KEY = "voiceName";      // the chosen voice's name; none means automatic
-const WARNING_SPEECH = "Careful. A person is close in front of the car.";
 const TEST_SPEECH = "Hello. This is the voice the page will use.";
 const MAX_SPOKEN_CHARS = 600;  // about 40 seconds of speech
 const PIECE_CHARS = 160;       // pieces this short finish before Chrome's silence on long ones
 const SPEAK_DELAY_MS = 60;     // after cancel(), the next speak() waits this long
+const VOICES_WAIT_MS = 1500;   // an empty list of voices is waited for at most this long, once
 const START_WAIT_MS = 4000;    // no start (or no next piece) this soon: the browser is not speaking
 const MS_PER_CHAR = 90;        // generous: a piece that takes longer than this has stalled ...
 const PIECE_EXTRA_MS = 4000;   // ... plus this much
@@ -2726,7 +2712,9 @@ function findSpeech() {
 let speech = findSpeech();
 let voiceWanted = readStored(VOICE_KEY) === "on";   // off by default
 let pageTouched = false;       // the visitor has clicked or pressed a key: browsers allow speech now
-let talking = null;            // { kind, pieces, timer, tick } while the page says something
+let talking = null;            // { kind, pieces, next, voice, timer, tick } while the page says something
+let voiceWaiters = [];         // what waits for the list of voices to arrive
+let voicesWaitedFor = false;   // the empty list was waited for once already: never again
 
 // ---- cleaning the text for the ear ----
 
@@ -2838,43 +2826,91 @@ function drawVoiceChoices() {
   voiceChoice.value = voices.some((voice) => voice.name === wanted) ? wanted : "auto";   // gone: automatic
 }
 
+// The list of voices arrived (or changed): the voice box is drawn again, and speech that
+// waited for the list goes on.
+function voicesChanged() {
+  drawVoiceChoices();
+  const waiting = voiceWaiters;
+  voiceWaiters = [];
+  for (const go of waiting) go();
+}
+
 function listenForVoices() {
   try {
-    if (typeof speech.synth.addEventListener === "function") speech.synth.addEventListener("voiceschanged", drawVoiceChoices);
-    else speech.synth.onvoiceschanged = drawVoiceChoices;
+    if (typeof speech.synth.addEventListener === "function") speech.synth.addEventListener("voiceschanged", voicesChanged);
+    else speech.synth.onvoiceschanged = voicesChanged;
   } catch (error) {
     // the list is read again whenever the box opens
   }
+}
+
+function voicesListed() {
+  try {
+    return asList(speech.synth.getVoices()).length > 0;
+  } catch (error) {
+    return false;
+  }
+}
+
+// Run `then` once the browser has listed its voices, or after VOICES_WAIT_MS when it has not.
+// A browser that lists none is waited for only the first time.
+function whenVoicesListed(then) {
+  if (voicesWaitedFor || voicesListed()) {
+    then();
+    return;
+  }
+  let done = false;
+  const go = () => {
+    if (done) return;
+    done = true;
+    voicesWaitedFor = true;
+    then();
+  };
+  voiceWaiters.push(go);
+  setTimeout(go, VOICES_WAIT_MS);
 }
 
 // ---- speaking ----
 
 const voiceActive = () => speech !== null && voiceWanted && pageTouched;
 
-// Speak this when voice is on. `kind` is "answer", "greeting" or "warning".
+// Speak this answer when voice is on. Called only after something the visitor did.
 function say(text, kind) {
   if (voiceActive()) speak(text, kind);
 }
 
 function speak(text, kind) {
   if (!speech || hearing) return;                     // never while listening: it would hear itself
-  if (talking && talking.kind === "warning" && kind !== "warning") return;   // a warning is not cut off
   const pieces = speechPieces(earText(text));
   if (!pieces.length) return;
   hush();
-  const talk = { kind, pieces, timer: 0, tick: 0 };
+  const talk = { kind, pieces, next: 0, voice: null, timer: 0, tick: 0 };
   talking = talk;
   talk.tick = setTimeout(() => startTalking(talk), SPEAK_DELAY_MS);   // the next tick after cancel()
 }
 
+// The voice is picked once, when the list is there, and used for every piece of this talk.
 function startTalking(talk) {
   if (talking !== talk) return;
-  const voice = chosenVoice();
+  waitForTalk(talk, VOICES_WAIT_MS + START_WAIT_MS);
+  whenVoicesListed(() => {
+    if (talking !== talk) return;
+    talk.voice = chosenVoice();
+    try {
+      if (speech.synth.paused) speech.synth.resume();   // a synth left paused would stay silent
+    } catch (error) {
+      loseSpeech();
+      return;
+    }
+    speakPiece(talk);
+  });
+}
+
+// One piece at a time: the next one is handed over only when this one has ended.
+function speakPiece(talk) {
+  if (talking !== talk) return;
   try {
-    if (speech.synth.paused) speech.synth.resume();   // a synth left paused would stay silent
-    talk.pieces.forEach((piece, index) => {
-      speech.synth.speak(utterance(talk, piece, voice, index === talk.pieces.length - 1));
-    });
+    speech.synth.speak(utterance(talk, talk.pieces[talk.next]));
   } catch (error) {
     loseSpeech();
     return;
@@ -2882,12 +2918,20 @@ function startTalking(talk) {
   waitForTalk(talk, START_WAIT_MS);
 }
 
-function utterance(talk, piece, voice, last) {
+function utterance(talk, piece) {
+  const voice = talk.voice;
   const words = new speech.Utterance(piece);
   if (voice) words.voice = voice;
   words.lang = voice && voice.lang ? asText(voice.lang) : "en-US";   // English, whatever the system's language
+  let ended = false;
   words.onstart = () => pieceStarted(talk, piece);
-  words.onend = () => (last ? talkEnded(talk) : waitForTalk(talk, START_WAIT_MS));
+  words.onend = () => {
+    if (ended || talking !== talk) return;           // an "end" fired twice moves on only once
+    ended = true;
+    talk.next += 1;
+    if (talk.next < talk.pieces.length) speakPiece(talk);
+    else talkEnded(talk);
+  };
   words.onerror = () => {
     if (talking === talk) hush();
   };
@@ -2913,6 +2957,7 @@ function talkEnded(talk) {
   clearTimeout(talk.timer);
   talking = null;
   showSpeaking(false);
+  talkStopped();
 }
 
 // Stop speaking at once. True when something was being said.
@@ -2924,6 +2969,7 @@ function hush() {
     talking = null;
   }
   showSpeaking(false);
+  if (wasTalking) talkStopped();
   if (!speech) return wasTalking;
   try {
     if (wasTalking || speech.synth.speaking || speech.synth.pending) speech.synth.cancel();
@@ -2939,9 +2985,11 @@ function showSpeaking(on) {
 
 // The speaking API threw: its controls go, the rest of the page goes on.
 function loseSpeech() {
+  const wasTalking = talking !== null;
   speech = null;
   talking = null;
   showSpeaking(false);
+  if (wasTalking) talkStopped();
   closeVoiceBox(false);
   voiceButton.hidden = true;
   drawVoicePrivacy();
@@ -3032,14 +3080,17 @@ let hearing = null;            // the listening session, or null
 let captionWait = null;        // { where, question } while a caption waits for its answer
 let captionTimer = 0;
 
-// Where a spoken question goes: its field, how it is sent, where a problem is shown.
+// Where a spoken question goes: its field, how it is sent, where a problem is shown, and
+// where the conversation's own short reply ("Okay.") is shown.
 function chatTarget() {
-  return { where: "chat", field: input, send: sendChat, problem: (text) => addMessage("error", text), caption: false };
+  return { where: "chat", field: input, send: sendChat, problem: (text) => addMessage("error", text),
+           reply: (text) => addMessage("answer", text), caption: false };
 }
 
 function followTarget() {
   return { where: "follow", field: followQuestion, send: sendFollowUp,
-           problem: (text) => addFollowMessage("error", text), caption: false };
+           problem: (text) => addFollowMessage("error", text), reply: (text) => addFollowMessage("answer", text),
+           caption: false };
 }
 
 const followOpen = () => !details.hidden && !followUp.hidden && !followForm.hidden && followId !== null;
@@ -3050,23 +3101,31 @@ function stageTarget() {
   const target = followOpen() ? followTarget() : chatTarget();
   target.caption = true;
   target.problem = (text) => showCaption("", text, true, CAPTION_MS);
+  target.reply = (text) => showCaption("", text, false, CAPTION_MS);
   return target;
 }
 
 function pressMic(button, makeTarget) {
+  if (conversation) {
+    conversationNext(conversation, "press", button);   // the conversation decides: interrupt or stop
+    return;
+  }
   if (hearing) {
     cancelListening();                 // pressed again while listening: cancel, send nothing
     return;
   }
   const target = makeTarget();
-  if (!target.field.disabled) startListening(button, target);
+  if (target.field.disabled) return;
+  if (conversationWanted) startConversation(button, makeTarget);   // listen, answer aloud, listen again
+  else startListening(button, target);                             // one question
 }
 
 askMic.addEventListener("click", () => pressMic(askMic, chatTarget));
 followMic.addEventListener("click", () => pressMic(followMic, followTarget));
 stageMic.addEventListener("click", () => pressMic(stageMic, stageTarget));
 
-function startListening(button, target) {
+// `conv` is the conversation this is one turn of; none for a single question.
+function startListening(button, target, conv) {
   let recognizer;
   try {
     recognizer = new Recognition();
@@ -3079,7 +3138,8 @@ function startListening(button, target) {
     return;
   }
   const session = { recognizer, button, target, before: target.field.value, placeholder: target.field.placeholder,
-                    words: "", final: false, error: "", done: false, cancelled: false, timer: 0 };
+                    words: "", final: false, error: "", done: false, cancelled: false, timer: 0,
+                    conversation: conv || null };
   const wasTalking = hush();           // the page must not hear itself
   hearing = session;
   showListening(session, true);
@@ -3162,6 +3222,10 @@ function endListening(session) {
   clearTimeout(session.timer);
   if (hearing === session) hearing = null;
   showListening(session, false);
+  if (session.conversation) {
+    turnEnded(session);                // one turn of a conversation: it decides what comes next
+    return;
+  }
   const { target } = session;
   if (!session.cancelled && session.final && target.field.value.trim()) {
     sendHeard(target);
@@ -3175,16 +3239,18 @@ function endListening(session) {
   target.problem(LISTEN_PROBLEMS[session.error] || (session.error ? STOPPED_LISTENING : NOTHING_HEARD));
 }
 
+// True when the question was sent.
 function sendHeard(target) {
   const question = target.field.value.trim();
   const sent = target.send();          // as if Send had been pressed; it never sends an empty field
-  if (!target.caption) return;
+  if (!target.caption) return sent;
   if (!sent) {
     hideCaption();
-    return;
+    return false;
   }
   showCaption(question, "Thinking ...", false, CAPTION_WAIT_MS);
   captionWait = { where: target.where, question };
+  return true;
 }
 
 // Cancel listening without sending. True when the page was listening.
@@ -3208,6 +3274,8 @@ function showListening(session, on) {
 function loseListening() {
   Recognition = null;
   for (const button of micButtons) button.hidden = true;
+  conversationRow.hidden = true;
+  if (conversation) conversationNext(conversation, "stop");
   drawVoicePrivacy();
 }
 
@@ -3223,7 +3291,9 @@ function drawVoicePrivacy() {
 
 // Called once for each answer (or problem) of the main chat ("chat") and of the panel ("follow").
 function answerArrived(where, text, isProblem) {
-  if (!isProblem) say(text, "answer");   // errors are not spoken
+  if (conversationWaitsFor(where)) {
+    conversationNext(conversation, isProblem ? "problem" : "answer", text);   // the conversation speaks it
+  } else if (!isProblem) say(text, "answer");   // errors are not spoken
   if (!captionWait || captionWait.where !== where) return;
   const { question } = captionWait;
   captionWait = null;
@@ -3251,18 +3321,236 @@ function hideCaption() {
 
 // Another thing is shown in the panel, or it closed: nothing spoken waits for the old one.
 function panelChanged() {
+  // A conversation about the old thing ends quietly: its late answer is never spoken.
+  if (conversation && conversation.where === "follow") conversationNext(conversation, "stop");
   if (hearing && hearing.target.where === "follow") cancelListening();
   if (captionWait && captionWait.where === "follow") hideCaption();
 }
 
-// Escape: first silence (or stop listening); true when there was something to stop.
+// Escape: first silence (or stop listening, or end the conversation); true when there was
+// something to stop.
 function stopVoice() {
+  if (conversation) {
+    conversationNext(conversation, "stop");
+    hush();                            // Escape silences everything
+    return true;
+  }
   return cancelListening() || hush();
 }
+
+// ---- conversation: one press, then listen, answer aloud, listen again ----
+//
+// With the Conversation switch on, a press on a microphone starts a conversation instead of
+// one question. It is a small state machine. `conversation` is null while it is idle; while
+// it runs it is in one of three states, shown on the microphone that drives it:
+//
+//   listening --a question heard and sent--> thinking --the answer--> speaking
+//       ^                                                                |
+//       +--------------- speech over, then the same short pause --------+
+//
+// conversationNext(conv, event) is the one place that decides what happens next; the rest of
+// the page only tells it what happened (a press, what a turn heard, the answer, the end of
+// speech, the pause being over, "stop"). Every way out goes through
+// endConversation(), which closes the microphone, stops the conversation's own answer and
+// puts the microphone's label back, so the page is as it was before the press.
+//   - Each turn is an ordinary listening session (startListening), so the quirks handled
+//     there (two final results, "end" after an error, a recogniser that never ends) are
+//     handled for every turn.
+//   - It never listens while the page speaks: it waits until nothing is being said (the end
+//     event, or the last-resort timer of the speaking part), then the same pause as when a
+//     microphone is pressed (AFTER_SPEECH_MS), and looks again before it listens.
+//   - The answer is spoken even when "Speak the answers" is off; without speech in the
+//     browser it is only shown, and the page waits NO_SPEECH_WAIT_MS before listening.
+//   - Anything else the visitor makes the page say meanwhile (a click on an object, the
+//     scene) is waited for in the same way before it listens again.
+
+const CONVERSATION_KEY = "conversation";   // "on" or "off" in localStorage
+const NO_SPEECH_WAIT_MS = 1500;  // without speech, the pause between an answer and listening again
+const MAX_MISSES = 2;            // nothing heard this many turns in a row: the conversation ends
+const SILENT_ERRORS = ["no-speech", "no-match"];   // these mean nothing was heard, not a failure
+// Only the whole sentence: "Thank you." ends it, "how do I stop the car" is a question.
+const STOP_WORDS = /^(stop|goodbye|bye|that's all|thank you)[.!?]*$/;
+const STOP_REPLY = "Okay.";
+const CONVERSATION_LABELS = {
+  listening: "Conversation: listening. Press to stop",
+  thinking: "Conversation: thinking. Press to stop",
+  speaking: "Conversation: speaking. Press to interrupt",
+};
+
+const conversationRow = byId("conversationRow"), conversationSwitch = byId("conversationSwitch");
+let conversationWanted = readStored(CONVERSATION_KEY) === "on";   // off by default
+let conversation = null;       // the running conversation, or null (idle)
+
+function isStopWords(words) {
+  const cleaned = asText(words).toLowerCase().replace(/[\u2018\u2019]/g, "'").replace(/\s+/g, " ").trim();
+  return STOP_WORDS.test(cleaned);
+}
+
+function startConversation(button, makeTarget) {
+  const conv = { button, makeTarget, state: "", where: "", misses: 0, talk: null, timer: 0,
+                 label: button.getAttribute("aria-label") || "", title: button.title };
+  conversation = conv;
+  conversationNext(conv, "start");
+}
+
+// The one place that decides what the conversation does next. `event` is what just happened:
+//   "start"    a microphone was pressed with the switch on
+//   "press"    a microphone was pressed while it runs (detail: which one)
+//   "heard"    a turn ended with words (detail: the listening session)
+//   "silence"  a turn ended with nothing heard (detail: the session)
+//   "failed"   a turn ended with a recognition error (detail: the session)
+//   "answer"   the answer arrived (detail: its text); "problem": an error came instead
+//   "quiet"    the page stopped speaking: the end, a cut-off or the last-resort timer
+//   "ready"    the pause after speaking is over
+//   "stop"    Escape, the switch, the panel or the view changed: it ends quietly
+function conversationNext(conv, event, detail) {
+  if (conversation !== conv) return;            // it has ended: late events change nothing
+  switch (event) {
+    case "start":
+      toListening(conv);
+      break;
+    case "press":
+      if (detail === conv.button && conv.state === "speaking") toListening(conv);   // the visitor interrupts
+      else endConversation(conv);               // the same microphone again (or another one): stop
+      break;
+    case "heard":
+      conv.misses = 0;
+      if (isStopWords(detail.target.field.value)) {
+        detail.target.field.value = detail.before;   // not sent as a question
+        endConversation(conv);
+        detail.target.reply(STOP_REPLY);
+      } else if (sendHeard(detail.target)) {
+        conv.state = "thinking";
+      } else {
+        endConversation(conv);                  // it could not be sent (the chat was busy)
+      }
+      break;
+    case "silence":
+      conv.misses += 1;
+      if (conv.misses < MAX_MISSES) {
+        toListening(conv);
+      } else {
+        endConversation(conv);
+        detail.target.problem(NOTHING_HEARD);
+      }
+      break;
+    case "failed":
+      endConversation(conv);
+      detail.target.problem(LISTEN_PROBLEMS[detail.error] || STOPPED_LISTENING);
+      break;
+    case "answer":
+      toSpeaking(conv, asText(detail));
+      break;
+    case "problem":
+      endConversation(conv);                    // the problem is shown where the answer would be
+      break;
+    case "quiet":
+      if (conv.state === "speaking") waitThenListen(conv);
+      break;
+    case "ready":
+      if (conv.state === "speaking" && !talking) toListening(conv);   // still speaking: its "quiet" comes later
+      break;
+    default:                                    // "stop"
+      endConversation(conv);
+  }
+  drawConversation(conv);
+}
+
+// Is the conversation waiting for this answer ("chat" or "follow")?
+function conversationWaitsFor(where) {
+  return conversation !== null && conversation.state === "thinking" && conversation.where === where;
+}
+
+function toListening(conv) {
+  clearTimeout(conv.timer);
+  const target = conv.makeTarget();             // where this microphone's questions go now
+  if (target.field.disabled || (target.where === "follow" && !followOpen())) {
+    endConversation(conv);                      // the panel's chat is gone or full
+    return;
+  }
+  conv.state = "listening";
+  conv.where = target.where;
+  startListening(conv.button, target, conv);    // it hushes the page first (an interruption)
+  if (conversation === conv && !hearing) endConversation(conv);   // the browser would not listen
+}
+
+function toSpeaking(conv, answer) {
+  conv.state = "speaking";
+  const before = talking;
+  if (speech) speak(answer, "answer");          // even when "Speak the answers" is off
+  conv.talk = talking !== before ? talking : null;
+  if (!talking) waitThenListen(conv);           // nothing is being said: no speech, or nothing to say
+}
+
+function waitThenListen(conv) {
+  clearTimeout(conv.timer);
+  conv.timer = setTimeout(() => conversationNext(conv, "ready"), speech ? AFTER_SPEECH_MS : NO_SPEECH_WAIT_MS);
+}
+
+// The one way out: the microphone closes, its own answer stops, the button is as it was.
+// A message, when there is one, is shown by the caller.
+function endConversation(conv) {
+  if (conversation !== conv) return;
+  conversation = null;
+  clearTimeout(conv.timer);
+  if (hearing && hearing.conversation === conv) cancelListening();
+  if (conv.talk && talking === conv.talk) hush();
+  conv.talk = null;
+  drawConversation(conv);
+}
+
+// What one turn heard, for conversationNext. Nothing that was not sent stays in the field.
+function turnEnded(session) {
+  const { target } = session;
+  const sendable = !session.cancelled && session.final && target.field.value.trim();
+  if (!sendable) target.field.value = session.before;
+  if (session.cancelled) {                      // stopped by the conversation itself
+    if (target.caption) hideCaption();
+  } else if (sendable) {
+    conversationNext(session.conversation, "heard", session);
+  } else if (!session.error || SILENT_ERRORS.includes(session.error)) {
+    conversationNext(session.conversation, "silence", session);
+  } else {
+    conversationNext(session.conversation, "failed", session);
+  }
+}
+
+// Speech stopped (its end, a cut-off, the last-resort timer): a conversation may listen again.
+function talkStopped() {
+  if (conversation) conversationNext(conversation, "quiet");
+}
+
+// The stage microphone exists only in the full view: entering or leaving it ends its conversation.
+function voiceViewChanged() {
+  if (conversation && conversation.button === stageMic) conversationNext(conversation, "stop");
+}
+
+// The microphone that drives the conversation shows its state (label and mark); after the
+// end it gets its own label back.
+function drawConversation(conv) {
+  const { button } = conv;
+  const running = conversation === conv;
+  const label = running ? CONVERSATION_LABELS[conv.state] : conv.label;
+  button.setAttribute("aria-pressed", running ? "true" : "false");
+  button.setAttribute("aria-label", label);
+  button.title = running ? label : conv.title;
+  if (running) button.dataset.talk = conv.state;
+  else delete button.dataset.talk;
+}
+
+function setConversationWanted(on) {
+  conversationWanted = on;
+  store(CONVERSATION_KEY, on ? "on" : "off");
+  if (!on && conversation) conversationNext(conversation, "stop");
+}
+
+conversationSwitch.addEventListener("change", () => setConversationWanted(conversationSwitch.checked));
 
 function setUpVoice() {
   voiceButton.hidden = speech === null;
   for (const button of micButtons) button.hidden = Recognition === null;
+  conversationRow.hidden = Recognition === null;
+  conversationSwitch.checked = conversationWanted;
   drawVoicePrivacy();
   if (!speech) return;
   listenForVoices();
@@ -3640,62 +3928,7 @@ async function followRunningPhotos() {
   }
 }
 
-// ---- notes: what the assistant knows ------------------------------------------------------
-//
-// The text area holds data/knowledge.md. Save sends it back; the server keeps the old file as
-// knowledge.md.bak and has the assistant read the notes again. Save stays off until the notes
-// were loaded, so an empty box can never overwrite them.
-
-const notesSection = byId("knowledge"), notesForm = byId("notesForm"), notesText = byId("notesText");
-const notesSave = byId("notesSave"), notesResult = byId("notesResult"), notesPlaceholder = byId("notesPlaceholder");
-let notesLoaded = false;
-
-function drawNotesWarning() {
-  notesPlaceholder.hidden = !notesText.value.includes("[REPLACE]");
-}
-
-async function loadNotes() {
-  if (notesSection.hidden) return;
-  try {
-    const { response, data } = await getJson("/api/notes");
-    if (!response.ok || !data || typeof data.text !== "string") {
-      showResult(notesResult, errorText(data, response, "Reload the page to try again."), "", true);
-      return;
-    }
-    notesText.value = data.text;
-    notesLoaded = true;
-    notesText.disabled = false;
-    notesSave.disabled = false;
-    drawNotesWarning();
-  } catch (error) {
-    showResult(notesResult, "Program not running: the notes could not be loaded.", "", true);
-  }
-}
-
-notesText.addEventListener("input", drawNotesWarning);
-
-notesForm.addEventListener("submit", async (event) => {
-  event.preventDefault();
-  if (!notesLoaded || notesSave.disabled) return;
-  const hadFocus = document.activeElement === notesSave;
-  setBusyButton(notesSave, true, hadFocus);
-  showResult(notesResult, "Saving ...", "", false);
-  try {
-    const { response, data } = await sendJson("PUT", "/api/notes", { text: notesText.value });
-    if (response.ok && data && data.ok === true) {
-      showResult(notesResult, data.warning ? "Saved." : "Saved. The assistant answers from these notes now.", data.warning, false);
-    } else {
-      showResult(notesResult, errorText(data, response, "Please try again."), "", true);
-    }
-  } catch (error) {
-    showResult(notesResult, "Program not running: the notes could not be saved.", "", true);
-  } finally {
-    setBusyButton(notesSave, false, hadFocus);
-  }
-});
-
 loadPeople().then(followRunningPhotos);
-loadNotes();
 
 // ---- keys: Escape closes the topmost thing, F switches the full view -----------------
 

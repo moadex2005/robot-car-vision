@@ -1,4 +1,4 @@
-"""The M12 routes and page parts: people from the page, the notes editor, describe the scene.
+"""The M12 routes and page parts: people from the page, describe the scene.
 
 The people folder is a real PeopleBook in a temporary folder; the pipeline and the
 assistant are fakes that record what they were asked, in order.
@@ -8,9 +8,7 @@ import re
 
 import pytest
 
-from car_vision import app as app_module
-from car_vision.app import (MAX_NOTES_CHARS, PhotoWatch, UnavailableAssistant, build_people_book, create_app,
-                            notes_path)
+from car_vision.app import PhotoWatch, UnavailableAssistant, build_people_book, create_app
 from car_vision.assistant import Answer, AssistantError
 from car_vision.config import resolve_path
 from car_vision.people import PeopleBook
@@ -88,7 +86,7 @@ class FakeAssistant:
 
 @pytest.fixture
 def world(tmp_path):
-    """A temporary people folder with Sara (2 photos) and Omar (none), a notes file, fakes."""
+    """A temporary people folder with Sara (2 photos) and Omar (none), fakes."""
     photos_dir = tmp_path / "people"
     sara = photos_dir / "sara"
     sara.mkdir(parents=True)
@@ -103,13 +101,11 @@ def world(tmp_path):
     pipeline = FakePipeline(enrolled={"sara"}, calls=calls)
     pipeline.photos_dir = photos_dir
     assistant = FakeAssistant(calls, people_dir=photos_dir)
-    notes = tmp_path / "knowledge.md"
-    notes.write_text("# Notes\n[REPLACE] the team\n", encoding="utf-8")
     book = PeopleBook(photos_dir, tmp_path / "people.removed")
-    app = create_app(pipeline, assistant, people=book, notes_file=notes)
+    app = create_app(pipeline, assistant, people=book)
     app.testing = True
     return {"client": app.test_client(), "pipeline": pipeline, "assistant": assistant, "calls": calls,
-            "photos_dir": photos_dir, "removed_dir": tmp_path / "people.removed", "notes": notes, "tmp": tmp_path}
+            "photos_dir": photos_dir, "removed_dir": tmp_path / "people.removed", "tmp": tmp_path}
 
 
 def bare_client(**kwargs):
@@ -119,7 +115,7 @@ def bare_client(**kwargs):
     return app.test_client()
 
 
-# ---- without a people folder or a notes file -----------------------------------------------
+# ---- without a people folder -----------------------------------------------------------------
 
 
 @pytest.mark.parametrize("method, url", [
@@ -133,23 +129,21 @@ def test_people_routes_answer_a_plain_error_without_a_people_book(method, url):
 
 
 @pytest.mark.parametrize("method", ["get", "put"])
-def test_notes_routes_answer_a_plain_error_without_a_notes_file(method):
+def test_there_is_no_notes_address_any_more(method):
+    """The Notes editor was removed: no address may write the notes file from the page."""
     response = getattr(bare_client(), method)("/api/notes", json={"text": "x"})
-    assert response.status_code == 503
-    assert "assistant.notes_file" in response.get_json()["error"]
+    assert response.status_code in (404, 405)
 
 
-def test_the_page_hides_people_and_notes_when_the_server_has_neither():
+def test_the_page_hides_people_when_the_server_has_no_people_folder():
     page = bare_client().get("/").get_data(as_text=True)
     assert '<section class="section" id="people" aria-label="People" hidden>' in page
-    assert '<section class="section" id="knowledge" aria-label="Notes" hidden>' in page
-    assert '<a href="#people" id="peopleLink" hidden>' in page and '<a href="#knowledge" id="notesLink" hidden>' in page
+    assert '<a href="#people" id="peopleLink" hidden>' in page
 
 
-def test_the_page_shows_people_and_notes_when_the_server_has_both(world):
+def test_the_page_shows_people_when_the_server_has_a_people_folder(world):
     page = world["client"].get("/").get_data(as_text=True)
     assert '<section class="section" id="people" aria-label="People">' in page
-    assert '<section class="section" id="knowledge" aria-label="Notes">' in page
     assert '<a href="#people" id="peopleLink">People</a>' in page
 
 
@@ -357,73 +351,6 @@ def test_photo_watch_says_done_once_and_ignores_ends_it_did_not_start():
     assert watch.ended_done("done") is False
 
 
-# ---- notes -------------------------------------------------------------------------------------
-
-
-def test_reading_the_notes(world):
-    response = world["client"].get("/api/notes")
-    assert response.get_json() == {"text": "# Notes\n[REPLACE] the team\n"}
-
-
-def test_reading_missing_notes_gives_an_empty_text(world):
-    world["notes"].unlink()
-    assert world["client"].get("/api/notes").get_json() == {"text": ""}
-
-
-def test_saving_the_notes_keeps_a_backup_writes_utf8_then_reloads(world):
-    response = world["client"].put("/api/notes", json={"text": "# Notes\nSara builds the car. Ünïcode ✓\n"})
-    assert response.get_json() == {"ok": True}
-    assert world["notes"].read_bytes() == "# Notes\nSara builds the car. Ünïcode ✓\n".encode("utf-8")
-    backup = world["notes"].with_name("knowledge.md.bak")
-    assert backup.read_text(encoding="utf-8") == "# Notes\n[REPLACE] the team\n"
-    assert [p.name for p in world["tmp"].iterdir() if p.name.endswith(".partial")] == []
-    assert world["calls"] == ["assistant.reload"]
-
-
-@pytest.mark.parametrize("raw, message", [
-    ('{"text": 5}', "Send the notes as JSON"),
-    ('{"words": "x"}', "Send the notes as JSON"),
-    ('{"text": "' + "x" * (MAX_NOTES_CHARS + 1) + '"}', "at most 50000 characters"),
-    ('{"text": "half a pair \\ud800 here"}', "cannot be saved"),
-])
-def test_notes_that_cannot_be_saved_are_refused_and_nothing_is_written(world, raw, message):
-    response = world["client"].put("/api/notes", data=raw, content_type="application/json")
-    assert response.status_code == 400 and message in response.get_json()["error"]
-    assert world["notes"].read_text(encoding="utf-8") == "# Notes\n[REPLACE] the team\n"
-    assert not world["notes"].with_name("knowledge.md.bak").exists()
-    assert world["calls"] == []
-
-
-def test_notes_at_the_limit_are_saved(world):
-    assert world["client"].put("/api/notes", json={"text": "x" * MAX_NOTES_CHARS}).status_code == 200
-
-
-def test_a_failed_write_leaves_the_old_notes_and_no_temporary_file(world, monkeypatch):
-    def broken_replace(source, target):
-        raise PermissionError("the file is open in another program")
-
-    monkeypatch.setattr(app_module.os, "replace", broken_replace)
-    response = world["client"].put("/api/notes", json={"text": "new"})
-    assert response.status_code == 500 and "could not be saved" in response.get_json()["error"]
-    assert world["notes"].read_text(encoding="utf-8") == "# Notes\n[REPLACE] the team\n"
-    assert [p.name for p in world["tmp"].iterdir() if p.name.endswith(".partial")] == []
-    assert world["calls"] == []
-
-
-def test_saving_notes_with_a_failing_reload_answers_ok_with_a_warning(world):
-    world["assistant"].reload_error = AssistantError("The notes file could not be read.")
-    data = world["client"].put("/api/notes", json={"text": "new"}).get_json()
-    assert data["ok"] is True and "could not be read" in data["warning"]
-    assert world["notes"].read_text(encoding="utf-8") == "new"
-
-
-def test_a_new_notes_file_gets_no_backup(world):
-    world["notes"].unlink()
-    world["client"].put("/api/notes", json={"text": "first"})
-    assert world["notes"].read_text(encoding="utf-8") == "first"
-    assert not world["notes"].with_name("knowledge.md.bak").exists()
-
-
 # ---- describe the scene ----------------------------------------------------------------------
 
 
@@ -454,19 +381,18 @@ def test_the_unavailable_assistant_explains_itself_for_the_new_calls():
         standing_in.reload()
 
 
-# ---- building the book and the notes path from the settings ---------------------------------
+# ---- building the book from the settings -----------------------------------------------------
 
 
-def test_the_book_and_the_notes_come_from_the_settings():
+def test_the_book_comes_from_the_settings():
     config = {"recognizer": {"photos_dir": "data/people"}, "assistant": {"notes_file": "data/knowledge.md"}}
     book = build_people_book(config)
     assert book.photos_dir == resolve_path("data/people")
     assert book.removed_dir == resolve_path("data/people.removed")
-    assert notes_path(config) == resolve_path("data/knowledge.md")
 
 
-def test_missing_settings_turn_the_sections_off():
-    assert build_people_book({}) is None and notes_path({"assistant": {}}) is None
+def test_a_missing_setting_turns_the_people_section_off():
+    assert build_people_book({}) is None
 
 
 # ---- the page ---------------------------------------------------------------------------------
@@ -510,7 +436,7 @@ def test_the_page_follows_photos_only_while_a_session_runs(page):
     assert 'const RUNNING = ["taking", "enrolling"];' in page
     callers = [m.start() for m in re.finditer(r"followPhotos\(\);", page)]
     assert len(callers) == 3                       # after Take photos, while running, and a session found at load
-    resume = script_part(page, "async function followRunningPhotos()", "// ---- notes")
+    resume = script_part(page, "async function followRunningPhotos()", "// ---- keys")
     assert "RUNNING.includes(progress.state)" in resume
 
 
@@ -522,13 +448,17 @@ def test_the_photo_hint_is_also_a_solid_capsule_over_the_video(page):
     assert "backdrop-filter" not in capsule and "background: #1c1c1e" in capsule
 
 
-def test_the_page_has_the_notes_editor(page):
-    assert '<textarea id="notesText" maxlength="50000" rows="18" spellcheck="true" disabled></textarea>' in page
-    assert 'id="notesSave" type="submit" disabled>Save</button>' in page    # off until the notes were loaded
-    assert 'notesText.value.includes("[REPLACE]")' in page
-    assert 'sendJson("PUT", "/api/notes", { text: notesText.value })' in page
-    load = script_part(page, "async function loadNotes()", 'notesText.addEventListener("input"')
-    assert load.index("notesText.value = data.text;") < load.index("notesSave.disabled = false;")
+def test_the_page_has_no_notes_editor(page):
+    for gone in ('id="knowledge"', 'href="#knowledge"', "notesLink", "notesText", "notesSave", "notesForm",
+                 "notesResult", "notesPlaceholder", "loadNotes", "/api/notes", "notes-card", "notes-warning",
+                 "[REPLACE]"):
+        assert gone not in page, gone
+    # The People section is the last one before the footer, and its link stays.
+    assert '<a href="#people" id="peopleLink">People</a>' in page
+    tail = page[page.index('<section class="section" id="people"'):page.index('<footer class="footer">')]
+    assert "<section" not in tail[1:]
+    # The "Note:" lines under the video (the status notes) stay.
+    assert '<span class="notes" id="notes"></span>' in page
 
 
 def test_the_scene_button_sits_on_the_video_and_answers_in_caption_chat_and_voice(page):
@@ -549,16 +479,15 @@ def test_the_scene_button_sits_on_the_video_and_answers_in_caption_chat_and_voic
 def test_the_new_sections_are_outside_the_stage_so_the_full_view_makes_them_inert(page):
     from test_app import ids_around
     around = ids_around(page)
-    for element in ("people", "knowledge", "personForm", "notesText"):
+    for element in ("people", "personForm"):
         assert "watch" not in around[element], element
 
 
-def test_the_navigation_bar_links_the_new_sections_and_folds_its_links_earlier(page):
-    assert '<a href="#people" id="peopleLink">People</a>' in page
-    assert '<a href="#knowledge" id="notesLink">Notes</a>' in page
-    assert "@media (max-width: 1199.98px)" in page
-    narrow = page[page.index("@media (max-width: 1199.98px)"):]
-    assert "display: none" in narrow[:narrow.index("}")]
+def test_the_navigation_bar_links_the_sections_and_folds_its_links_when_narrow(page):
+    links = page[page.index('<nav class="nav-links"'):page.index("</nav>")]
+    assert re.findall(r'href="(#[a-z]+)"', links) == ["#watch", "#ask", "#people"]
+    match = re.search(r"@media \(max-width: (\d+)\.98px\) \{\s*\.nav-links \{ display: none; \}", page)
+    assert match, "the links fold below some width"
 
 
 def test_the_people_routes_are_named_in_the_page_as_the_server_has_them(page):

@@ -5,13 +5,11 @@ import logging
 import pytest
 
 from car_vision.config import ConfigError
-from car_vision.reactions import WARNING_TEXT, Reaction, ReactionEngine, tallest_person_ratio
+from car_vision.reactions import Reaction, ReactionEngine
 from car_vision.state import UNKNOWN, Detection, RecognizedFace, WorldSnapshot
 
 SETTINGS = {
     "greet_cooldown_seconds": 60,
-    "close_box_height_ratio": 0.75,
-    "close_hold_seconds": 0.5,
     "message_seconds": 4.0,
 }
 FRAME = (640, 480)
@@ -41,10 +39,6 @@ def snap(*faces, detections=(), frame_size=FRAME):
 
 def greetings(reactions):
     return [r.text for r in reactions if r.kind == "greeting"]
-
-
-def warned(reactions):
-    return any(r.kind == "warning" for r in reactions)
 
 
 # ---- greetings -----------------------------------------------------------
@@ -118,71 +112,20 @@ def test_unknown_faces_are_never_greeted():
         assert greetings(reactions.update(snap(STRANGER), step * 1.0)) == []
 
 
-# ---- the close warning ---------------------------------------------------
+# ---- no close warning any more -------------------------------------------
 
 
-def close():
-    return [person(400)]            # 400 / 480 = 0.83 of the frame height
-
-
-def far():
-    return [person(200)]            # 0.42
-
-
-def test_warning_only_after_the_hold_time():
+def test_a_person_filling_the_frame_gives_no_warning():
+    """The red "Person close in front of the car" warning was taken out at the owner's request."""
     reactions = engine()
-    assert not warned(reactions.update(snap(detections=close()), 0.0))
-    assert not warned(reactions.update(snap(detections=close()), 0.25))
-    shown = reactions.update(snap(detections=close()), 0.5)
-    assert Reaction("warning", WARNING_TEXT) in shown
-    assert warned(reactions.update(snap(detections=close()), 5.0))
+    for step in range(30):                              # 3 seconds very close to the camera
+        shown = reactions.update(snap(detections=[person(470)]), step / 10)
+        assert shown == []
 
 
-def test_warning_clears_on_the_first_frame_nobody_is_close():
-    reactions = engine()
-    reactions.update(snap(detections=close()), 0.0)
-    assert warned(reactions.update(snap(detections=close()), 1.0))
-    assert not warned(reactions.update(snap(detections=far()), 1.1))
-    assert not warned(reactions.update(snap(), 1.2))
-
-
-def test_short_gap_resets_the_hold():
-    reactions = engine()
-    reactions.update(snap(detections=close()), 0.0)
-    reactions.update(snap(detections=close()), 0.3)
-    reactions.update(snap(detections=far()), 0.4)                   # one frame apart
-    assert not warned(reactions.update(snap(detections=close()), 0.5))
-    assert not warned(reactions.update(snap(detections=close()), 0.75))
-    assert warned(reactions.update(snap(detections=close()), 1.0))  # 0.5 s since 0.5
-
-
-def test_zero_frame_size_gives_no_warning():
-    reactions = engine(close_hold_seconds=0)
-    for step in range(10):
-        assert not warned(reactions.update(snap(detections=close(), frame_size=(0, 0)), step * 0.5))
-
-
-def test_box_exactly_at_the_ratio_counts_as_close():
-    reactions = engine(close_hold_seconds=0)
-    assert warned(reactions.update(snap(detections=[person(360)]), 0.0))       # 360 / 480 = 0.75
-    assert not warned(reactions.update(snap(detections=[person(359)]), 0.1))
-
-
-def test_tall_boxes_that_are_not_people_do_not_warn():
-    reactions = engine(close_hold_seconds=0)
-    assert not warned(reactions.update(snap(detections=[person(470, label="chair")]), 0.0))
-
-
-def test_wide_frame_uses_its_own_height():
-    detections = [person(300, frame_height=360)]     # 300 / 360 = 0.83 in a 640 x 360 picture
-    assert tallest_person_ratio(snap(detections=detections, frame_size=(640, 360))) == pytest.approx(300 / 360)
-    assert warned(engine(close_hold_seconds=0).update(snap(detections=detections, frame_size=(640, 360)), 0.0))
-
-
-def test_warning_comes_before_greetings():
-    reactions = engine(close_hold_seconds=0)
-    shown = reactions.update(snap(SARA, detections=close()), 0.0)
-    assert [r.kind for r in shown] == ["warning", "greeting"]
+def test_a_close_known_person_is_only_greeted():
+    shown = engine().update(snap(SARA, detections=[person(470)]), 0.0)
+    assert [r.kind for r in shown] == ["greeting"]
 
 
 # ---- logging and settings ------------------------------------------------
@@ -191,29 +134,24 @@ def test_warning_comes_before_greetings():
 def test_each_start_and_end_is_logged_once_with_the_reason(caplog):
     reactions = engine()
     with caplog.at_level(logging.INFO, logger="car_vision.reactions"):
-        for step in range(20):                          # Sara close in view for 2 seconds
-            reactions.update(snap(SARA, detections=close()), step / 10)
-        for step in range(20, 60):                      # then she steps back
-            reactions.update(snap(SARA, detections=far()), step / 10)
+        for step in range(60):                          # Sara in view for 6 seconds, close to the camera
+            reactions.update(snap(SARA, detections=[person(400)]), step / 10)
     messages = [r.getMessage() for r in caplog.records if r.levelno == logging.INFO]
-    assert len(messages) == 4
+    assert len(messages) == 2
     assert sum("Greeting started" in m and "Sara Ahmed" in m for m in messages) == 1
     assert sum("Greeting ended" in m and "Sara Ahmed" in m for m in messages) == 1
-    assert sum("Close warning started" in m and "0.83" in m for m in messages) == 1
-    assert sum("Close warning ended" in m and "0.42" in m for m in messages) == 1
 
 
 def test_missing_setting_is_reported():
     settings = dict(SETTINGS)
-    del settings["close_hold_seconds"]
-    with pytest.raises(ConfigError, match="close_hold_seconds"):
+    del settings["message_seconds"]
+    with pytest.raises(ConfigError, match="message_seconds"):
         ReactionEngine(settings)
 
 
-@pytest.mark.parametrize("ratio", [0, -0.5, 1.5])
-def test_ratio_outside_zero_to_one_is_rejected(ratio):
-    with pytest.raises(ConfigError, match="close_box_height_ratio"):
-        engine(close_box_height_ratio=ratio)
+def test_the_old_warning_settings_are_simply_ignored():
+    """A config.yaml from before the warning was removed still starts the program."""
+    engine(close_box_height_ratio=0.75, close_hold_seconds=0.5)
 
 
 def test_negative_seconds_are_rejected():

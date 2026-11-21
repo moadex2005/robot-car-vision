@@ -24,7 +24,7 @@ from car_vision.phone import parse_size
 from car_vision.pipeline import (HINT_CANCELLED, HINT_CLOSER, HINT_NO_FACE, HINT_ONE_PERSON, HINT_STILL,
                                  HINT_SWITCHED, NOBODY_ENROLLED, SHARPNESS_THRESHOLD, Pipeline,
                                  next_photo_number, photo_hint, save_photo, sharpness)
-from car_vision.reactions import WARNING_TEXT, ReactionEngine
+from car_vision.reactions import ReactionEngine
 from car_vision.recognizer import FaceCheck, Recognizer
 from car_vision.state import Detection, RecognizedFace, WorldState
 
@@ -42,8 +42,7 @@ CONFIG = {
                    "people_file": "data/does-not-exist/people.json",
                    "photos_dir": "data/does-not-exist/people",
                    "embeddings_file": "data/does-not-exist/embeddings.npz"},
-    "reactions": {"greet_cooldown_seconds": 60, "close_box_height_ratio": 0.75,
-                  "close_hold_seconds": 0.0, "message_seconds": 4.0},
+    "reactions": {"greet_cooldown_seconds": 60, "message_seconds": 4.0},
     "app": {"host": "127.0.0.1", "port": 5000, "jpeg_quality": 80, "log_file": "logs/test.log"},
 }
 
@@ -277,12 +276,14 @@ def test_known_face_without_an_info_card_is_shown_by_its_id(make):
                                             "lines": [], "similarity": 0.5}]
 
 
-def test_close_warning_reaches_the_status(make):
+def test_a_person_close_to_the_camera_gives_no_warning_in_the_status(make):
+    """The close warning was removed at the owner's request: only greetings are reactions now."""
     tall = Detection("person", 0.9, (200, 10, 400, 350), 1)          # 340 / 360 of the frame
-    pipeline = make(detector=FakeDetector(detections=[tall]), recognizer=FakeRecognizer(faces=[]),
+    detector = FakeDetector(detections=[tall])
+    pipeline = make(detector=detector, recognizer=FakeRecognizer(faces=[]),
                     reactions=ReactionEngine(CONFIG["reactions"])).start()
-    assert wait_until(lambda: pipeline.status()["reactions"])
-    assert pipeline.status()["reactions"] == [{"kind": "warning", "text": WARNING_TEXT}]
+    assert wait_until(lambda: detector.calls >= 3)
+    assert pipeline.status()["reactions"] == []
 
 
 # ---- the objects list ------------------------------------------------------------------------
@@ -1395,14 +1396,6 @@ def test_a_new_frame_size_forgets_the_remembered_faces_and_checks_again_at_once(
     assert pipeline.state.snapshot().faces == ()
     assert pipeline.state.snapshot().frame_size == (1280, 720)
 
-
-@pytest.mark.parametrize("size, scale", [((640, 360), 1), ((1920, 1080), 3)])
-def test_the_close_warning_does_not_depend_on_the_frame_size(make, size, scale):
-    tall = Detection("person", 0.9, (200 * scale, 10 * scale, 400 * scale, 350 * scale), 1)   # 340 / 360
-    pipeline = make(source=FakeSource(size=size), detector=FakeDetector(detections=[tall]),
-                    recognizer=FakeRecognizer(faces=[]), reactions=ReactionEngine(CONFIG["reactions"])).start()
-    assert wait_until(lambda: pipeline.status()["reactions"])
-    assert pipeline.status()["reactions"] == [{"kind": "warning", "text": WARNING_TEXT}]
 
 
 # ---- talking with the phone: the harder cases --------------------------------------------

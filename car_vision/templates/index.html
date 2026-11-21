@@ -98,27 +98,34 @@
     }
   }
 
-  /* ---- slow colour shapes behind the glass (transform only) ---- */
+  /* ---- colour shapes behind the glass (transform only) ----
+     They move with the scroll position, not with time. Measured on the demo
+     laptop: shapes that drifted all the time made the browser redraw every
+     glass surface on every frame, which took the graphics card away from the
+     models (22 frames a second fell to about 5). Standing still costs nothing. */
   .backdrop { position: fixed; inset: 0; z-index: -1; overflow: hidden; pointer-events: none; }
   .blob { position: absolute; border-radius: 50%; }
   .blob.one {
     width: 60vmax; height: 60vmax; left: -18vmax; top: -14vmax;
     background: radial-gradient(closest-side, var(--blob-one), transparent);
-    animation: drift-one 38s ease-in-out infinite alternate;
   }
   .blob.two {
     width: 55vmax; height: 55vmax; right: -20vmax; top: 22vh;
     background: radial-gradient(closest-side, var(--blob-two), transparent);
-    animation: drift-two 46s ease-in-out infinite alternate;
   }
   .blob.three {
     width: 50vmax; height: 50vmax; left: 20vw; bottom: -30vmax;
     background: radial-gradient(closest-side, var(--blob-three), transparent);
-    animation: drift-three 52s ease-in-out infinite alternate;
   }
-  @keyframes drift-one { to { transform: translate(14vw, 10vh) scale(1.08); } }
-  @keyframes drift-two { to { transform: translate(-12vw, -8vh) scale(0.94); } }
-  @keyframes drift-three { to { transform: translate(-10vw, -14vh) scale(1.1); } }
+  @supports (animation-timeline: scroll()) {
+    .blob { animation-duration: auto; animation-timing-function: linear; animation-fill-mode: both; animation-timeline: scroll(root); }
+    .blob.one { animation-name: drift-one; }
+    .blob.two { animation-name: drift-two; }
+    .blob.three { animation-name: drift-three; }
+  }
+  @keyframes drift-one { to { transform: translate(22vw, 26vh) scale(1.15); } }
+  @keyframes drift-two { to { transform: translate(-20vw, -24vh) scale(0.9); } }
+  @keyframes drift-three { to { transform: translate(-16vw, -34vh) scale(1.2); } }
 
   /* ---- the navigation bar ---- */
   .nav {

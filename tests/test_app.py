@@ -893,6 +893,16 @@ def test_template_uses_no_inner_html_and_no_outside_resources():
         assert in_page or (address.startswith("/") and not address.startswith("//")), address
 
 
+def test_template_has_no_animation_that_runs_all_the_time_behind_the_glass():
+    """Shapes that drifted without end made the browser redraw every glass surface on
+    every frame; on the demo laptop that cut the models from 22 to about 5 frames a second."""
+    page = TEMPLATE.read_text(encoding="utf-8")
+    assert "animation-timeline: scroll(root)" in page        # the shapes follow the scroll position
+    endless = [line.strip() for line in page.splitlines() if "infinite" in line and "animation" in line]
+    # Only two small things may loop: the status dot, and the waiting dots while an answer is on its way.
+    assert all("ping" in line or "blink" in line for line in endless), endless
+
+
 def test_template_only_makes_links_for_http_and_https():
     page = TEMPLATE.read_text(encoding="utf-8")
     assert 'url.protocol !== "http:" && url.protocol !== "https:"' in page

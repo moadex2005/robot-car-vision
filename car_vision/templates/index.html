@@ -259,6 +259,22 @@
   .camera-result.problem { color: var(--warn); }
   .camera-box hr { border: 0; border-top: 1px solid var(--hairline); margin: 0.9rem 0; }
 
+  /* The picture size the phone sends: a plain select (keyboard and screen readers work as usual). */
+  .picture-row { margin-top: 0.9rem; }
+  .picture-line { display: flex; flex-wrap: wrap; align-items: center; gap: 0.45rem 0.8rem; }
+  .picture-line select {
+    flex: 1 1 14rem; min-width: 0;
+    background: var(--surface);
+    color: var(--text);
+    border: 1px solid var(--hairline);
+    border-radius: 999px;
+    padding: 0.5rem 1rem;
+    font: inherit; font-size: 0.95rem;
+    cursor: pointer;
+  }
+  .picture-line select:focus-visible { outline: 3px solid var(--accent); outline-offset: 1px; }
+  .picture-now { color: var(--grey); font-size: 0.85rem; font-variant-numeric: tabular-nums; white-space: nowrap; }
+
   /* A switch: a real checkbox (so keyboard and screen readers work), drawn as a track and knob. */
   .switch { position: relative; display: inline-flex; align-items: center; gap: 0.7rem; cursor: pointer; font-weight: 500; }
   .switch input { position: absolute; left: 0; top: 50%; width: 2.6rem; height: 1.5rem; margin: 0; transform: translateY(-50%); opacity: 0; cursor: pointer; }
@@ -709,6 +725,18 @@
     <p class="camera-help" id="cameraHelp">The address IP Webcam shows on the phone's screen, like 192.168.1.7:8080.</p>
     <p class="camera-result" id="cameraResult" aria-live="polite"></p>
   </form>
+  <!-- Shown only when the phone says which picture sizes it offers (IP Webcam does). -->
+  <div class="picture-row" id="pictureRow" hidden>
+    <label class="field-label" for="pictureChoice">Picture from the phone</label>
+    <div class="picture-line">
+      <select id="pictureChoice" aria-describedby="pictureNow pictureHelp">
+        <option value="auto">Automatic (smallest that is sharp enough)</option>
+        <option value="keep">Leave the phone as it is</option>
+      </select>
+      <span class="picture-now" id="pictureNow"></span>
+    </div>
+    <p class="camera-help" id="pictureHelp">Smaller pictures arrive sooner.<span id="pictureShown"></span></p>
+  </div>
   <hr>
   <label class="switch">
     <input type="checkbox" id="delaySwitch" role="switch">
@@ -1240,6 +1268,7 @@ function setOnline(isOnline) {
   greetings.replaceChildren();
   warning.hidden = true;
   notes.replaceChildren();
+  pictureRow.hidden = true;
   setState("is-offline", "Program not running");
 }
 
@@ -1258,6 +1287,7 @@ async function poll() {
     drawReactions(status);
     phoneUrl = asText(status.phone_url);
     drawConnecting(status);
+    drawPicture(status);
   } catch (error) {
     setOnline(false);
   } finally {
@@ -1808,6 +1838,68 @@ function drawConnecting(status) {
     connecting.hinted = true;            // still watching: "Connected" follows if it comes later
   }
 }
+
+// ---- the picture size the phone sends -------------------------------------------
+//
+// The server says what the phone sends now and which sizes it offers; null hides the row.
+// Changing the select posts the choice at once; the server asks the phone in the background.
+
+const pictureRow = byId("pictureRow"), pictureChoice = byId("pictureChoice");
+const pictureNow = byId("pictureNow"), pictureShown = byId("pictureShown");
+const autoOption = pictureChoice.options[0], keepOption = pictureChoice.options[1];
+let picturePosts = 0;          // choices sent and not answered yet; the select is left alone meanwhile
+
+// "640x360" as the page writes it: "640 × 360".
+const sizeLabel = (text) => asText(text).replace("x", " × ");
+
+function readPicture(raw) {
+  if (!raw || typeof raw !== "object") return null;
+  return { current: asText(raw.current), offered: asList(raw.offered).map(asText), choice: asText(raw.choice) };
+}
+
+// The two fixed choices, then one per offered size. A configured size the phone does not
+// offer is still shown, so the select always shows the choice in use.
+function pictureOptions(picture) {
+  const sizes = picture.offered.map((size) => new Option(sizeLabel(size), size));
+  const isWord = picture.choice === "auto" || picture.choice === "keep";
+  if (picture.choice && !isWord && !picture.offered.includes(picture.choice)) {
+    sizes.push(new Option(sizeLabel(picture.choice) + " (the phone does not offer it)", picture.choice));
+  }
+  return [autoOption, keepOption, ...sizes];
+}
+
+function drawPicture(status) {
+  const picture = readPicture(status.phone_picture);
+  pictureRow.hidden = picture === null;
+  if (picture === null) return;
+  const optionsChanged = changed("pictureOptions", { offered: picture.offered, choice: picture.choice });
+  if (optionsChanged) pictureChoice.replaceChildren(...pictureOptions(picture));
+  const choiceChanged = changed("pictureChoice", picture.choice);
+  if (optionsChanged || (choiceChanged && picturePosts === 0)) pictureChoice.value = picture.choice;
+  setText(pictureNow, picture.current ? "The phone sends " + sizeLabel(picture.current) : "");
+  // The size the page really shows is the size of the video's pictures.
+  const shown = video.naturalWidth > 0 && video.naturalHeight > 0
+    ? " The page shows " + video.naturalWidth + " × " + video.naturalHeight + " either way." : "";
+  setText(pictureShown, shown);
+}
+
+pictureChoice.addEventListener("change", async () => {
+  picturePosts += 1;
+  try {
+    const { response, data } = await postJson("/api/camera/picture", { choice: pictureChoice.value });
+    if (response.ok && data && data.ok === true) {
+      if (cameraResult.classList.contains("problem")) showCameraResult("", false);
+    } else {
+      showCameraResult(errorText(data, response, "Please try again."), true);
+      delete drawn.pictureChoice;      // the next status puts the select back to the choice in use
+    }
+  } catch (error) {
+    showCameraResult("Program not running: the choice could not be sent.", true);
+    delete drawn.pictureChoice;
+  } finally {
+    picturePosts -= 1;
+  }
+});
 
 // ---- the delay test -----------------------------------------------------------
 //

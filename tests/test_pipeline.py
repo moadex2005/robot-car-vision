@@ -5,6 +5,7 @@ No camera, model, network or graphics card is needed.
 
 import ast
 import json
+import logging
 import sys
 import threading
 import time
@@ -24,7 +25,8 @@ from car_vision.state import Detection, RecognizedFace, WorldState
 PIPELINE_FILE = Path(__file__).resolve().parent.parent / "car_vision" / "pipeline.py"
 
 CONFIG = {
-    "stream": {"source": "file", "phone_url": "http://192.168.0.2:8080/video", "webcam_index": 0,
+    "stream": {"source": "file", "phone_url": "http://192.168.0.2:8080/video", "phone_picture": "auto",
+               "webcam_index": 0,
                "file_path": "data/does-not-exist/clip.mp4", "width": 640, "height": 480,
                "reconnect_seconds": 0.01, "loop_file": True},
     "detector": {"model": "fake.pt", "models_dir": "models", "confidence": 0.4, "image_size": 640,
@@ -40,7 +42,7 @@ CONFIG = {
 }
 
 STATUS_KEYS = {"source", "connected", "fps", "device", "recognition", "notes",
-               "people", "objects", "reactions", "phone_url"}
+               "people", "objects", "reactions", "phone_url", "phone_picture"}
 
 PERSON = Detection("person", 0.9, (100, 60, 260, 300), 1)
 CHAIRS = [Detection("chair", 0.8, (400, 200, 500, 340), 2), Detection("chair", 0.7, (520, 200, 600, 340), 3)]
@@ -118,6 +120,17 @@ class FakeRecognizer:
         return self.people.get(person_id)
 
 
+class NoPhone:
+    """The network as the tests see it: nothing answers. Every address asked for is kept."""
+
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, url, timeout):
+        self.calls.append(url)
+        raise ConnectionRefusedError("nothing listens here in a test")
+
+
 def wait_until(condition, timeout=3.0):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -132,11 +145,12 @@ def make():
     """Build pipelines with fakes; every one is stopped at the end of the test."""
     made = []
 
-    def build(source=None, detector=None, recognizer=None, config=CONFIG, **kwargs):
+    def build(source=None, detector=None, recognizer=None, config=CONFIG, phone_fetch=None, **kwargs):
         pipeline = Pipeline(config,
                             source=source if source is not None else FakeSource(),
                             detector=detector if detector is not None else FakeDetector(),
                             recognizer=recognizer if recognizer is not None else FakeRecognizer(),
+                            phone_fetch=phone_fetch if phone_fetch is not None else NoPhone(),   # never the network
                             **kwargs)
         made.append(pipeline)
         return pipeline
@@ -828,6 +842,297 @@ def test_without_a_factory_the_phone_source_is_a_frame_source(make, monkeypatch)
     pipeline = make(source=FakeSource(frames=1))
     pipeline.use_phone(PHONE)
     assert built == [{**CONFIG["stream"], "source": "phone", "phone_url": PHONE}]
+
+
+# ---- the phone's picture size ---------------------------------------------------------------
+
+REAL_OFFERED = ["960x540", "800x600", "3840x2160", "1920x1080", "1280x720", "1600x1200",
+                "640x480", "640x360", "352x288", "320x240", "176x144"]
+BY_AREA = ["176x144", "320x240", "352x288", "640x360", "640x480", "800x600", "960x540",
+           "1280x720", "1600x1200", "1920x1080", "3840x2160"]
+
+
+class FakePhoneApp:
+    """Answers like IP Webcam: its status with the current size, and "Ok" to a new size.
+
+    `lies` answers Ok but keeps the old size; `gate` holds every answer until it is set.
+    """
+
+    def __init__(self, current="1920x1080", offered=REAL_OFFERED, lies=False, gate=None):
+        self.current = current
+        self.offered = list(offered)
+        self.lies = lies
+        self.gate = gate
+        self.calls = []
+        self._lock = threading.Lock()
+
+    def __call__(self, url, timeout):
+        assert timeout == 3.0
+        with self._lock:
+            self.calls.append(url)
+        if self.gate is not None:
+            assert self.gate.wait(5)
+        if url.endswith("/status.json?show_avail=1"):
+            return json.dumps({"curvals": {"video_size": self.current}, "avail": {"video_size": self.offered}})
+        size = url.partition("/settings/video_size?set=")[2]
+        if size in self.offered and not self.lies:
+            self.current = size
+        return '<?xml version="1.0" ?>\n<result>Ok</result>\n'
+
+    @property
+    def sizes_asked(self):
+        with self._lock:
+            return [url.partition("set=")[2] for url in self.calls if "set=" in url]
+
+
+class Network:
+    """Several fake phones, each at its own "host:port"."""
+
+    def __init__(self, apps_by_host):
+        self.apps = apps_by_host
+
+    def __call__(self, url, timeout):
+        return self.apps[url.split("/")[2]](url, timeout)
+
+
+def picture_config(choice):
+    return {**CONFIG, "stream": {**CONFIG["stream"], "phone_picture": choice}}
+
+
+def picture_of(pipeline):
+    return pipeline.status()["phone_picture"]
+
+
+def phone_at_start(make, app, choice="auto", **kwargs):
+    """A pipeline whose source is the phone from the start."""
+    return make(source=phone_source(), phone_fetch=app, config=picture_config(choice), **kwargs).start()
+
+
+def test_auto_asks_the_phone_for_the_best_size_and_reports_what_it_reads_back(make):
+    app = FakePhoneApp()
+    pipeline = phone_at_start(make, app)
+    assert wait_until(lambda: picture_of(pipeline) and picture_of(pipeline)["current"] == "640x360")
+    assert picture_of(pipeline) == {"current": "640x360", "offered": BY_AREA, "choice": "auto"}
+    phone = "http://192.168.0.2:8080"
+    assert app.calls == [phone + "/status.json?show_avail=1", phone + "/settings/video_size?set=640x360",
+                         phone + "/status.json?show_avail=1"]
+    json.dumps(pipeline.status())
+
+
+def test_the_offered_sizes_survive_a_phone_that_lists_one_size_while_its_camera_restarts(make):
+    """Seen on the real phone: right after a size change its status listed only the old size."""
+    class RestartingPhone(FakePhoneApp):
+        def __call__(self, url, timeout):
+            answer = super().__call__(url, timeout)
+            if "set=" in url:
+                self.offered = ["1920x1080"]          # what it lists for a moment afterwards
+            return answer
+
+    pipeline = phone_at_start(make, RestartingPhone())
+    assert wait_until(lambda: picture_of(pipeline) and picture_of(pipeline)["current"] == "640x360")
+    assert picture_of(pipeline) == {"current": "640x360", "offered": BY_AREA, "choice": "auto"}
+
+
+def test_auto_asks_once_for_each_connect(make):
+    app = FakePhoneApp()
+    pipeline = make(source=FakeSource(frames=3), phone_fetch=app,
+                    source_factory=SourceFactory(phone_source(), phone_source())).start()
+    pipeline.use_phone("http://192.168.0.2:8080/video")
+    assert wait_until(lambda: (picture_of(pipeline) or {}).get("current") == "640x360")
+    time.sleep(0.05)
+    assert app.sizes_asked == ["640x360"]
+    app.current = "1920x1080"                          # someone changed it on the phone meanwhile
+    pipeline.use_phone("http://192.168.0.2:8080/video")
+    assert wait_until(lambda: app.sizes_asked == ["640x360", "640x360"])
+    assert wait_until(lambda: (picture_of(pipeline) or {}).get("current") == "640x360")
+
+
+def test_a_phone_already_at_the_best_size_is_not_asked(make):
+    app = FakePhoneApp(current="640x360")
+    pipeline = phone_at_start(make, app)
+    assert wait_until(lambda: picture_of(pipeline) is not None)
+    time.sleep(0.05)
+    assert app.sizes_asked == [] and len(app.calls) == 1
+    assert picture_of(pipeline)["current"] == "640x360"
+
+
+def test_current_is_what_the_phone_says_after_the_change_not_what_was_asked(make, monkeypatch):
+    monkeypatch.setattr(pipeline_module, "READ_BACK_WAIT_SECONDS", 0.01)
+    app = FakePhoneApp(lies=True)                      # says Ok, keeps sending 1920 x 1080
+    pipeline = phone_at_start(make, app)
+    assert wait_until(lambda: len(app.calls) == 4)     # status, ask, read back, read back once more
+    time.sleep(0.05)
+    assert len(app.calls) == 4
+    assert picture_of(pipeline)["current"] == "1920x1080"
+
+
+def test_keep_asks_nothing(make):
+    app = FakePhoneApp()
+    pipeline = phone_at_start(make, app, choice="keep")
+    assert wait_until(lambda: picture_of(pipeline) is not None)
+    time.sleep(0.05)
+    assert app.sizes_asked == []
+    assert picture_of(pipeline) == {"current": "1920x1080", "offered": BY_AREA, "choice": "keep"}
+
+
+def test_a_fixed_size_is_asked_for(make):
+    app = FakePhoneApp()
+    pipeline = phone_at_start(make, app, choice="1280x720")
+    assert wait_until(lambda: (picture_of(pipeline) or {}).get("current") == "1280x720")
+    assert app.sizes_asked == ["1280x720"]
+    assert picture_of(pipeline)["choice"] == "1280x720"
+
+
+def test_a_fixed_size_the_phone_does_not_offer_is_ignored_with_one_warning(make, caplog):
+    caplog.set_level(logging.INFO, logger="car_vision.pipeline")
+    app = FakePhoneApp()
+    pipeline = phone_at_start(make, app, choice="1234x567")
+    assert wait_until(lambda: picture_of(pipeline) is not None)
+    time.sleep(0.05)
+    assert app.sizes_asked == []
+    warnings = [record for record in caplog.records if record.levelno == logging.WARNING]
+    assert len(warnings) == 1 and "1234x567" in warnings[0].getMessage()
+    assert picture_of(pipeline)["current"] == "1920x1080"
+
+
+@pytest.mark.parametrize("kind", ["webcam", "file"])
+def test_the_webcam_and_a_clip_never_ask_anything(make, kind):
+    app = FakePhoneApp()
+    source = FakeSource(frames=3)
+    source.source = kind
+    pipeline = make(source=source, phone_fetch=app).start()
+    assert wait_until(lambda: pipeline.latest_jpeg() is not None)
+    pipeline.set_phone_picture("auto")
+    pipeline.set_phone_picture("keep")
+    time.sleep(0.05)
+    assert app.calls == []
+    assert picture_of(pipeline) is None
+
+
+def test_another_camera_app_changes_nothing_and_shows_nothing(make):
+    nothing = NoPhone()
+    detector = FakeDetector()
+    pipeline = make(source=phone_source(frames=5), detector=detector, phone_fetch=nothing).start()
+    assert wait_until(lambda: nothing.calls and detector.calls == 5)
+    time.sleep(0.05)
+    assert nothing.calls == ["http://192.168.0.2:8080/status.json?show_avail=1"]   # asked once, gave up
+    assert picture_of(pipeline) is None
+    assert pipeline.status()["error"] is None
+
+
+def test_a_silent_phone_slows_neither_the_video_nor_the_server(make):
+    gate = threading.Event()
+    app = FakePhoneApp(gate=gate)
+    detector = FakeDetector()
+    factory = SourceFactory(phone_source(frames=5))
+    pipeline = make(source=FakeSource(frames=1), detector=detector, phone_fetch=app, source_factory=factory).start()
+    try:
+        began = time.monotonic()
+        pipeline.use_phone(PHONE)
+        assert wait_until(lambda: app.calls)               # the thread is waiting on the phone ...
+        pipeline.set_phone_picture("keep")
+        pipeline.status()
+        assert time.monotonic() - began < 0.5               # ... and nobody else waits for it
+        assert wait_until(lambda: pipeline.state.snapshot().frame_size == (320, 240))   # the video goes on
+        assert pipeline.target(track_id=2) is not None
+    finally:
+        gate.set()
+
+
+def test_the_newest_switch_wins(make):
+    gate = threading.Event()
+    first, second = FakePhoneApp(gate=gate), FakePhoneApp(current="1280x720")
+    network = Network({"192.168.1.10:8080": first, "192.168.1.11:8080": second})
+    factory = SourceFactory(phone_source(), phone_source())
+    pipeline = make(source=FakeSource(frames=1), phone_fetch=network, source_factory=factory).start()
+    try:
+        pipeline.use_phone("http://192.168.1.10:8080/video")
+        assert wait_until(lambda: first.calls)              # the first phone is slow to answer
+        pipeline.use_phone("http://192.168.1.11:8080/video")
+    finally:
+        gate.set()
+    assert wait_until(lambda: (picture_of(pipeline) or {}).get("current") == "640x360")
+    time.sleep(0.1)
+    assert first.sizes_asked == []                          # its answer came too late to matter
+    assert second.sizes_asked == ["640x360"]
+    assert picture_of(pipeline)["current"] == "640x360"
+
+
+def test_a_switch_forgets_what_the_old_phone_said(make):
+    old_phone = FakePhoneApp(current="640x360")
+    new_phone = FakePhoneApp(gate=threading.Event())        # never answers in this test
+    network = Network({"192.168.0.2:8080": old_phone, "192.168.1.7:8080": new_phone})
+    pipeline = make(source=phone_source(), phone_fetch=network, source_factory=SourceFactory(phone_source())).start()
+    assert wait_until(lambda: picture_of(pipeline) is not None)
+    pipeline.use_phone(PHONE)
+    assert picture_of(pipeline) is None
+    new_phone.gate.set()
+
+
+def test_set_phone_picture_each_form(make):
+    app = FakePhoneApp()
+    config = picture_config("keep")
+    pipeline = make(source=phone_source(), phone_fetch=app, config=config).start()
+    assert wait_until(lambda: picture_of(pipeline) is not None)
+    pipeline.set_phone_picture("1280x720")
+    assert picture_of(pipeline)["choice"] == "1280x720"    # applies at once ...
+    assert wait_until(lambda: picture_of(pipeline)["current"] == "1280x720")   # ... and the phone follows
+    pipeline.set_phone_picture(" AUTO ")
+    assert wait_until(lambda: picture_of(pipeline)["current"] == "640x360")
+    assert picture_of(pipeline)["choice"] == "auto"
+    pipeline.set_phone_picture("keep")
+    assert wait_until(lambda: picture_of(pipeline)["choice"] == "keep")
+    time.sleep(0.05)
+    assert app.sizes_asked == ["1280x720", "640x360"]
+    assert config["stream"]["phone_picture"] == "keep"        # for this run only: the settings are not changed
+
+
+@pytest.mark.parametrize("choice", ["1234x567", "huge", "", "640 x 360", "0x0", None, 640])
+def test_set_phone_picture_refuses_what_the_phone_does_not_offer(make, choice):
+    app = FakePhoneApp()
+    pipeline = phone_at_start(make, app, choice="keep")
+    assert wait_until(lambda: picture_of(pipeline) is not None)
+    calls = len(app.calls)
+    with pytest.raises(ValueError) as refused:
+        pipeline.set_phone_picture(choice)
+    assert "offer" in str(refused.value)
+    assert picture_of(pipeline)["choice"] == "keep"
+    time.sleep(0.05)
+    assert len(app.calls) == calls                          # nothing was sent
+
+
+def test_a_size_cannot_be_chosen_before_the_phone_said_what_it_offers(make):
+    pipeline = make(source=FakeSource())
+    with pytest.raises(ValueError):
+        pipeline.set_phone_picture("640x360")
+    pipeline.set_phone_picture("keep")                      # the two words always work
+    assert pipeline._picture_choice == "keep"
+
+
+@pytest.mark.parametrize("value", ["big", "", "640 by 360", 640, True, None, ["auto"]])
+def test_a_wrong_phone_picture_setting_names_the_three_forms(value):
+    with pytest.raises(ConfigError, match="auto, keep or a size like 1280x720"):
+        Pipeline(picture_config(value), source=FakeSource(), detector=FakeDetector(), recognizer=FakeRecognizer())
+
+
+def test_the_phone_picture_setting_is_required():
+    stream = {key: value for key, value in CONFIG["stream"].items() if key != "phone_picture"}
+    with pytest.raises(ConfigError, match="phone_picture"):
+        Pipeline({**CONFIG, "stream": stream}, source=FakeSource(), detector=FakeDetector(),
+                 recognizer=FakeRecognizer())
+
+
+@pytest.mark.parametrize("text, choice", [("auto", "auto"), ("Keep", "keep"), (" 1280x720 ", "1280x720"),
+                                          ("1280X720", "1280x720"), ("1280 x 720", None), ("max", None)])
+def test_picture_choice(text, choice):
+    assert pipeline_module.picture_choice(text) == choice
+
+
+def test_picture_status_sorts_the_sizes_from_small_to_large():
+    picture = pipeline_module.PhonePicture((1920, 1080), ((1280, 720), (640, 480), (800, 450), (640, 360)))
+    assert pipeline_module.picture_status(picture, "auto") == {
+        "current": "1920x1080", "offered": ["640x360", "640x480", "800x450", "1280x720"], "choice": "auto"}
+    assert pipeline_module.picture_status(None, "auto") is None
 
 
 # ---- start-up ---------------------------------------------------------------------------

@@ -4,10 +4,12 @@ Pure logic and a temporary folder: no network, no phone.
 """
 
 import ast
+import base64
 import json
 import logging
 import sys
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import pytest
 
@@ -186,6 +188,189 @@ def test_a_remembered_file_written_by_hand_is_normalised(tmp_path):
     path = tmp_path / "camera.json"
     path.write_text('{"phone_url": " 192.168.1.7 "}', encoding="utf-8")
     assert load_remembered(path) == "http://192.168.1.7:8080/video"
+
+
+# ---- the picture size ------------------------------------------------------------------
+
+# What the real phone answered (the list as it came, in no useful order).
+REAL_OFFERED = ["960x540", "800x600", "3840x2160", "1920x1080", "1280x720", "1600x1200",
+                "640x480", "640x360", "352x288", "320x240", "176x144"]
+STREAM = "http://192.168.1.7:8080/video"
+
+
+def status_json(current="1920x1080", offered=REAL_OFFERED):
+    return json.dumps({"video_connections": 1, "audio_connections": 0,
+                       "curvals": {"video_size": current, "quality": "50", "orientation": "landscape"},
+                       "avail": {"video_size": offered, "quality": ["1", "100"]}})
+
+
+class FakeFetch:
+    """Stands in for the network: records every address and hands back prepared answers."""
+
+    def __init__(self, *answers):
+        self.answers = list(answers)
+        self.calls = []
+
+    def __call__(self, url, timeout):
+        self.calls.append((url, timeout))
+        answer = self.answers.pop(0) if self.answers else "nothing prepared"
+        if isinstance(answer, BaseException):
+            raise answer
+        return answer
+
+
+REAL_SIZES = [phone.parse_size(text) for text in REAL_OFFERED]
+
+
+@pytest.mark.parametrize("text, size", [
+    ("640x360", (640, 360)), ("1920x1080", (1920, 1080)), ("1x1", (1, 1)),
+    ("640X360", None), ("640 x 360", None), (" 640x360", None), ("640x", None), ("x360", None),
+    ("0x360", None), ("640x0", None), ("-640x360", None), ("640x360x2", None), ("640.5x360", None),
+    ("123456x2", None), ("", None), (None, None), (640, None), ("٦٤٠x٣٦٠", None),
+])
+def test_parse_size(text, size):
+    assert phone.parse_size(text) == size
+
+
+def test_best_size_for_the_real_phone_is_640x360():
+    assert phone.best_size(REAL_SIZES, (1920, 1080), 640, 480) == (640, 360)
+
+
+def test_best_size_for_a_4_by_3_phone_is_640x480():
+    assert phone.best_size(REAL_SIZES, (1920, 1440), 640, 480) == (640, 480)
+
+
+def test_best_size_is_none_when_the_phone_already_sends_it():
+    assert phone.best_size(REAL_SIZES, (640, 360), 640, 480) is None
+
+
+def test_best_size_is_never_larger_than_the_current_size():
+    # The page could show 640 x 360, but the phone sends 352 x 198: nothing smaller fits, nothing larger is asked for.
+    assert phone.best_size([(640, 360), (1280, 720)], (352, 198), 640, 480) is None
+    assert phone.best_size([(1280, 720)], (960, 540), 640, 480) is None
+
+
+def test_best_size_never_picks_a_size_too_small_or_of_another_shape():
+    assert phone.best_size([(320, 180), (176, 144)], (1920, 1080), 640, 480) is None   # too small to be sharp
+    assert phone.best_size([(640, 480), (800, 600)], (1920, 1080), 640, 480) is None   # another shape
+    assert phone.best_size([(1280, 720), (960, 540)], (1920, 1080), 640, 480) == (960, 540)
+
+
+def test_best_size_allows_a_shape_two_percent_off_but_not_more():
+    assert phone.best_size([(640, 356)], (1920, 1080), 640, 356) == (640, 356)   # 1.1 % wider
+    assert phone.best_size([(640, 352)], (1920, 1080), 640, 352) is None         # 2.3 % wider
+
+
+def test_best_size_with_nothing_offered_is_none():
+    assert phone.best_size([], (1920, 1080), 640, 480) is None
+
+
+def test_read_picture_sizes_on_the_real_answer():
+    fetch = FakeFetch(status_json())
+    current, offered = phone.read_picture_sizes(STREAM, fetch)
+    assert current == (1920, 1080)
+    assert offered == REAL_SIZES
+    assert fetch.calls == [("http://192.168.1.7:8080/status.json?show_avail=1", 3.0)]
+
+
+def test_read_picture_sizes_skips_junk_in_the_list():
+    fetch = FakeFetch(status_json(offered=["640x360", "big", 7, None, "640x360", "0x0", "1280x720"]))
+    assert phone.read_picture_sizes(STREAM, fetch) == ((1920, 1080), [(640, 360), (1280, 720)])
+
+
+@pytest.mark.parametrize("answer", [
+    "<html>Another camera app</html>",
+    "",
+    "[1, 2, 3]",
+    '{"curvals": {"video_size": "huge"}, "avail": {"video_size": ["640x360"]}}',
+    '{"curvals": "1920x1080"}',
+    '{"avail": {"video_size": ["640x360"]}}',
+    "[" * 100_000 + "]" * 100_000,                       # json raises RecursionError
+    b'{"curvals": {"video_size": "1920x1080"}}',         # not text
+    None,
+    OSError("No route to host"),
+    TimeoutError("timed out"),
+    ConnectionRefusedError("refused"),
+    RuntimeError("anything at all"),
+])
+def test_read_picture_sizes_gives_up_quietly(answer, caplog):
+    caplog.set_level(logging.DEBUG, logger="car_vision.phone")
+    assert phone.read_picture_sizes(STREAM, FakeFetch(answer)) == (None, [])
+    assert len(caplog.records) == 1 and caplog.records[0].levelno == logging.DEBUG
+
+
+@pytest.mark.parametrize("stream_url", [
+    "http://8.8.8.8:8080/video",            # not on the local network
+    "http://phone.local:8080/video",        # a name, not an address
+    "https://192.168.1.7:8080/video",
+    "http://[::1]:8080/video",
+    "http://192.168.1.7:port/video",
+    "",
+    None,
+])
+def test_nothing_is_sent_for_an_address_that_is_not_a_local_phone(stream_url):
+    fetch = FakeFetch(status_json(), "<result>Ok</result>")
+    assert phone.read_picture_sizes(stream_url, fetch) == (None, [])
+    assert phone.ask_for_size(stream_url, (640, 360), fetch) is False
+    assert fetch.calls == []
+
+
+def test_the_requests_go_to_the_host_and_port_of_the_stream_only():
+    fetch = FakeFetch(status_json(), "<result>Ok</result>")
+    phone.read_picture_sizes("http://10.0.0.5:4747/video", fetch)
+    phone.ask_for_size("http://10.0.0.5:4747/", (640, 360), fetch)
+    assert [url for url, _timeout in fetch.calls] == [
+        "http://10.0.0.5:4747/status.json?show_avail=1",
+        "http://10.0.0.5:4747/settings/video_size?set=640x360"]
+    fetch = FakeFetch(status_json())
+    phone.read_picture_sizes("http://192.168.1.7/video", fetch)              # no port: IP Webcam's 8080
+    assert fetch.calls[0][0] == "http://192.168.1.7:8080/status.json?show_avail=1"
+
+
+def test_ask_for_size_on_ok():
+    fetch = FakeFetch('<?xml version="1.0" ?>\n<result>Ok</result>\n')
+    assert phone.ask_for_size(STREAM, (640, 360), fetch) is True
+    assert fetch.calls == [("http://192.168.1.7:8080/settings/video_size?set=640x360", 3.0)]
+
+
+@pytest.mark.parametrize("answer", ["<result>Error</result>", "", "Okay", "<html>404</html>", None, b"Ok",
+                                    OSError("refused"), TimeoutError("timed out"), ValueError("odd")])
+def test_ask_for_size_on_another_answer_or_a_failure_is_false(answer, caplog):
+    caplog.set_level(logging.DEBUG, logger="car_vision.phone")
+    assert phone.ask_for_size(STREAM, (640, 360), FakeFetch(answer)) is False
+    assert len(caplog.records) == 1
+
+
+@pytest.mark.parametrize("size", [(0, 360), (640, 0), (-640, 360), (8001, 360), (640, 8001),
+                                  (640.0, 360), (True, 360), ("640", "360"), [640, 360], (640,), None])
+def test_ask_for_size_refuses_a_silly_size_and_sends_nothing(size):
+    fetch = FakeFetch("<result>Ok</result>")
+    assert phone.ask_for_size(STREAM, size, fetch) is False
+    assert fetch.calls == []
+
+
+def test_ask_for_size_accepts_8000():
+    assert phone.ask_for_size(STREAM, (8000, 8000), FakeFetch("<result>Ok</result>")) is True
+
+
+def test_a_login_goes_along_and_is_never_logged(caplog):
+    caplog.set_level(logging.DEBUG, logger="car_vision.phone")
+    stream = "http://me:secret@192.168.1.7:8080/video"
+    failing = FakeFetch(OSError("could not reach http://me:secret@192.168.1.7:8080"),
+                        "junk", OSError("me:secret"), "<result>Error</result>")
+    assert phone.read_picture_sizes(stream, failing) == (None, [])
+    assert phone.read_picture_sizes(stream, failing) == (None, [])
+    assert phone.ask_for_size(stream, (640, 360), failing) is False
+    assert phone.ask_for_size(stream, (640, 360), failing) is False
+    assert len(caplog.records) == 4
+    assert "secret" not in caplog.text
+    assert failing.calls[0][0] == "http://me:secret@192.168.1.7:8080/status.json?show_avail=1"
+
+
+def test_the_login_becomes_a_basic_auth_header():
+    header = phone.login_header(urlsplit("http://me:se%40cret@192.168.1.7:8080/status.json"))
+    assert header == {"Authorization": "Basic " + base64.b64encode(b"me:se@cret").decode("ascii")}
+    assert phone.login_header(urlsplit("http://192.168.1.7:8080/status.json")) == {}
 
 
 def test_phone_uses_only_the_standard_library():

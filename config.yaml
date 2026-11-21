@@ -4,6 +4,8 @@
 stream:
   source: webcam            # phone, webcam or file
   phone_url: "http://192.168.165.249:8080/video"   # the address IP Webcam shows, plus /video
+  phone_picture: auto       # auto = ask the phone for the smallest picture that is sharp enough (less delay);
+                            # keep = never change the phone; or a size the phone offers, like 1280x720
   webcam_index: 0           # 0 is the laptop's built-in camera
   file_path: data/samples/car_clip.mp4          # a clip recorded from the car
   width: 640                # frames are shrunk to fit inside this size, keeping their shape

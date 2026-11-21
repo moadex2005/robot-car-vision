@@ -15,18 +15,30 @@ start uses the same phone. config.yaml is never written. A phone that needs a
 login keeps the address from config.yaml (with its login) when the remembered
 one is for the same host and port: see same_phone().
 
+The picture size: the page never shows more than about 640 x 360, but the
+phone may send 1920 x 1080, which takes about twice as long to arrive.
+read_picture_sizes() asks IP Webcam which sizes it offers, best_size() picks
+the smallest one that is still sharp enough, and ask_for_size() asks the
+phone to send it. These talk only to the host and port of the stream address,
+wait at most 3 seconds, and never raise: another camera app simply gives
+"no answer".
+
 Standard library only.
 """
 
 from __future__ import annotations
 
+import base64
+import http.client
 import ipaddress
 import json
 import logging
+import re
+from collections.abc import Callable, Sequence
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import SplitResult, unquote, urlsplit
 
-log =logging.getLogger(__name__)
+log = logging.getLogger(__name__)
 
 DEFAULT_PORT = 8080              # the port IP Webcam uses unless it was changed
 STREAM_PATH = "/video"           # where IP Webcam serves its MJPEG stream
@@ -175,3 +187,188 @@ def remember(path: Path, url: str) -> None:
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(json.dumps({"phone_url": checked}, indent=2) + "\n", encoding="utf-8")
+
+
+# ---- the picture size the phone sends ------------------------------------------------
+#
+# IP Webcam answers two addresses beside its stream (checked on the real phone):
+#   /status.json?show_avail=1          JSON: curvals.video_size is the current size ("1920x1080"),
+#                                      avail.video_size the sizes it offers, in no useful order
+#   /settings/video_size?set=640x360   asks for another size; answers a little XML text with "Ok"
+
+Size = tuple[int, int]                      # (width, height) in pixels
+Fetch = Callable[[str, float], str]         # (address, timeout in seconds) -> the answer as text
+
+ASK_TIMEOUT_SECONDS = 3.0        # a phone that does not answer within this is given up on
+MAX_SIDE = 8000                  # no camera sends pictures wider or higher than this
+SAME_SHAPE = 0.02                # two sizes have the same shape when width / height differ by at most 2 %
+MAX_ANSWER_BYTES = 64 * 1024     # the status answer is a few kilobytes; anything more is not read
+MAX_SIZES = 100                  # at most this many offered sizes are kept from one answer
+STATUS_PATH = "/status.json?show_avail=1"
+SET_SIZE_PATH = "/settings/video_size?set="
+SIZE_PATTERN = re.compile(r"([1-9][0-9]{0,4})x([1-9][0-9]{0,4})")
+OK_ANSWER = re.compile(r"\bOk\b")
+
+
+def parse_size(text: str) -> Size | None:
+    """(640, 360) for the text "640x360"; None for anything else."""
+    if not isinstance(text, str):
+        return None
+    match = SIZE_PATTERN.fullmatch(text)
+    return (int(match[1]), int(match[2])) if match else None
+
+
+def size_text(size: Size) -> str:
+    """The size the way IP Webcam writes it, e.g. "640x360"."""
+    return f"{size[0]}x{size[1]}"
+
+
+def is_usable_size(size: object) -> bool:
+    """True for a (width, height) pair of whole numbers from 1 to 8000."""
+    return (isinstance(size, tuple) and len(size) == 2
+            and all(isinstance(side, int) and not isinstance(side, bool) and 1 <= side <= MAX_SIDE
+                    for side in size))
+
+
+def shown_size(size: Size, max_width: int, max_height: int) -> Size:
+    """The size the page shows a picture of this size at.
+
+    The same arithmetic as stream.fitted_size (the largest size with the same
+    shape inside the box, never enlarged, both sides even), repeated here so
+    this module needs nothing but the standard library.
+    """
+    width, height = size
+    scale = min(max_width / width, max_height / height, 1.0)
+    return max(2, int(round(width * scale / 2)) * 2), max(2, int(round(height * scale / 2)) * 2)
+
+
+def same_shape(one: Size, other: Size) -> bool:
+    """True when the two sizes have the same width / height, within 2 %."""
+    return abs((one[0] / one[1]) / (other[0] / other[1]) - 1) <= SAME_SHAPE
+
+
+def area(size: Size) -> int:
+    return size[0] * size[1]
+
+
+def best_size(offered: Sequence[Size], current: Size, max_width: int, max_height: int) -> Size | None:
+    """The smallest offered size that is still sharp enough for the page, or None.
+
+    "Sharp enough" means the same shape as the current picture and at least as
+    large as what the page will show. Never a size larger than the current one.
+    None when the current size is already that one, or when nothing fits.
+    """
+    if not is_usable_size(current):
+        return None
+    shown = shown_size(current, max_width, max_height)
+    sharp_enough = [size for size in offered
+                    if is_usable_size(size) and same_shape(size, current)
+                    and shown[0] <= size[0] <= current[0] and shown[1] <= size[1] <= current[1]]
+    if not sharp_enough:
+        return None
+    smallest = min(sharp_enough, key=area)
+    return None if smallest == current else smallest
+
+
+def read_picture_sizes(stream_url: str, fetch: Fetch | None = None) -> tuple[Size | None, list[Size]]:
+    """(the size the phone sends now, the sizes it offers); (None, []) when it does not say.
+
+    Never raises: no phone, another camera app, a timeout or a junk answer is
+    one debug log line.
+    """
+    address = phone_address(stream_url, STATUS_PATH)
+    if address is None:
+        log.debug("Not asking %s for picture sizes: not a plain http address on the local network",
+                  without_login(str(stream_url)))
+        return None, []
+    try:
+        return sizes_in_status((fetch or fetch_text)(address, ASK_TIMEOUT_SECONDS))
+    except Exception as error:                 # anything at all: the video must go on without it
+        log.debug("The phone at %s gave no picture sizes (%s)", without_login(stream_url), type(error).__name__)
+        return None, []
+
+
+def sizes_in_status(answer: str) -> tuple[Size, list[Size]]:
+    """The current and the offered sizes in IP Webcam's status answer; ValueError when it has none."""
+    if not isinstance(answer, str):
+        raise ValueError("the answer is not text")
+    data = json.loads(answer)
+    current_values = data.get("curvals") if isinstance(data, dict) else None
+    available = data.get("avail") if isinstance(data, dict) else None
+    current = parse_size(current_values.get("video_size")) if isinstance(current_values, dict) else None
+    if current is None:
+        raise ValueError("the answer has no current video_size")
+    listed = available.get("video_size") if isinstance(available, dict) else None
+    offered: list[Size] = []
+    for item in listed if isinstance(listed, list) else []:
+        size = parse_size(item)
+        if size is not None and size not in offered:
+            offered.append(size)
+    return current, offered[:MAX_SIZES]
+
+
+def ask_for_size(stream_url: str, size: Size, fetch: Fetch | None = None) -> bool:
+    """Ask the phone to send pictures of this size. True when it answered "Ok".
+
+    A size that is not positive or is larger than 8000 on a side is refused
+    without sending anything. Never raises.
+    """
+    if not is_usable_size(size):
+        return False
+    address = phone_address(stream_url, SET_SIZE_PATH + size_text(size))
+    if address is None:
+        return False
+    try:
+        answer = (fetch or fetch_text)(address, ASK_TIMEOUT_SECONDS)
+    except Exception as error:                 # anything at all: the video must go on without it
+        log.debug("The phone at %s did not take the size %s (%s)",
+                  without_login(stream_url), size_text(size), type(error).__name__)
+        return False
+    if isinstance(answer, str) and OK_ANSWER.search(answer):
+        return True
+    log.debug("The phone at %s did not answer Ok to the size %s", without_login(stream_url), size_text(size))
+    return False
+
+
+def phone_address(stream_url: str, path: str) -> str | None:
+    """`path` on exactly the host and port of the stream address, keeping its login.
+
+    None unless the stream address is plain http to an IPv4 address on the
+    local network, so these requests can never go anywhere else.
+    """
+    try:
+        parts = urlsplit(stream_url.strip())
+        port = parts.port or DEFAULT_PORT
+        ip = ipaddress.IPv4Address(parts.hostname or "")
+    except (AttributeError, TypeError, ValueError):     # not text, a bad port, not an IPv4 address
+        return None
+    if parts.scheme.lower() != "http" or not any(ip in network for network in LOCAL_NETWORKS):
+        return None
+    login = parts.netloc.rpartition("@")[0]
+    return f"http://{login + '@' if login else ''}{ip}:{port}{path}"
+
+
+def fetch_text(url: str, timeout: float) -> str:
+    """GET an http address and return the answer as text. Raises on any failure.
+
+    A login in the address is sent as Basic auth, the way the stream reader sends it.
+    """
+    parts = urlsplit(url)
+    path = (parts.path or "/") + (f"?{parts.query}" if parts.query else "")
+    connection = http.client.HTTPConnection(parts.hostname, parts.port, timeout=timeout)
+    try:
+        connection.request("GET", path, headers=login_header(parts))
+        response = connection.getresponse()
+        if response.status != 200:
+            raise OSError(f"the phone answered with status {response.status}")
+        return response.read(MAX_ANSWER_BYTES).decode("utf-8", errors="replace")
+    finally:
+        connection.close()
+
+
+def login_header(parts: SplitResult) -> dict[str, str]:
+    """The Basic auth header for a login in the address; no header without one."""
+    if parts.username is None:
+        return {}
+    login = f"{unquote(parts.username)}:{unquote(parts.password or '')}"
+    return {"Authorization": "Basic " + base64.b64encode(login.encode("utf-8")).decode("ascii")}

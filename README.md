@@ -14,7 +14,7 @@ A phone on the car streams its camera to this laptop. The laptop labels objects,
 - **Ask about this**: a small chat at the bottom of the details panel, for more questions about the thing you clicked. Each thing keeps its own short conversation (up to 10 questions).
 - **Chat**: type a question; the assistant answers from `data/knowledge.md` and searches the web when the notes do not have the answer.
 - **Full screen**: the button in the corner of the video, or the `F` key. The list and the details panel work there too.
-- **Camera**: the button in the top bar. Type the address IP Webcam shows on the phone (like `192.168.1.7:8080`) and press Connect; the page switches to that phone at once and remembers it for next time. The same box has a **Delay test** switch: it shows a clock with milliseconds, so pointing the phone at the screen shows how far the video is behind.
+- **Camera**: the button in the top bar. Type the address IP Webcam shows on the phone (like `192.168.1.7:8080`) and press Connect; the page switches to that phone at once and remembers it for next time. Under the address, **Picture from the phone** chooses the size the phone sends: the automatic choice asks IP Webcam for the smallest size that is still sharp enough for the page (640 x 360 for a wide picture), which roughly halves the delay compared with 1920 x 1080; you can also leave the phone as it is or pick a size. The same box has a **Delay test** switch: it shows a clock with milliseconds, so pointing the phone at the screen shows how far the video is behind.
 - **Light and dark**: the sun and moon button in the top bar. Until you choose, the page follows Windows.
 
 Limits to know before the demo:
@@ -72,7 +72,7 @@ Everything you can change is in `config.yaml`, with a comment beside each value.
 
 1. Install the **IP Webcam** app on the Android phone.
 2. Put the phone and the laptop on the same network. The simplest way is to turn on the phone's own hotspot and join it from the laptop.
-3. In IP Webcam, set the video resolution to 640 x 480, scroll down and tap **Start server**. The app shows an address such as `http://192.168.43.1:8080`.
+3. In IP Webcam, scroll down and tap **Start server**. The app shows an address such as `http://192.168.43.1:8080`. You do not need to set the video resolution: the program asks the phone for a small picture itself (`stream.phone_picture: auto` in `config.yaml`).
 4. Start the demo page and type that address into the **Camera** box. (Or put the address plus `/video` into `stream.phone_url` in `config.yaml`; an address typed on the page is remembered in `data/camera.json` and wins at the next start.)
 5. Test it:
 

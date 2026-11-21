@@ -14,6 +14,8 @@ Read `CLAUDE.md` first, then `specs/M7-click-to-inspect.md` (its "Look and feel"
 
 ## Part A: the phone stream reader (`car_vision/stream.py`, `tests/test_stream.py`)
 
+> **Outcome (measured on the real phone, 2026-11-21): built, reviewed, then taken out again.** The reader below worked, but it is Python, and Python threads share one lock with the detector's thread. Reader alone, the stream delay was the same as FFmpeg's (59 to 79 ms against 66 ms at 640 x 360). Inside the full pipeline it lost badly: FFmpeg let the pipeline process 25.8 pictures a second, our reader 14.5, and in one run 3. FFmpeg reads and decodes in C, outside that lock. The phone is therefore read with FFmpeg and its low-delay options, and the delay was cut by asking the phone for a smaller picture instead (`specs/M9-phone-picture-size.md`). The text below is kept as the record of what was tried.
+
 Today the phone is opened with `cv2.VideoCapture(url, cv2.CAP_FFMPEG)`. Every 1920 x 1080 picture is decoded in full and then shrunk to 640 x 360, and the laptop has no say over buffering. Replace that with a reader of our own for the phone's MJPEG stream.
 
 ```python

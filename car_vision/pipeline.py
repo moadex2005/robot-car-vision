@@ -20,6 +20,11 @@ use_phone() switches the live source to another phone while the loop runs
 loop notices it, forgets everything about the old picture, and drops any
 result it was still working out for the old camera.
 
+Whenever a phone is started, a short thread of its own asks the phone which
+picture sizes it offers and, with stream.phone_picture set to auto, asks for
+the smallest one that is still sharp enough: smaller pictures arrive sooner.
+set_phone_picture() changes that choice for this run (the camera box again).
+
 Every part can be handed in from outside, so the tests run the loop with
 fakes and need no camera, model or graphics card.
 """
@@ -40,7 +45,8 @@ from car_vision import draw
 from car_vision.config import ConfigError, require, section
 from car_vision.detector import Detector
 from car_vision.faces import FaceMemory, Person
-from car_vision.phone import without_login
+from car_vision.phone import (Fetch, Size, area, ask_for_size, best_size, parse_size, read_picture_sizes,
+                              size_text, without_login)
 from car_vision.reactions import Reaction, ReactionEngine
 from car_vision.recognizer import Recognizer, load_known_faces
 from car_vision.state import Box, Detection, RecognizedFace, WorldSnapshot, WorldState
@@ -61,6 +67,12 @@ CLIP_FINISHED = "Clip finished"   # drawn and shown when a clip has played to it
 AREA_SHARE = 0.5               # a click on no box takes half the frame wide and half the frame high
 FACE_LABEL = "face"            # the label of a target that is a face box with no person box around it
 DARK_LEVEL = 24                # the plain dark picture shown while a new camera connects
+
+PICTURE_WORDS = ("auto", "keep")   # stream.phone_picture: these two words, or a size like 1280x720
+BAD_PICTURE_SETTING = "stream.phone_picture must be auto, keep or a size like 1280x720, got {!r}"
+NOT_A_PICTURE_CHOICE = "Choose auto, keep or one of the sizes the phone offers, like 640x360."
+READ_BACK_TRIES = 2            # after a change the size is read back from the phone, once more if it lags
+READ_BACK_WAIT_SECONDS = 1.0   # ... this long later
 
 
 @dataclass(frozen=True)
@@ -94,6 +106,14 @@ class View:
         return width, height
 
 
+@dataclass(frozen=True)
+class PhonePicture:
+    """What the phone said about its picture: the size it sends now and the sizes it offers."""
+
+    current: Size
+    offered: tuple[Size, ...]
+
+
 SourceFactory = Callable[[dict], Any]     # stream settings in, a FrameSource (or a fake) out
 
 
@@ -102,7 +122,8 @@ class Pipeline:
 
     def __init__(self, config: dict, source=None, detector=None, recognizer=None,
                  reactions=None, state: WorldState | None = None,
-                 source_factory: SourceFactory | None = None) -> None:
+                 source_factory: SourceFactory | None = None,
+                 phone_fetch: Fetch | None = None) -> None:
         recognizer_settings = section(config, "recognizer")
         self.every_n_frames: int = require(recognizer_settings, "every_n_frames", int)
         if self.every_n_frames < 1:
@@ -115,6 +136,10 @@ class Pipeline:
         self._stream_settings = dict(section(config, "stream"))
         phone_url = self._stream_settings.get("phone_url")
         self._phone_url: str | None = phone_url if isinstance(phone_url, str) else None
+        self._picture_choice: str = configured_picture_choice(self._stream_settings)
+        self._box: Size = (require(self._stream_settings, "width", int),
+                           require(self._stream_settings, "height", int))
+        self._fetch = phone_fetch              # None: really ask the phone (tests pass a fake)
         self._make_source: SourceFactory = source_factory if source_factory is not None else FrameSource
         # Cheap parts first, so a wrong setting or a missing clip shows before the slow model loads.
         self._source = source if source is not None else self._make_source(self._stream_settings)
@@ -138,7 +163,11 @@ class Pipeline:
         self._started = False                  # start() was called
         self._loop_running = False             # the loop thread runs (it ends after too many failures)
 
+        self._picture: PhonePicture | None = None   # None: not a phone, or it did not say
+        self._picture_round = 0                # goes up for every new phone or choice; the newest wins
+
         self._switch_lock = threading.Lock()   # one use_phone() at a time
+        self._picture_lock = threading.Lock()  # one talk with the phone about its picture at a time
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         # Only the loop thread uses these.
@@ -165,6 +194,7 @@ class Pipeline:
             self._stop.clear()
             source.start()
             self._start_loop()
+            self._check_phone_picture()         # only does something when the source is the phone
         return self
 
     def stop(self) -> None:
@@ -173,6 +203,7 @@ class Pipeline:
         with self._switch_lock:                 # a switch under way finishes first
             with self._lock:
                 self._started = False
+                self._picture_round += 1        # a talk with the phone still under way is ignored
                 source = self._source
             thread, self._thread = self._thread, None
         if thread is not None:
@@ -205,8 +236,29 @@ class Pipeline:
                 new_source.start()
             if restart:
                 self._start_loop()
+            self._check_phone_picture()
         log.info("Switched the camera to the phone at %s", url)
         let_go_in_background(old_source)
+
+    def set_phone_picture(self, choice: str) -> None:
+        """Choose the phone's picture size for this run: "auto", "keep" or a size like "640x360".
+
+        config.yaml is not written. The phone is asked in a thread of its own,
+        so this returns at once. Raises ValueError with a plain message for
+        anything else, and for a size the phone does not offer.
+        """
+        wanted = picture_choice(choice)
+        if wanted is None:
+            raise ValueError(NOT_A_PICTURE_CHOICE)
+        size = parse_size(wanted)
+        with self._lock:
+            offered = self._picture.offered if self._picture is not None else ()
+            if size is not None and size not in offered:
+                raise ValueError(f"The phone does not offer {size[0]} x {size[1]}. "
+                                 "Choose one of the sizes in the list.")
+            self._picture_choice = wanted
+        log.info("Phone picture: %s", wanted)
+        self._check_phone_picture()
 
     def latest_jpeg(self) -> bytes | None:
         """The newest annotated frame as JPEG bytes; None until the first frame.
@@ -226,6 +278,7 @@ class Pipeline:
             source = self._source
             phone_url = self._phone_url
             switched_at = self._switched_at        # 0.0 until the first switch
+            picture, choice = self._picture, self._picture_choice
         # While the stream is down nothing new is seen, so old sightings are left out,
         # and so is everything seen by the camera used before the last switch.
         seen_at = snapshot.detections_at
@@ -235,6 +288,7 @@ class Pipeline:
             "connected": bool(source.connected) and error is None,   # a stopped loop is not live
             "ended": bool(source.ended),              # a clip played to its end (loop_file: false)
             "phone_url": without_login(phone_url) if phone_url else None,   # in use or remembered; no password
+            "phone_picture": picture_status(picture, choice) if source.source == "phone" else None,
             "fps": round(self._fps.value(), 1),
             "device": self._detector.device,
             "recognition": self._recognizer is not None,
@@ -285,6 +339,88 @@ class Pipeline:
             self._notes.append(NO_INFO_CARDS)
         return recognizer
 
+    # ---- the phone's picture size (a short thread of its own) ------------------
+    #
+    # Each call of _check_phone_picture() starts a new "round". The thread of an
+    # older round finds out that it is no longer the newest before it writes or
+    # asks anything, and stops. Only one thread talks to the phone at a time.
+
+    def _check_phone_picture(self) -> None:
+        """Read the phone's picture sizes and ask for the chosen one, off the video loop.
+
+        Does nothing unless the running source is the phone.
+        """
+        with self._lock:
+            self._picture_round += 1
+            work = self._picture_round
+            live = self._started and not self._stop.is_set()
+            url = self._phone_url if self._source.source == "phone" else None
+        if live and url is not None:
+            threading.Thread(target=self._tune_phone_picture, args=(url, work),
+                             name="phone-picture", daemon=True).start()
+
+    def _tune_phone_picture(self, url: str, work: int) -> None:
+        """Read the sizes, ask for the chosen one when it differs, then read the size back.
+
+        Every step gives up quietly: a phone that is off or another camera app
+        just leaves status()["phone_picture"] at None.
+        """
+        with self._picture_lock:
+            if not self._is_newest(work):
+                return
+            current, offered = read_picture_sizes(url, self._fetch)
+            if current is None or not self._keep_picture(work, current, offered):
+                return
+            wanted = self._wanted_size(current, offered)
+            if wanted is None or not self._is_newest(work):
+                return
+            log.info("Asking the phone for %s pictures instead of %s", size_text(wanted), size_text(current))
+            if ask_for_size(url, wanted, self._fetch):
+                self._read_back(url, work, wanted, offered)
+
+    def _read_back(self, url: str, work: int, wanted: Size, offered: list[Size]) -> None:
+        """Keep what the phone says it sends after the change; once more a moment later if it lags.
+
+        Only the current size is taken from these answers. The list of offered
+        sizes stays the one read before the change: while its camera restarts,
+        the real phone lists just one size for a moment.
+        """
+        for attempt in range(READ_BACK_TRIES):
+            if attempt > 0:
+                self._stop.wait(READ_BACK_WAIT_SECONDS)
+            if not self._is_newest(work):
+                return
+            current, _listed_during_restart = read_picture_sizes(url, self._fetch)
+            if current is None or not self._keep_picture(work, current, offered) or current == wanted:
+                return
+
+    def _wanted_size(self, current: Size, offered: list[Size]) -> Size | None:
+        """The size to ask the phone for under the present choice; None to leave it as it is."""
+        with self._lock:
+            choice = self._picture_choice
+        if choice == "keep":
+            return None
+        if choice == "auto":
+            return best_size(offered, current, *self._box)
+        size = parse_size(choice)
+        if size not in offered:
+            log.warning("stream.phone_picture is %s, but the phone does not offer that size; "
+                        "the phone is left as it is", choice)
+            return None
+        return None if size == current else size
+
+    def _is_newest(self, work: int) -> bool:
+        with self._lock:
+            return work == self._picture_round
+
+    def _keep_picture(self, work: int, current: Size, offered: list[Size]) -> bool:
+        """Keep what the phone said, unless a newer round began meanwhile (then False)."""
+        with self._lock:
+            if work != self._picture_round:
+                return False
+            self._picture = PhonePicture(current, tuple(offered))
+            return True
+
     # ---- the loop thread -----------------------------------------------------
 
     def _start_loop(self) -> None:
@@ -296,6 +432,8 @@ class Pipeline:
         picture, and the assistant must not be told about people that camera saw."""
         self._generation += 1
         self._switched_at = time.monotonic()
+        self._picture = None                    # the new phone has not said yet
+        self._picture_round += 1                # what the old phone still says is ignored
         self._view = None
         self._error = None
         self._on_screen = []
@@ -474,6 +612,42 @@ def let_go_in_background(source: Any) -> None:
             log.exception("Letting go of the old camera failed")
 
     threading.Thread(target=let_go, name="old-camera", daemon=True).start()
+
+
+# ---- the phone's picture size: the setting and the status --------------------------------
+
+
+def picture_choice(text: Any) -> str | None:
+    """"auto", "keep" or a size written like "640x360"; None for anything else."""
+    if not isinstance(text, str):
+        return None
+    word = text.strip().lower()
+    if word in PICTURE_WORDS:
+        return word
+    size = parse_size(word)
+    return size_text(size) if size is not None else None
+
+
+def configured_picture_choice(settings: dict[str, Any]) -> str:
+    """stream.phone_picture from config.yaml, checked. Raises ConfigError when it is missing or wrong."""
+    if "phone_picture" not in settings:
+        require(settings, "phone_picture", str)     # raises the usual "missing the setting" message
+    value = settings["phone_picture"]
+    choice = picture_choice(value)
+    if choice is None:
+        raise ConfigError(BAD_PICTURE_SETTING.format(value))
+    return choice
+
+
+def picture_status(picture: PhonePicture | None, choice: str) -> dict[str, Any] | None:
+    """What the page shows about the phone's picture, e.g.
+    {"current": "1920x1080", "offered": ["640x360", ...], "choice": "auto"}; None when the phone did not say."""
+    if picture is None:
+        return None
+    offered = sorted(picture.offered, key=lambda size: (area(size), size[0]))
+    return {"current": size_text(picture.current),
+            "offered": [size_text(size) for size in offered],
+            "choice": choice}
 
 
 CardOf = Callable[[RecognizedFace], Person]     # the person a known face belongs to

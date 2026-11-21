@@ -5,7 +5,8 @@ video goes to /api/inspect, which answers at once with a small photo of what
 was clicked; for an object, /api/describe then asks the assistant what it is,
 and /api/follow_up answers more questions about that one thing. The camera
 box on the page sends a phone's address to /api/camera, which switches the
-video to that phone and remembers the address for the next start.
+video to that phone and remembers the address for the next start, and the
+picture size to ask the phone for to /api/camera/picture.
 Start it with
 
     .venv\\Scripts\\python.exe -m car_vision.app
@@ -47,7 +48,7 @@ from car_vision.stream import SOURCES
 log = logging.getLogger(__name__)
 
 MAX_QUESTION_CHARS = 2000
-VIDEO_MAX_FPS = 20               # /video sends at most this many frames a second
+VIDEO_MAX_FPS = 30               # /video sends at most this many frames a second (the phone sends 30)
 VIDEO_POLL_SECONDS = 0.01        # how often /video looks for a new frame
 VIDEO_KEEPALIVE_SECONDS = 1.0    # with no new frame for this long, the last one is sent again, so a
                                  # closed browser tab is noticed and its server thread ends
@@ -466,6 +467,18 @@ def create_app(pipeline: Any, assistant: Any, camera_file: Path | None = None) -
             except OSError as error:                  # the switch still happened
                 log.warning("Could not remember the phone address in %s: %s", camera_file, error)
         return jsonify(ok=True, url=url)
+
+    @app.post("/api/camera/picture")
+    def camera_picture() -> Any:
+        body = request.get_json(silent=True)
+        choice = body.get("choice") if isinstance(body, dict) else None
+        if not isinstance(choice, str):
+            return jsonify(error='Send the choice as JSON, like {"choice": "auto"}.'), 400
+        try:
+            pipeline.set_phone_picture(choice)       # returns at once; the phone is asked in the background
+        except ValueError as error:                  # not a choice, or a size the phone does not offer
+            return jsonify(error=str(error)), 400
+        return jsonify(ok=True)
 
     @app.errorhandler(HTTPException)
     def http_error(error: HTTPException) -> Any:

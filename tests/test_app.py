@@ -42,6 +42,7 @@ STATUS = {
     "reactions": [{"kind": "greeting", "text": "Hello, Sara Ahmed!"}],
     "error": None,
 }
+OFFERED = ("640x360", "1280x720", "1920x1080")      # the sizes the fake phone offers
 JPEG = cv2.imencode(".jpg", np.full((36, 64, 3), 90, np.uint8))[1].tobytes()
 WEB_ANSWER = Answer("Rover follows a black line.", used_web=True,
                     sources=("https://example.org/a", "https://example.org/b"))
@@ -83,12 +84,19 @@ class FakePipeline:
         self.target_result = target
         self.clicks = []
         self.phones = []                    # every address use_phone() was given
+        self.pictures = []                  # every choice set_phone_picture() took
         self.started = False
         self.stopped = False
         FakePipeline.instances.append(self)
 
     def use_phone(self, url):
         self.phones.append(url)
+
+    def set_phone_picture(self, choice):
+        """Like the real one: the two words, or a size this fake phone offers; ValueError otherwise."""
+        if choice not in ("auto", "keep", *OFFERED):
+            raise ValueError(f"The phone does not offer {choice}.")
+        self.pictures.append(choice)
 
     def target(self, x=None, y=None, track_id=None, label=None):
         self.clicks.append({"x": x, "y": y, "track_id": track_id, "label": label})
@@ -270,7 +278,7 @@ def test_only_the_listed_methods_are_accepted_and_the_answer_is_json():
     client = client_for()
     for method, path in (("get", "/api/ask"), ("post", "/api/status"), ("get", "/api/inspect"),
                          ("get", "/api/describe"), ("get", "/api/reset"), ("get", "/api/follow_up"),
-                         ("get", "/api/camera")):
+                         ("get", "/api/camera"), ("get", "/api/camera/picture")):
         response = getattr(client, method)(path)
         assert response.status_code == 405
         assert response.is_json and isinstance(response.get_json()["error"], str)
@@ -860,6 +868,49 @@ def test_camera_still_switches_when_the_address_cannot_be_written(tmp_path):
     assert pipeline.phones == ["http://192.168.1.7:8080/video"]
 
 
+# ---- /api/camera/picture ------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("choice", ["auto", "keep", "640x360", "1920x1080"])
+def test_camera_picture_passes_the_choice_on_and_answers_at_once(choice):
+    pipeline = FakePipeline()
+    response = client_for(pipeline=pipeline).post("/api/camera/picture", json={"choice": choice})
+    assert response.status_code == 200
+    assert response.get_json() == {"ok": True}
+    assert pipeline.pictures == [choice]
+
+
+@pytest.mark.parametrize("choice", ["800x600", "huge", "", "http://8.8.8.8/"])
+def test_camera_picture_refuses_what_the_pipeline_refuses(choice):
+    pipeline = FakePipeline()
+    response = client_for(pipeline=pipeline).post("/api/camera/picture", json={"choice": choice})
+    assert response.status_code == 400
+    assert isinstance(response.get_json()["error"], str)
+    assert pipeline.pictures == []
+
+
+@pytest.mark.parametrize("body, content_type", [
+    ("choice=auto", "application/x-www-form-urlencoded"),
+    ("not json", "application/json"),
+    ('["auto"]', "application/json"),
+    ('{"size": "auto"}', "application/json"),
+    ('{"choice": 640}', "application/json"),
+    ('{"choice": null}', "application/json"),
+    ('{"choice": ["auto"]}', "application/json"),
+])
+def test_camera_picture_with_a_body_that_is_not_a_json_choice_is_400(body, content_type):
+    pipeline = FakePipeline()
+    response = client_for(pipeline=pipeline).post("/api/camera/picture", data=body, content_type=content_type)
+    assert response.status_code == 400
+    assert isinstance(response.get_json()["error"], str)
+    assert pipeline.pictures == []
+
+
+def test_camera_picture_shows_the_pipelines_own_message():
+    response = client_for().post("/api/camera/picture", json={"choice": "800x600"})
+    assert response.get_json() == {"error": "The phone does not offer 800x600."}
+
+
 # ---- the stores behind the two routes --------------------------------------------------
 
 
@@ -955,7 +1006,8 @@ class ChangingPipeline:
         return b"picture " + str(self.calls).encode()
 
 
-def test_stream_sends_at_most_20_frames_a_second():
+def test_stream_sends_at_most_30_frames_a_second():
+    assert app_module.VIDEO_MAX_FPS == 30                 # the phone sends 30 small pictures a second
     clock = FakeClock()
     stream = mjpeg_stream(ChangingPipeline(), clock=clock, sleep=clock.sleep)
     sent_at = []
@@ -963,8 +1015,8 @@ def test_stream_sends_at_most_20_frames_a_second():
         next(stream)
         sent_at.append(clock.now)
     gaps = [b - a for a, b in zip(sent_at, sent_at[1:])]
-    assert min(gaps) >= 0.05 - 1e-9
-    assert len(sent_at) <= 2.0 * 20 + 1
+    assert min(gaps) >= 1 / 30 - 1e-9
+    assert len(sent_at) <= 2.0 * 30 + 1
 
 
 class StillPipeline:
@@ -1424,6 +1476,26 @@ def test_template_scrolls_only_the_panel_and_the_chat_list_never_the_page():
     # follow-up field is always in view and typing in it never makes the browser scroll the page.
     assert "function fitDetails()" in page
     assert page.count("fitDetails();") >= 3                        # on scroll, on opening, on full screen
+
+
+def test_template_has_the_phone_picture_row():
+    page = rendered_page()
+    around = ids_around(page)
+    assert "cameraBox" in around["pictureRow"] and "cameraBox" in around["pictureChoice"]
+    assert '<div class="picture-row" id="pictureRow" hidden>' in page          # hidden until the phone says
+    assert '<label class="field-label" for="pictureChoice">Picture from the phone</label>' in page
+    assert '<option value="auto">Automatic (smallest that is sharp enough)</option>' in page
+    assert '<option value="keep">Leave the phone as it is</option>' in page
+    assert "Smaller pictures arrive sooner." in page and '" The page shows "' in page and '" either way."' in page
+    assert 'id="pictureNow"' in page and '"The phone sends "' in page
+    assert '"/api/camera/picture", { choice: pictureChoice.value }' in page   # only the choice is sent
+    assert 'pictureRow.hidden = picture === null;' in page
+    assert 'pictureChoice.addEventListener("change"' in page                 # posts as soon as it changes
+    assert "showCameraResult(errorText(data, response" in page                 # errors in the result line
+    assert ".picture-line select:focus-visible" in page                        # a visible ring for the keyboard
+    select = css_rule(page, ".picture-line select")
+    assert "var(--surface)" in select and "var(--text)" in select              # follows the light and dark look
+    assert "backdrop-filter" not in select
 
 
 def test_template_has_the_follow_up_chat():

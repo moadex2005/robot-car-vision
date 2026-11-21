@@ -7,15 +7,26 @@ import logging
 import re
 import subprocess
 import sys
+import types
 from pathlib import Path
 
 import numpy as np
 import pytest
 
 from car_vision import draw
+from car_vision import recognizer as recognizer_module
 from car_vision.config import ConfigError
-from car_vision.faces import FaceMatcher, Person
-from car_vision.recognizer import Recognizer, choose_providers, describe_faces, track_for
+from car_vision.faces import FaceMatcher, Person, save_embeddings
+from car_vision.recognizer import (
+    FACE_VECTOR_SIZE,
+    FaceModelError,
+    Recognizer,
+    choose_providers,
+    describe_faces,
+    load_face_model,
+    load_known_faces,
+    track_for,
+)
 from car_vision.state import UNKNOWN, Detection, RecognizedFace
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -30,7 +41,6 @@ SETTINGS = {
     "match_threshold": 0.42,
     "every_n_frames": 5,
     "min_face_pixels": 40,
-    "people_file": "data/does-not-exist/people.json",
     "photos_dir": "data/does-not-exist/people",
     "embeddings_file": "data/does-not-exist/embeddings.npz",
 }
@@ -52,6 +62,7 @@ def one_hot(index, noise=0.0, seed=0):
 SARA = one_hot(0)
 OMAR = one_hot(1)
 STRANGER = one_hot(5)
+FULL_SIZE_SARA = np.eye(FACE_VECTOR_SIZE, dtype=np.float32)[0]   # for files read with the real size check
 
 
 class FakeFace:
@@ -185,6 +196,12 @@ def test_track_for_counts_the_box_edge_as_inside():
     assert track_for((0, 0, 20, 20), [person_box(5, (10, 10, 100, 100))]) == 5
 
 
+def test_track_for_prefers_a_tracked_box_to_a_smaller_untracked_one():
+    detections = [person_box(None, (90, 70, 210, 250)), person_box(4, (0, 0, 600, 479))]
+    assert track_for((100, 80, 180, 180), detections) == 4
+    assert track_for((100, 80, 180, 180), detections[:1]) is None
+
+
 # ---- start-up --------------------------------------------------------------------------
 
 
@@ -207,9 +224,171 @@ def test_matching_people_and_faces_give_no_warning(caplog):
     assert not caplog.records
 
 
-def test_missing_people_file_is_a_config_error():
-    with pytest.raises(ConfigError, match="People file not found"):
-        Recognizer(SETTINGS, face_model=FakeFaceModel())
+def test_people_come_from_the_folders_under_photos_dir(tmp_path):
+    (tmp_path / "sara").mkdir()
+    (tmp_path / "sara" / "about.md").write_text("# Sara Ahmed\nRole: Team lead\n- one\n- two\n- three\n- four\n",
+                                                encoding="utf-8")
+    settings = dict(SETTINGS, photos_dir=str(tmp_path))
+    matcher = FaceMatcher(["sara"], np.stack([SARA]), threshold=0.42)
+    made = Recognizer(settings, face_model=FakeFaceModel(FakeFace((10, 10, 90, 90), SARA)), matcher=matcher)
+    assert made.person("sara").lines == ("one", "two", "three", "four")
+    assert made.recognize(frame())[0].name == "Sara Ahmed"
+
+
+def test_missing_photos_dir_means_nobody_not_an_error():
+    matcher = FaceMatcher([], np.zeros((0, SIZE)), 0.42)
+    made = Recognizer(SETTINGS, face_model=FakeFaceModel(FakeFace((10, 10, 90, 90), SARA)), matcher=matcher)
+    assert made.person("sara") is None
+    assert made.recognize(frame())[0].name == UNKNOWN
+
+
+def test_missing_embeddings_file_is_a_config_error():
+    with pytest.raises(ConfigError, match="car_vision.enroll"):
+        Recognizer(SETTINGS, face_model=FakeFaceModel(), people=PEOPLE)
+
+
+# ---- load_known_faces: the normal cases while nobody is fully set up yet ----------------
+
+
+def known_faces_settings(tmp_path, embeddings=None):
+    photos = tmp_path / "people"
+    photos.mkdir()
+    embeddings_file = tmp_path / "embeddings.npz"
+    if embeddings is not None:
+        save_embeddings(embeddings_file, list(embeddings), np.stack(list(embeddings.values())))
+    return dict(SETTINGS, photos_dir=str(photos), embeddings_file=str(embeddings_file)), photos
+
+
+def test_no_people_at_all_gives_notes_not_a_crash(tmp_path, capsys):
+    settings, _ = known_faces_settings(tmp_path)
+    people, matcher = load_known_faces(settings)
+    assert people == {} and matcher.person_ids == set()
+    out = capsys.readouterr().out
+    assert "no person folders" in out
+    assert "Nobody is enrolled yet" in out
+
+
+def test_photos_but_no_about_gives_a_note_and_the_folder_name(tmp_path, capsys):
+    settings, photos = known_faces_settings(tmp_path, {"luran": FULL_SIZE_SARA})
+    (photos / "luran").mkdir()
+    people, matcher = load_known_faces(settings)
+    assert people == {"luran": Person("luran", "luran")}
+    assert matcher.match(FULL_SIZE_SARA)[0] == "luran"
+    assert "no about.md (or an empty one) for luran" in capsys.readouterr().out
+
+
+def test_about_but_no_photos_is_loaded_and_never_matched(tmp_path, capsys, caplog):
+    settings, photos = known_faces_settings(tmp_path)
+    (photos / "sara").mkdir()
+    (photos / "sara" / "about.md").write_text("# Sara Ahmed\n", encoding="utf-8")
+    people, matcher = load_known_faces(settings)
+    assert people["sara"].name == "Sara Ahmed"
+    assert matcher.match(SARA) == (None, 0.0)
+    with caplog.at_level(logging.WARNING, logger="car_vision.recognizer"):
+        made = Recognizer(settings, face_model=FakeFaceModel(FakeFace((10, 10, 90, 90), SARA)),
+                          people=people, matcher=matcher)
+    assert "not enrolled yet" in caplog.text and "sara" in caplog.text
+    assert made.recognize(frame())[0].name == UNKNOWN
+
+
+def test_about_in_a_wrong_encoding_gives_one_note_and_the_others_still_load(tmp_path, capsys):
+    settings, photos = known_faces_settings(tmp_path, {"sara": FULL_SIZE_SARA})
+    (photos / "sara").mkdir()
+    (photos / "sara" / "about.md").write_bytes("# Sára\n".encode("cp1252"))
+    (photos / "omar").mkdir()
+    (photos / "omar" / "about.md").write_text("# Omar Ali\n", encoding="utf-8")
+    people, matcher = load_known_faces(settings)
+    assert people == {"omar": people["omar"], "sara": Person("sara", "sara")}
+    assert people["omar"].name == "Omar Ali"
+    assert matcher.match(FULL_SIZE_SARA)[0] == "sara"           # still recognised, by folder name
+    out = capsys.readouterr().out
+    assert out.count("not saved as UTF-8") == 1
+    assert str(Path("sara") / "about.md") in out
+    assert "no about.md (or an empty one) for sara" not in out
+
+
+def test_invalid_folder_name_gives_a_note_naming_the_folder_and_the_rule(tmp_path, capsys):
+    settings, photos = known_faces_settings(tmp_path)
+    (photos / "Luran").mkdir()
+    people, _ = load_known_faces(settings)
+    assert people == {}
+    out = capsys.readouterr().out
+    assert "Note: Skipped the folder 'Luran'" in out
+    assert "small letters, digits and underscores" in out
+
+
+def test_about_with_only_a_comment_counts_as_no_about(tmp_path, capsys):
+    settings, photos = known_faces_settings(tmp_path)
+    (photos / "sara").mkdir()
+    (photos / "sara" / "about.md").write_text("<!-- write about Sara here -->\n", encoding="utf-8")
+    load_known_faces(settings)
+    assert "no about.md (or an empty one) for sara" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("stored", ["wrong size", "one row only"])
+def test_embeddings_that_do_not_fit_the_model_give_a_note_and_everyone_unknown(tmp_path, capsys, stored):
+    settings, photos = known_faces_settings(tmp_path)
+    path = tmp_path / "embeddings.npz"
+    if stored == "wrong size":
+        save_embeddings(path, ["sara"], np.stack([SARA]))              # 8 numbers, the model makes 512
+    else:
+        np.savez(path, ids=np.array(["sara"]), embeddings=np.zeros(1, np.float32))
+    people, matcher = load_known_faces(settings)
+    out = capsys.readouterr().out
+    assert "Run the enroll command again" in out
+    assert matcher.person_ids == set()
+    made = Recognizer(settings, face_model=FakeFaceModel(FakeFace((10, 10, 90, 90), FULL_SIZE_SARA)),
+                      people=people, matcher=matcher)
+    assert made.recognize(frame())[0].name == UNKNOWN                   # no error in the live loop
+
+
+# ---- the face model cannot load ------------------------------------------------------------
+
+
+def fake_face_libraries(monkeypatch, error):
+    """Stand-ins for onnxruntime and insightface whose model raises `error`."""
+    onnxruntime = types.ModuleType("onnxruntime")
+    onnxruntime.get_available_providers = lambda: ["CPUExecutionProvider"]
+    insightface = types.ModuleType("insightface")
+    insightface_app = types.ModuleType("insightface.app")
+
+    def face_analysis(**_kwargs):
+        raise error
+
+    insightface_app.FaceAnalysis = face_analysis
+    insightface.app = insightface_app
+    monkeypatch.setitem(sys.modules, "onnxruntime", onnxruntime)
+    monkeypatch.setitem(sys.modules, "insightface", insightface)
+    monkeypatch.setitem(sys.modules, "insightface.app", insightface_app)
+
+
+def test_a_face_model_that_cannot_load_gives_a_one_line_face_model_error(tmp_path, monkeypatch):
+    fake_face_libraries(monkeypatch, RuntimeError("Failed to download buffalo_l\nlong details"))
+    settings = dict(SETTINGS, models_dir=str(tmp_path / "models"))
+    with pytest.raises(FaceModelError) as caught:
+        load_face_model(settings)
+    assert "Failed to download buffalo_l" in str(caught.value)
+    assert "long details" not in str(caught.value)
+
+
+def test_a_wrong_device_setting_stays_a_config_error(tmp_path, monkeypatch):
+    fake_face_libraries(monkeypatch, RuntimeError("never reached"))
+    with pytest.raises(ConfigError, match="recognizer.device"):
+        load_face_model(dict(SETTINGS, device="gpu", models_dir=str(tmp_path / "models")))
+
+
+def test_recognizer_main_prints_cannot_start_and_returns_1(tmp_path, monkeypatch, capsys):
+    settings, _ = known_faces_settings(tmp_path)
+
+    def no_model(_settings):
+        raise FaceModelError("the face models could not be loaded: no network")
+
+    monkeypatch.setattr(recognizer_module, "load_config",
+                        lambda: {"stream": {}, "detector": {}, "recognizer": settings})
+    monkeypatch.setattr(recognizer_module, "Detector", lambda _settings: object())
+    monkeypatch.setattr(recognizer_module, "load_face_model", no_model)
+    assert recognizer_module.main(["--no-window"]) == 1
+    assert "Cannot start: the face models could not be loaded: no network" in capsys.readouterr().out
 
 
 def test_missing_setting_is_reported():
@@ -280,7 +459,8 @@ def painted_box(image):
 
 
 LONG_CARD = Person("sara", "Sara Ahmed", "Team lead",
-                   ("Built the car chassis", "Fourth-year student", "Likes robots", "A fourth line not shown"))
+                   ("Built the car chassis", "Fourth-year student", "Likes robots", "A fourth line not shown"),
+                   story="A story that the card never shows.", brief="# Sara Ahmed\n...")
 
 
 @pytest.mark.parametrize("width, height", [(640, 480), (640, 360)])

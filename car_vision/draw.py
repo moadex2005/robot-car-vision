@@ -100,6 +100,7 @@ CARD_GAP = 8                            # space between the face box and the car
 CARD_PADDING = 8
 CARD_LINE_GAP = 6
 CARD_MAX_LINES = 3
+CARD_MAX_CHARS = 60                     # no card row is longer than this, even before measuring
 CARD_BACKGROUND = (40, 40, 40)
 CARD_NAME_SCALE = 0.6
 CARD_NAME_THICKNESS = 2
@@ -118,7 +119,7 @@ def draw_faces(frame: np.ndarray, faces: Iterable[RecognizedFace], show_scores: 
         x1, y1, x2, y2 = face.box
         color = KNOWN_FACE_COLOR if face.is_known else UNKNOWN_FACE_COLOR
         cv2.rectangle(frame, (x1, y1), (x2, y2), color, BOX_THICKNESS)
-        text = face.name
+        text = face.name if drawable(face.name) else (face.person_id or "?")
         if show_scores:
             text += f" {face.similarity:.2f}"
         draw_caption(frame, text, x1, y1, color)
@@ -152,12 +153,22 @@ def draw_info_card(frame: np.ndarray, face: RecognizedFace, person: Person) -> N
         y += baseline + CARD_LINE_GAP
 
 
+def drawable(text: str) -> bool:
+    """True when cv2.putText can draw the text; it shows other letters (Arabic, accents) as '?'."""
+    return text.isascii()
+
+
 def _card_rows(person: Person, text_width: int) -> list[tuple[str, float, int, tuple[int, int, int]]]:
-    """The text rows of a card, each cut to fit: (text, scale, thickness, colour)."""
-    rows = [(_fit_text(person.name, text_width, CARD_NAME_SCALE, CARD_NAME_THICKNESS),
+    """The text rows of a card, each cut to fit: (text, scale, thickness, colour).
+
+    A name that cannot be drawn is replaced by the person id (the folder name);
+    other rows that cannot be drawn are left off. The web page shows them all.
+    """
+    name = person.name if drawable(person.name) else person.person_id
+    rows = [(_fit_text(name, text_width, CARD_NAME_SCALE, CARD_NAME_THICKNESS),
              CARD_NAME_SCALE, CARD_NAME_THICKNESS, KNOWN_FACE_COLOR)]
     texts = ([person.role] if person.role else []) + list(person.lines[:CARD_MAX_LINES])
-    for text in texts:
+    for text in filter(drawable, texts):
         rows.append((_fit_text(text, text_width, CARD_TEXT_SCALE, CARD_TEXT_THICKNESS),
                      CARD_TEXT_SCALE, CARD_TEXT_THICKNESS, (255, 255, 255)))
     return rows
@@ -190,10 +201,15 @@ def _card_position(face_box: tuple[int, int, int, int], card_width: int, card_he
 
 
 def _fit_text(text: str, max_width: int, scale: float, thickness: int) -> str:
-    """The text itself when it fits in max_width pixels, else as much as fits followed by '...'."""
-    if cv2.getTextSize(text, FONT, scale, thickness)[0][0] <= max_width:
+    """The text itself when it fits in max_width pixels, else as much as fits followed by '...'.
+
+    Text longer than CARD_MAX_CHARS is cut first, because measuring is slow for very long text.
+    """
+    too_long = len(text) > CARD_MAX_CHARS
+    text = text[:CARD_MAX_CHARS]
+    if not too_long and cv2.getTextSize(text, FONT, scale, thickness)[0][0] <= max_width:
         return text
-    for end in range(len(text) - 1, 0, -1):
+    for end in range(len(text), 0, -1):
         cut = text[:end].rstrip() + ELLIPSIS
         if cv2.getTextSize(cut, FONT, scale, thickness)[0][0] <= max_width:
             return cut

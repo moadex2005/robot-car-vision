@@ -8,8 +8,8 @@ the camera and look at it, turning their head a little between photos.
     .venv\\Scripts\\python.exe -m car_vision.capture sara --source webcam --count 5
 
 Photos go to data/people/<id>/ at the camera's full resolution. Take them only
-with the person's permission. Afterwards add the person to data/people.json
-and run the enroll command.
+with the person's permission. Afterwards write an about.md for the person in
+the same folder (see data/people.example/) and run the enroll command.
 """
 
 from __future__ import annotations

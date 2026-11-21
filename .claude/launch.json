@@ -1,0 +1,17 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "demo-clip",
+      "runtimeExecutable": ".venv\\Scripts\\python.exe",
+      "runtimeArgs": ["-m", "car_vision.app", "--file", "data/samples/car_clip.mp4"],
+      "port": 5000
+    },
+    {
+      "name": "demo-webcam",
+      "runtimeExecutable": ".venv\\Scripts\\python.exe",
+      "runtimeArgs": ["-m", "car_vision.app", "--source", "webcam"],
+      "port": 5000
+    }
+  ]
+}

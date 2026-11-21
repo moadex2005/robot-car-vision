@@ -11,6 +11,7 @@ failures-to-be-removed (XPASS) once the problem is fixed.
 
 from __future__ import annotations
 
+import base64
 import json
 from pathlib import Path
 from typing import Any
@@ -73,7 +74,8 @@ def settings(tmp_path: Path) -> dict[str, Any]:
     notes = tmp_path / "knowledge.md"
     notes.write_text("# Project\nThe car is called Rover.\n", encoding="utf-8")
     return {"provider": "anthropic", "model": "claude-sonnet-5-5", "effort": "low",
-            "max_tokens": 16000, "notes_file": str(notes), "web_search": True,
+            "max_tokens": 16000, "notes_file": str(notes),
+            "people_dir": str(tmp_path / "people"), "web_search": True,
             "web_search_max_uses": 3, "history_turns": 10, "seen_within_seconds": 3.0}
 
 
@@ -125,6 +127,30 @@ def test_wire_paused_turn_is_resumed_and_kept(settings: dict[str, Any]) -> None:
     assert wire.bodies[1]["messages"][1]["content"] == paused
     bot.ask("follow up")
     assert [m["role"] for m in wire.bodies[2]["messages"]] == ["user", "assistant", "assistant", "user"]
+
+
+def test_wire_describe_sends_one_user_turn_with_the_picture(settings: dict[str, Any]) -> None:
+    picture = bytes([0xFF, 0xD8, 0xFF, 0xE0]) + b"fake jpeg body"
+    answer = "NAME: Laptop\nABOUT: A portable computer.\nSPECS:\n- Weight: about 1.5 kg\n"
+    wire = Wire([reply_json([{"type": "text", "text": "Hi."}]),
+                 reply_json([{"type": "text", "text": answer}])])
+    bot = bot_on(settings, wire)
+    bot.ask("one")                                   # some chat history that must not go along
+    info = bot.describe(picture, "laptop")
+    body, headers = wire.bodies[1], wire.headers[1]
+    assert body["messages"] == [{"role": "user", "content": [
+        {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg",
+                                     "data": base64.standard_b64encode(picture).decode("ascii")}},
+        {"type": "text", "text": 'The object detector labelled this "laptop".'},
+    ]}]
+    assert body["system"] == [{"type": "text", "text": assistant.DESCRIBE_PROMPT,
+                               "cache_control": {"type": "ephemeral"}}]
+    assert body["tools"] == [{"type": "web_search_20260209", "name": "web_search", "max_uses": 3}]
+    assert body["model"] == "claude-sonnet-5-5" and body["output_config"] == {"effort": "low"}
+    assert "format" not in body["output_config"]     # no JSON mode: it cannot go with citations
+    assert set(headers["anthropic-beta"].split(",")) == {
+        "server-side-fallback-2026-07-01", "thinking-binding-controls-2026-08-01"}
+    assert info.name == "Laptop" and info.specs == (("Weight", "about 1.5 kg"),)
 
 
 def test_bom_from_a_piped_powershell_line_is_stripped_under_cp1252() -> None:

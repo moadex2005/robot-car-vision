@@ -8,7 +8,7 @@ __pycache__/
 .env
 
 # People's faces and anything computed from them stay on this laptop
-data/people/*/
+data/people/*
 data/people.json
 data/embeddings.npz
 

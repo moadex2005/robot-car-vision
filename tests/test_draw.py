@@ -4,10 +4,13 @@ import subprocess
 import sys
 from pathlib import Path
 
+import cv2
 import numpy as np
 
+from car_vision import draw
 from car_vision.draw import caption_for, color_for, draw_detections, draw_status
-from car_vision.state import Detection
+from car_vision.faces import Person
+from car_vision.state import Detection, RecognizedFace
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -71,6 +74,41 @@ def test_draw_status_writes_in_the_top_left_corner():
     draw_status(frame, "Detect FPS 15.0")
     assert frame[0:40, 0:200].any()
     assert not frame[100:, :].any()
+
+
+ARABIC_NAME = "سارة"          # Sara, in Arabic letters
+
+
+def test_non_ascii_text_is_replaced_by_the_id_or_left_off_the_card():
+    person = Person("sara", ARABIC_NAME, "Team lead",
+                    ("Built the chassis", "طالبة", "Café owner", "fourth"))
+    assert draw.drawable("Sara Ahmed") and not draw.drawable(ARABIC_NAME)
+    rows = [row[0] for row in draw._card_rows(person, 200)]
+    assert rows == ["sara", "Team lead", "Built the chassis"]          # of the first three lines
+
+
+def test_a_face_with_a_non_ascii_name_is_captioned_with_its_id(monkeypatch):
+    captions = []
+    monkeypatch.setattr(draw, "draw_caption", lambda frame, text, x, y, color: captions.append(text))
+    faces = [RecognizedFace(ARABIC_NAME, 0.7, (10, 10, 60, 60), "sara"),
+             RecognizedFace("Omar Ali", 0.7, (100, 10, 160, 60), "omar")]
+    draw.draw_faces(blank(), faces, show_scores=True)
+    assert captions == ["sara 0.70", "Omar Ali 0.70"]
+
+
+def test_very_long_card_text_is_cut_before_it_is_measured(monkeypatch):
+    measured = []
+    real_size = cv2.getTextSize
+
+    def counting_size(text, *args):
+        measured.append(len(text))
+        return real_size(text, *args)
+
+    monkeypatch.setattr(cv2, "getTextSize", counting_size)
+    cut = draw._fit_text("x" * 3000, 200, draw.CARD_TEXT_SCALE, draw.CARD_TEXT_THICKNESS)
+    assert cut.endswith("...")
+    assert max(measured) <= draw.CARD_MAX_CHARS + len("...")
+    assert len(measured) <= draw.CARD_MAX_CHARS + 1
 
 
 def test_draw_module_imports_only_cv2_numpy_and_state():

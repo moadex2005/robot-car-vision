@@ -3,7 +3,8 @@
 Pure logic with no camera and no model, so all of it can be tested with
 made-up numbers:
 
-- load_people reads data/people.json, the hand-written info cards.
+- load_people reads the person folders under data/people/: each folder is one
+  person, described by an optional hand-written about.md.
 - save_embeddings and load_embeddings keep the face vectors made by enroll.
 - FaceMatcher tells which enrolled person a face vector belongs to, if any.
 - FaceMemory keeps faces on screen between the frames where faces are checked.
@@ -11,8 +12,9 @@ made-up numbers:
 
 from __future__ import annotations
 
-import json
+import logging
 import os
+import re
 import zipfile
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -23,68 +25,144 @@ import numpy as np
 from car_vision.config import ConfigError
 from car_vision.state import Box, Detection, RecognizedFace
 
+log = logging.getLogger(__name__)
+
 ENROLL_COMMAND = r".venv\Scripts\python.exe -m car_vision.enroll"
+ABOUT_FILE = "about.md"
+PERSON_ID = re.compile(r"[a-z0-9_]+")            # a folder name: small letters, digits, underscores
+HTML_COMMENT = re.compile(r"<!--.*?-->", re.DOTALL)
+# "Role: x", "Role : x", "**Role:** x" and "**Role**: x", in any letter case.
+ROLE_LINE = re.compile(r"\*{0,2}role\s*\*{0,2}\s*:\s*\*{0,2}\s*(.*)", re.IGNORECASE)
+# A bullet: -, *, + or a bullet sign, then a space or a tab. A bare mark is an empty bullet.
+BULLET_LINE = re.compile(r"[-*+•](?:[ \t]+(.*))?")
 
 
-# ---- the people file --------------------------------------------------------
+# ---- the person folders ------------------------------------------------------
 
 
 @dataclass(frozen=True)
 class Person:
-    """One enrolled person and the text on their info card."""
+    """One person the camera may recognise, and what the team wrote about them."""
 
     person_id: str
     name: str
     role: str = ""
-    lines: tuple[str, ...] = ()
+    lines: tuple[str, ...] = ()     # every bullet line of about.md, in order
+    story: str = ""                 # the text that is left: no heading, no Role line, no bullets
+    brief: str = ""                 # the whole about.md as written
 
 
-def load_people(path: Path) -> dict[str, Person]:
-    """Read the people file. Every mistake in it becomes a ConfigError that names the file."""
-    path = Path(path)
-    if not path.is_file():
-        raise ConfigError(
-            f"People file not found: {path}\n"
-            "Copy data/people.example.json to data/people.json and write in your team."
-        )
+def load_people(photos_dir: Path, problems: dict[str, str] | None = None) -> dict[str, Person]:
+    """One Person per sub-folder of photos_dir, in name order.
+
+    A missing photos_dir gives nobody. A folder without about.md is a person
+    known only by the folder name.
+
+    Two problems do not stop the others, and each is reported once:
+    - a folder name that is not a valid id: the folder is skipped;
+    - an about.md that cannot be read (for example, not saved as UTF-8): that
+      person is known only by the folder name.
+    The report goes into `problems` (folder name -> a full sentence for the
+    user) when the caller gives one, else into the log as a warning.
+    """
+    photos_dir = Path(photos_dir)
+    if not photos_dir.is_dir():
+        return {}
+    people: dict[str, Person] = {}
+    for folder in sorted(p for p in photos_dir.iterdir() if p.is_dir()):
+        if not PERSON_ID.fullmatch(folder.name):
+            report(problems, folder.name,
+                   f"Skipped the folder '{folder.name}' in {photos_dir}: a person folder name may only "
+                   "have small letters, digits and underscores, like sara_ahmed. Rename it to use it.")
+            continue
+        people[folder.name] = read_person(folder, problems)
+    return people
+
+
+def read_person(folder: Path, problems: dict[str, str] | None = None) -> Person:
+    """The Person described by folder/about.md, or just the folder name when there is
+    none or it cannot be read (see load_people for where the problem goes)."""
+    about = folder / ABOUT_FILE
+    if not about.is_file():
+        return Person(person_id=folder.name, name=folder.name)
     try:
-        # utf-8-sig also accepts the invisible mark Windows Notepad may put at the start.
-        text = path.read_text(encoding="utf-8-sig")
-    except (OSError, UnicodeDecodeError) as error:
-        raise ConfigError(f"Could not read {path.name}: {error}") from error
+        text = read_about(about)
+    except ConfigError as error:
+        report(problems, folder.name,
+               f"{error} Until then {folder.name} is shown by folder name, with no card text.")
+        return Person(person_id=folder.name, name=folder.name)
+    return parse_about(folder.name, text)
+
+
+def report(problems: dict[str, str] | None, folder_name: str, message: str) -> None:
+    """Put a problem in the caller's dict, or in the log when there is none."""
+    if problems is None:
+        log.warning("%s", message)
+    else:
+        problems[folder_name] = message
+
+
+def has_about_text(person: Person) -> bool:
+    """True when the person's about.md says something besides HTML comments."""
+    return bool(HTML_COMMENT.sub("", person.brief).strip())
+
+
+def read_about(path: Path) -> str:
+    """The text of an about.md, read as UTF-8 and accepting a byte-order mark."""
     try:
-        data = json.loads(text)
-    except json.JSONDecodeError as error:
-        raise ConfigError(
-            f"{path.name} is not valid JSON: {error.msg} at line {error.lineno}, column {error.colno}. "
-            "Check for a missing comma or quote, or a comma after the last item."
-        ) from error
-    if not isinstance(data, dict):
-        raise ConfigError(
-            f'{path.name} must be one object of people, like {{"sara": {{"name": "Sara Ahmed"}}}}'
-        )
-    return {person_id: _person_from(path.name, person_id, entry) for person_id, entry in data.items()}
+        return path.read_text(encoding="utf-8-sig")
+    except UnicodeDecodeError:
+        problem = ConfigError(f"{path} is not saved as UTF-8. Open it in a text editor "
+                              "and save it again with the UTF-8 encoding.")
+    except OSError as error:
+        problem = ConfigError(f"Could not read {path}: {error.strerror or error}")
+    raise problem from None
 
 
-def _person_from(file_name: str, person_id: str, entry: object) -> Person:
-    where = f"{file_name}, person '{person_id}'"
-    if not person_id.strip():
-        raise ConfigError(f"{file_name} has a person with an empty id")
-    if not isinstance(entry, dict):
-        raise ConfigError(f'{where}: must be an object like {{"name": "Sara Ahmed"}}')
-    if "name" not in entry:
-        raise ConfigError(f"{where}: 'name' is missing")
-    name = entry["name"]
-    if not isinstance(name, str) or not name.strip():
-        raise ConfigError(f"{where}: 'name' must be text, got {name!r}")
-    role = entry.get("role", "")
-    if not isinstance(role, str):
-        raise ConfigError(f"{where}: 'role' must be text, got {role!r}")
-    lines = entry.get("lines", [])
-    if not isinstance(lines, list) or not all(isinstance(line, str) for line in lines):
-        raise ConfigError(f"{where}: 'lines' must be a list of text, like [\"Built the chassis\"]")
-    return Person(person_id=person_id, name=name.strip(), role=role.strip(),
-                  lines=tuple(line.strip() for line in lines))
+def parse_about(person_id: str, text: str) -> Person:
+    """Build a Person from the text of an about.md.
+
+    The first '# ' heading is the name (else the person id), the first
+    'Role:' line is the role, bullet lines (-, *, + or a bullet sign) are the
+    card lines, and the rest is the story. HTML comments are left out of all
+    of them.
+    """
+    name, role, role_seen = "", "", False
+    lines: list[str] = []
+    story: list[str] = []
+    for line in HTML_COMMENT.sub("", text).splitlines():
+        stripped = line.strip()
+        role_match = ROLE_LINE.fullmatch(stripped)
+        bullet_match = BULLET_LINE.fullmatch(stripped)
+        if not name and heading_text(line):
+            name = heading_text(line)
+        elif role_match and not role_seen:
+            role, role_seen = role_match.group(1).strip(" *"), True
+        elif bullet_match:
+            if (bullet_match.group(1) or "").strip():
+                lines.append(bullet_match.group(1).strip())
+        else:
+            story.append(line.rstrip())
+    return Person(person_id=person_id, name=name or person_id, role=role,
+                  lines=tuple(lines), story=join_paragraphs(story), brief=text)
+
+
+def heading_text(line: str) -> str:
+    """The text of a '# ' heading without closing #s, or '' when the line is not one."""
+    if not line.startswith("# "):
+        return ""
+    return line[2:].strip().rstrip("#").strip()
+
+
+def join_paragraphs(lines: list[str]) -> str:
+    """The lines as text, with one blank line between paragraphs and none at the ends."""
+    paragraphs: list[list[str]] = [[]]
+    for line in lines:
+        if line:
+            paragraphs[-1].append(line)
+        elif paragraphs[-1]:
+            paragraphs.append([])
+    return "\n\n".join("\n".join(paragraph) for paragraph in paragraphs if paragraph)
 
 
 # ---- the embeddings file ------------------------------------------------------
@@ -103,8 +181,12 @@ def save_embeddings(path: Path, ids: list[str], embeddings: np.ndarray) -> None:
     os.replace(temporary, path)
 
 
-def load_embeddings(path: Path) -> tuple[list[str], np.ndarray]:
-    """Read the file written by save_embeddings."""
+def load_embeddings(path: Path, vector_size: int | None = None) -> tuple[list[str], np.ndarray]:
+    """Read the file written by save_embeddings.
+
+    With vector_size, every stored face vector must have that many numbers
+    (the size the face model makes), else a ConfigError says to enroll again.
+    """
     path = Path(path)
     if not path.is_file():
         raise ConfigError(f"No saved faces at {path}. Run the enroll command first:\n  {ENROLL_COMMAND}")
@@ -112,15 +194,23 @@ def load_embeddings(path: Path) -> tuple[list[str], np.ndarray]:
         with np.load(path, allow_pickle=False) as data:
             ids = [str(value) for value in data["ids"]]
             embeddings = np.asarray(data["embeddings"], dtype=np.float32)
-    except (OSError, EOFError, ValueError, KeyError, zipfile.BadZipFile) as error:
+    except (OSError, EOFError, ValueError, KeyError, TypeError, zipfile.BadZipFile) as error:
         raise ConfigError(
             f"{path.name} is damaged or not an embeddings file ({error}). "
             f"Run the enroll command again:\n  {ENROLL_COMMAND}"
         ) from error
+    if embeddings.ndim != 2:
+        raise ConfigError(f"{path.name} does not hold one face vector per row. "
+                          f"Run the enroll command again:\n  {ENROLL_COMMAND}")
     if len(embeddings) != len(ids):
         raise ConfigError(
             f"{path.name} has {len(ids)} ids but {len(embeddings)} face vectors. "
             f"Run the enroll command again:\n  {ENROLL_COMMAND}"
+        )
+    if vector_size is not None and ids and embeddings.shape[1] != vector_size:
+        raise ConfigError(
+            f"{path.name} holds face vectors of {embeddings.shape[1]} numbers, but the face model "
+            f"makes {vector_size}. Run the enroll command again:\n  {ENROLL_COMMAND}"
         )
     return ids, embeddings
 
@@ -203,39 +293,55 @@ def shifted(box: Box, old_anchor: Box, new_anchor: Box) -> Box:
     return x1 + dx, y1 + dy, x2 + dx, y2 + dy
 
 
+TRACK_GAP_SECONDS = 0.3      # how long a face waits for its person track to come back
+
+
+@dataclass
+class RememberedFace:
+    """One face kept by FaceMemory, and what it needs to follow its person box."""
+
+    face: RecognizedFace
+    anchor: Box | None              # the person box when the face was seen
+    seen_at: float
+    box: Box                        # where the face was last shown
+    track_lost_at: float | None = None
+
+
 class FaceMemory:
     """Keeps the last recognised faces on screen between face checks."""
 
     def __init__(self, max_age_seconds: float = 1.0) -> None:
         self.max_age_seconds = max_age_seconds
-        # Each entry: the face, the box of its person track when it was seen, and when.
-        self._faces: list[tuple[RecognizedFace, Box | None, float]] = []
+        self._faces: list[RememberedFace] = []
 
     def remember(self, faces: Sequence[RecognizedFace], detections: Sequence[Detection], now: float) -> None:
         """Store the faces of a fresh face check. The faces stored before are forgotten."""
         boxes = person_boxes(detections)
         self._faces = [
-            (face, boxes.get(face.track_id) if face.track_id is not None else None, now)
+            RememberedFace(face, boxes.get(face.track_id) if face.track_id is not None else None,
+                           now, face.box)
             for face in faces
         ]
 
     def current(self, detections: Sequence[Detection], now: float) -> list[RecognizedFace]:
         """The remembered faces, moved along with their person boxes in this frame."""
         boxes = person_boxes(detections)
-        kept: list[tuple[RecognizedFace, Box | None, float]] = []
-        result: list[RecognizedFace] = []
-        for face, anchor, seen_at in self._faces:
-            if face.track_id is not None:
-                new_anchor = boxes.get(face.track_id)
-                if new_anchor is None:
-                    continue                           # the person left: forget the face
-                box = face.box if anchor is None else shifted(face.box, anchor, new_anchor)
-                result.append(RecognizedFace(face.name, face.similarity, box,
-                                             face.person_id, face.track_id))
-            else:
-                if now - seen_at > self.max_age_seconds:
-                    continue                           # too old to trust
-                result.append(face)
-            kept.append((face, anchor, seen_at))
-        self._faces = kept
-        return result
+        self._faces = [entry for entry in self._faces if self._still_valid(entry, boxes, now)]
+        return [RecognizedFace(e.face.name, e.face.similarity, e.box, e.face.person_id, e.face.track_id)
+                for e in self._faces]
+
+    def _still_valid(self, entry: RememberedFace, boxes: dict[int, Box], now: float) -> bool:
+        """Move the entry with its person box; False when it should be forgotten."""
+        if entry.face.track_id is None:
+            return now - entry.seen_at <= self.max_age_seconds      # else too old to trust
+        new_anchor = boxes.get(entry.face.track_id)
+        if new_anchor is None:
+            # The track is missing: keep the face where it was for a moment, in
+            # case the detector only missed the person in one or two frames.
+            if entry.track_lost_at is None:
+                entry.track_lost_at = now
+            return now - entry.track_lost_at <= TRACK_GAP_SECONDS
+        entry.track_lost_at = None
+        if entry.anchor is not None:
+            entry.box = shifted(entry.face.box, entry.anchor, new_anchor)
+        return True

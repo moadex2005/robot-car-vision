@@ -35,7 +35,7 @@ class RecognizedFace:
     name: str                     # display name, or UNKNOWN
     similarity: float             # cosine similarity to the best enrolled match
     box: Box
-    person_id: str | None = None  # key in people.json; None when unknown
+    person_id: str | None = None  # the person's folder name; None when unknown
     track_id: int | None = None   # track of the person box this face sits in
 
     @property

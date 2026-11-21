@@ -1,7 +1,8 @@
 """Turns each person's photos into saved face vectors, once, before the live view.
 
-Put 3 to 10 clear photos of each person in data/people/<person_id>/, where
-<person_id> is their key in data/people.json, then run:
+Every sub-folder of data/people/ is one person; the folder name is their id
+(small letters, digits, underscores). Put 3 to 10 clear photos of each person
+in their folder, next to their about.md, then run:
 
     .venv\\Scripts\\python.exe -m car_vision.enroll
 
@@ -25,10 +26,11 @@ import cv2
 import numpy as np
 
 from car_vision.config import ConfigError, load_config, require, resolve_path, section
-from car_vision.faces import load_people, normalized, save_embeddings
-from car_vision.recognizer import embedding_of, load_face_model
+from car_vision.faces import ABOUT_FILE, Person, has_about_text, load_people, normalized, save_embeddings
+from car_vision.recognizer import FaceModelError, embedding_of, load_face_model
 
 PHOTO_SUFFIXES = (".jpg", ".jpeg", ".png")
+SYSTEM_FILES = ("thumbs.db", "desktop.ini")
 ENOUGH_PHOTOS = 3
 CLEAR_WINNER = 2.0        # the largest face must be at least twice the area of the next
 
@@ -72,14 +74,21 @@ def pick_face(faces: list[Any]) -> tuple[Any | None, str]:
 
 
 def enroll(settings: dict, face_model: Any = None) -> dict[str, int]:
-    """Encode every usable photo and save the vectors. Returns person id -> photos used."""
-    people = load_people(resolve_path(require(settings, "people_file", str)))
+    """Encode every usable photo and save the vectors. Returns person id -> photos used.
+
+    The people are the sub-folders of photos_dir.
+    """
     photos_dir = resolve_path(require(settings, "photos_dir", str))
     embeddings_path = resolve_path(require(settings, "embeddings_file", str))
+    problems: dict[str, str] = {}             # folder name -> what is wrong with it
+    people = load_people(photos_dir, problems)
 
     found = {person_id: photos_in(photos_dir / person_id) for person_id in people}
     if not photos_dir.is_dir():
         print(f"The photo folder does not exist: {photos_dir}")
+    elif not people:
+        print(f"There are no person folders in {photos_dir}.")
+    print_ignored_files(photos_dir, people)
 
     ids: list[str] = []
     rows: list[np.ndarray] = []
@@ -97,8 +106,9 @@ def enroll(settings: dict, face_model: Any = None) -> dict[str, int]:
                 rows.append(vector)
                 used[person_id] += 1
 
-    print_table(people, found, used)
-    print_ignored_folders(photos_dir, people)
+    if people:
+        print_table(people, found, used)
+    print_about_notes(people, problems)
 
     if rows:
         save_embeddings(embeddings_path, ids, np.vstack(rows))
@@ -108,7 +118,21 @@ def enroll(settings: dict, face_model: Any = None) -> dict[str, int]:
         print(f"Nobody was enrolled, so {embeddings_path.name} was not written.\n"
               f"Put 3 to 10 clear photos of each person in {photos_dir}\\<person id>\\ "
               "(jpg or png), one face per photo, then run this again.")
+        remove_old_embeddings(embeddings_path)
     return used
+
+
+def remove_old_embeddings(path: Path) -> None:
+    """Delete faces saved by an earlier run, so people who were removed are not still recognised."""
+    if not path.is_file():
+        return
+    try:
+        path.unlink()
+    except OSError as error:
+        print(f"Could not remove the old {path.name} ({error.strerror or error}); "
+              "delete it by hand, or people from an earlier run are still recognised.")
+        return
+    print(f"Removed the old {path.name}, so nobody is recognised until people are enrolled again.")
 
 
 def encode_photo(face_model: Any, photo: Path) -> tuple[np.ndarray | None, str]:
@@ -116,7 +140,11 @@ def encode_photo(face_model: Any, photo: Path) -> tuple[np.ndarray | None, str]:
     image = read_photo(photo)
     if image is None:
         return None, "unreadable (not a jpg or png image, or damaged)"
-    face, reason = pick_face(list(face_model.get(image)))
+    try:
+        faces = list(face_model.get(image))
+    except Exception:                                # one strange photo must not stop the run
+        return None, "could not be processed"
+    face, reason = pick_face(faces)
     if face is None:
         return None, reason
     raw = embedding_of(face)
@@ -142,12 +170,35 @@ def print_table(people: dict, found: dict[str, list[Path]], used: dict[str, int]
                   f"{ENOUGH_PHOTOS} or more make recognition more reliable")
 
 
-def print_ignored_folders(photos_dir: Path, people: dict) -> None:
-    if not photos_dir.is_dir():
-        return
-    extra = sorted(p.name for p in photos_dir.iterdir() if p.is_dir() and p.name not in people)
-    if extra:
-        print(f"Ignored folders (no entry in the people file): {', '.join(extra)}")
+def ignored_files(folder: Path) -> list[str]:
+    """Names of the files in a person folder that enrol does not read.
+
+    about.md and the hidden files Windows makes (Thumbs.db, desktop.ini) are left out.
+    """
+    if not folder.is_dir():
+        return []
+    return sorted(p.name for p in folder.iterdir()
+                  if p.is_file() and p.suffix.lower() not in PHOTO_SUFFIXES
+                  and p.name != ABOUT_FILE and p.name.lower() not in SYSTEM_FILES
+                  and not p.name.startswith("."))
+
+
+def print_ignored_files(photos_dir: Path, people: dict[str, Person]) -> None:
+    """One line per person with files in other formats, such as .heic or .webp."""
+    for person_id in people:
+        names = ignored_files(photos_dir / person_id)
+        if names:
+            print(f"Ignored (not jpg or png): {', '.join(f'{person_id}/{name}' for name in names)}")
+
+
+def print_about_notes(people: dict[str, Person], problems: dict[str, str]) -> None:
+    """A note for each folder or about.md with a problem, and for each about.md missing or empty."""
+    for problem in problems.values():
+        print(f"Note: {problem}")
+    for person_id, person in people.items():
+        if not has_about_text(person) and person_id not in problems:
+            print(f"Note: {person_id} has no about.md (or an empty one), so they are shown "
+                  "by folder name, with no card text.")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -158,6 +209,9 @@ def main(argv: list[str] | None = None) -> int:
         used = enroll(section(load_config(), "recognizer"))
     except ConfigError as error:
         print(f"Cannot enroll: {error}")
+        return 1
+    except FaceModelError as error:
+        print(f"Cannot start: {error}")
         return 1
     return 0 if any(count > 0 for count in used.values()) else 1
 

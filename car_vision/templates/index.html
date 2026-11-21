@@ -1,0 +1,1186 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>Robot car vision</title>
+<style>
+  /* ---- colours, sizes and curves: light by default, dark when the system asks ---- */
+  :root {
+    --page: #f5f5f7;
+    --surface: #ffffff;
+    --text: #1d1d1f;
+    --grey: #6e6e73;
+    --hairline: rgba(0, 0, 0, 0.08);
+    --accent: #0066cc;
+    --accent-text: #ffffff;
+    --accent-soft: rgba(0, 102, 204, 0.1);
+    --warn: #d70015;
+    --glass: rgba(255, 255, 255, 0.62);
+    --glass-solid: rgba(255, 255, 255, 0.94);
+    --glass-edge: rgba(255, 255, 255, 0.75);
+    --glass-shine: rgba(255, 255, 255, 0.9);
+    --shadow: 0 18px 50px rgba(0, 0, 0, 0.08), 0 2px 8px rgba(0, 0, 0, 0.04);
+    --shadow-deep: 0 40px 90px rgba(0, 0, 0, 0.18), 0 10px 30px rgba(0, 0, 0, 0.08);
+    --blob-one: rgba(0, 113, 227, 0.22);
+    --blob-two: rgba(191, 90, 242, 0.16);
+    --blob-three: rgba(48, 209, 88, 0.14);
+
+    --font: "Segoe UI Variable Display", "Segoe UI", system-ui, -apple-system, "SF Pro Display",
+            "Helvetica Neue", Arial, sans-serif;
+    --gutter: clamp(16px, 4vw, 64px);
+    --nav-space: 84px;                  /* the fixed bar and its margin: anchors land below it */
+    --radius-big: 32px;
+    --radius: 24px;
+    --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+    --spring: cubic-bezier(0.34, 1.56, 0.64, 1);
+    font-size: clamp(17px, 0.55vw + 10px, 22px);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --page: #000000;
+      --surface: #1c1c1e;
+      --text: #f5f5f7;
+      --grey: #a1a1a6;
+      --hairline: rgba(255, 255, 255, 0.12);
+      --accent: #2997ff;
+      --accent-text: #000000;
+      --accent-soft: rgba(41, 151, 255, 0.16);
+      --warn: #ff453a;
+      --glass: rgba(30, 30, 32, 0.58);
+      --glass-solid: rgba(30, 30, 32, 0.95);
+      --glass-edge: rgba(255, 255, 255, 0.12);
+      --glass-shine: rgba(255, 255, 255, 0.16);
+      --shadow: 0 18px 50px rgba(0, 0, 0, 0.5), 0 2px 8px rgba(0, 0, 0, 0.3);
+      --shadow-deep: 0 40px 100px rgba(0, 0, 0, 0.7), 0 10px 30px rgba(0, 0, 0, 0.4);
+      --blob-one: rgba(10, 132, 255, 0.28);
+      --blob-two: rgba(191, 90, 242, 0.2);
+      --blob-three: rgba(48, 209, 88, 0.12);
+    }
+  }
+
+  * { box-sizing: border-box; }
+  [hidden] { display: none !important; }
+  html { scroll-behavior: smooth; scroll-padding-top: var(--nav-space); }
+  body {
+    margin: 0;
+    background: var(--page);
+    color: var(--text);
+    font-family: var(--font);
+    font-weight: 400;
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+    overflow-x: hidden;
+  }
+  a { color: var(--accent); }
+  :focus-visible { outline: 3px solid var(--accent); outline-offset: 3px; }
+  .visually-hidden {
+    position: absolute; width: 1px; height: 1px; overflow: hidden;
+    clip: rect(0 0 0 0); white-space: nowrap;
+  }
+
+  /* ---- liquid glass: translucent fill, blur, hairline edge, a light line along the top ---- */
+  .glass {
+    background: var(--glass-solid);
+    border: 1px solid var(--glass-edge);
+    box-shadow: inset 0 1px 0 var(--glass-shine), var(--shadow);
+  }
+  @supports ((-webkit-backdrop-filter: blur(1px)) or (backdrop-filter: blur(1px))) {
+    .glass {
+      background: var(--glass);
+      -webkit-backdrop-filter: blur(24px) saturate(180%);
+      backdrop-filter: blur(24px) saturate(180%);
+    }
+  }
+
+  /* ---- slow colour shapes behind the glass (transform only) ---- */
+  .backdrop { position: fixed; inset: 0; z-index: -1; overflow: hidden; pointer-events: none; }
+  .blob { position: absolute; border-radius: 50%; }
+  .blob.one {
+    width: 60vmax; height: 60vmax; left: -18vmax; top: -14vmax;
+    background: radial-gradient(closest-side, var(--blob-one), transparent);
+    animation: drift-one 38s ease-in-out infinite alternate;
+  }
+  .blob.two {
+    width: 55vmax; height: 55vmax; right: -20vmax; top: 22vh;
+    background: radial-gradient(closest-side, var(--blob-two), transparent);
+    animation: drift-two 46s ease-in-out infinite alternate;
+  }
+  .blob.three {
+    width: 50vmax; height: 50vmax; left: 20vw; bottom: -30vmax;
+    background: radial-gradient(closest-side, var(--blob-three), transparent);
+    animation: drift-three 52s ease-in-out infinite alternate;
+  }
+  @keyframes drift-one { to { transform: translate(14vw, 10vh) scale(1.08); } }
+  @keyframes drift-two { to { transform: translate(-12vw, -8vh) scale(0.94); } }
+  @keyframes drift-three { to { transform: translate(-10vw, -14vh) scale(1.1); } }
+
+  /* ---- the navigation bar ---- */
+  .nav {
+    position: fixed; z-index: 50;
+    top: 14px; left: 50%;
+    width: min(1240px, calc(100% - 2 * var(--gutter)));
+    display: flex; align-items: center; gap: 1.2rem;
+    padding: 0.55rem 0.6rem 0.55rem 1.3rem;
+    border-radius: 999px;
+    transform: translateX(-50%);
+    transition: transform 0.5s var(--ease-out);
+  }
+  .nav.is-compact { transform: translateX(-50%) translateY(-6px) scale(0.97); }
+  .brand {
+    font-weight: 650; font-size: 1.02rem; letter-spacing: -0.01em;
+    color: var(--text); text-decoration: none; white-space: nowrap;
+  }
+  .nav-links { display: flex; gap: 0.3rem; margin-right: auto; }
+  .nav-links a {
+    color: var(--grey); text-decoration: none; font-size: 0.88rem;
+    padding: 0.3rem 0.75rem; border-radius: 999px;
+    transition: color 0.2s, background-color 0.2s;
+  }
+  .nav-links a:hover { color: var(--text); background: var(--accent-soft); }
+
+  .status-pill {
+    display: inline-flex; align-items: center; gap: 0.55rem;
+    padding: 0.38rem 0.9rem 0.38rem 0.75rem;
+    border-radius: 999px;
+    background: var(--accent-soft);
+    font-size: 0.85rem;
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+  }
+  .dot { position: relative; width: 0.6em; height: 0.6em; border-radius: 50%; background: var(--grey); flex: none; }
+  .dot::after {
+    content: ""; position: absolute; inset: 0; border-radius: 50%;
+    background: inherit; opacity: 0;
+  }
+  .is-live .dot { background: #30d158; }
+  .is-live .dot::after { animation: ping 2s var(--ease-out) infinite; }
+  .is-down .dot { background: #ff9f0a; }
+  .is-offline .dot { background: var(--warn); }
+  @keyframes ping { 0% { transform: scale(1); opacity: 0.6; } 100% { transform: scale(3); opacity: 0; } }
+  .status-state { font-weight: 600; }
+  .status-item { color: var(--grey); }
+  .status-item::before { content: "\00b7"; margin-right: 0.55rem; }
+  .fps { display: inline-block; min-width: 2.6ch; text-align: right; }
+  .is-offline .status-item { display: none; }
+
+  /* ---- buttons: pills that react like a spring ---- */
+  .pill {
+    display: inline-flex; align-items: center; justify-content: center; gap: 0.4em;
+    font: inherit; font-size: 1rem; font-weight: 500;
+    padding: 0.75rem 1.5rem;
+    border-radius: 999px;
+    border: 1px solid transparent;
+    text-decoration: none;
+    cursor: pointer;
+    transition: transform 0.45s var(--spring), background-color 0.2s, opacity 0.2s;
+  }
+  .pill:hover { transform: translateY(-2px) scale(1.03); }
+  .pill:active { transform: scale(0.96); transition-duration: 0.12s; }
+  .pill.primary { background: var(--accent); color: var(--accent-text); }
+  .pill.secondary { background: transparent; color: var(--accent); border-color: var(--accent); }
+  .pill:disabled { opacity: 0.4; cursor: progress; transform: none; }
+  .pill.small { font-size: 0.85rem; padding: 0.4rem 0.95rem; }
+
+  /* ---- sections ---- */
+  main { padding: 0 var(--gutter); }
+  .section { max-width: 1240px; margin: 0 auto; padding: clamp(48px, 8vh, 110px) 0; }
+  .section.wide { max-width: 1680px; }       /* the live view uses more of a big screen */
+  .section-head { text-align: center; margin-bottom: clamp(24px, 4vh, 48px); }
+  .section-head h2 {
+    margin: 0;
+    font-size: clamp(2.1rem, 3.6vw, 3.8rem);
+    font-weight: 700; letter-spacing: -0.03em; line-height: 1.05;
+  }
+  .section-head p { margin: 0.6rem auto 0; max-width: 40rem; color: var(--grey); font-size: 1.1rem; }
+
+  .hero {
+    min-height: calc(88svh - var(--nav-space));
+    padding-top: calc(var(--nav-space) + 6vh);
+    display: grid; place-content: center; text-align: center;
+    overflow: clip;                     /* the slower headline never slides into the next section */
+  }
+  .hero-title {
+    margin: 0;
+    font-size: clamp(3.4rem, 9vw, 9.5rem);
+    font-weight: 700; letter-spacing: -0.045em; line-height: 0.98;
+  }
+  .hero-line { margin: 1.2rem 0 0; font-size: clamp(1.3rem, 2.2vw, 2.1rem); color: var(--grey); letter-spacing: -0.01em; }
+  .hero-actions { margin-top: 2.2rem; display: flex; flex-wrap: wrap; justify-content: center; gap: 0.9rem; }
+
+  /* Parts of a section fade and rise into place (only when the script runs, so nothing stays hidden
+     without it). The anchors themselves are never moved, so "Watch live" lands in the right place. */
+  .js .reveal { opacity: 0; transform: translateY(32px); transition: opacity 0.9s var(--ease-out), transform 0.9s var(--ease-out); }
+  .js .reveal.is-in { opacity: 1; transform: none; }
+
+  /* ---- the live view: the product shot, with the details sheet beside it ---- */
+  .stage { display: grid; grid-template-columns: minmax(0, 1fr); gap: 28px; align-items: start; }
+  .shot { min-width: 0; }
+  .frame {
+    --ratio: 1.7778;
+    position: relative;
+    /* As wide as the layout allows, but short enough to leave the first row of pills in view. */
+    width: min(100%, calc((100svh - var(--nav-space) - 9.5rem) * var(--ratio)));
+    aspect-ratio: var(--ratio);
+    margin: 0 auto;
+    background: #000;
+    border-radius: var(--radius-big);
+    overflow: hidden;
+    box-shadow: 0 0 0 1px var(--hairline), var(--shadow-deep);   /* the ring keeps the edge visible on a dark page */
+  }
+  .frame img {
+    position: absolute; inset: 0;
+    width: 100%; height: 100%;
+    object-fit: contain;
+    display: block;
+  }
+  .frame img.is-clickable { cursor: pointer; }   /* only over the picture, not over black bars */
+  .waiting, .offline {
+    position: absolute; inset: 0;
+    display: grid; place-items: center;
+    text-align: center; padding: 1rem;
+    color: #f5f5f7;
+  }
+  .waiting { color: #a1a1a6; font-size: 1.2rem; }
+  .offline { background: rgba(0, 0, 0, 0.72); font-size: clamp(1.6rem, 3vw, 2.6rem); font-weight: 700; letter-spacing: -0.02em; }
+  .offline small { display: block; margin-top: 0.4rem; font-size: 1rem; font-weight: 400; color: #a1a1a6; letter-spacing: 0; }
+
+  /* Banners: small glass capsules over the top edge of the video. */
+  .banners {
+    position: absolute; top: 0; left: 0; right: 0;
+    display: flex; flex-direction: column; align-items: center; gap: 10px;
+    padding: clamp(12px, 1.4vw, 22px);
+    pointer-events: none;
+  }
+  .capsule {
+    display: inline-flex; align-items: center; gap: 0.55em;
+    padding: 0.55em 1.25em;
+    border-radius: 999px;
+    font-weight: 650; letter-spacing: -0.01em; line-height: 1.2;
+    animation: capsule-in 0.6s var(--spring);
+  }
+  .warning {
+    background: rgba(215, 0, 21, 0.9);
+    color: #fff;
+    font-size: clamp(1.4rem, 2.2vw, 2.1rem);
+    border: 1px solid rgba(255, 255, 255, 0.35);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.35), 0 16px 40px rgba(215, 0, 21, 0.45);
+  }
+  .warning svg { width: 1.15em; height: 1.15em; flex: none; }
+  .greetings { display: flex; flex-direction: column; align-items: center; gap: 8px; }
+  .greeting {
+    color: #fff; font-size: clamp(1.2rem, 1.8vw, 1.7rem);
+    background: rgba(30, 30, 32, 0.55);
+    border: 1px solid rgba(255, 255, 255, 0.28);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.3), 0 12px 30px rgba(0, 0, 0, 0.3);
+    -webkit-backdrop-filter: blur(16px) saturate(180%);
+    backdrop-filter: blur(16px) saturate(180%);
+  }
+  @keyframes capsule-in { from { opacity: 0; transform: translateY(-14px) scale(0.92); } to { opacity: 1; transform: none; } }
+
+  .view-meta {
+    display: flex; flex-wrap: wrap; justify-content: center; gap: 0.3rem 1.2rem;
+    margin: 1.1rem 0 0; min-height: 1.4em;
+    color: var(--grey); font-size: 0.85rem;
+  }
+  .notes { display: contents; }
+  .note::before { content: "Note: "; font-weight: 600; color: var(--text); }
+  .stopped { color: var(--warn); font-weight: 600; }
+
+  /* In view: a wrapping row of glass pills under the video. */
+  .inview { margin-top: 1.6rem; text-align: center; }
+  .inview h3 { margin: 0 0 0.9rem; font-size: 0.8rem; font-weight: 600; letter-spacing: 0.14em; text-transform: uppercase; color: var(--grey); }
+  .things { list-style: none; margin: 0; padding: 0; display: flex; flex-wrap: wrap; justify-content: center; gap: 0.6rem; }
+  .things li { animation: pill-in 0.55s var(--spring); }
+  @keyframes pill-in { from { opacity: 0; transform: translateY(10px) scale(0.9); } to { opacity: 1; transform: none; } }
+  .thing {
+    display: inline-flex; align-items: baseline; gap: 0.6rem;
+    padding: 0.6rem 1.15rem;
+    border-radius: 999px;
+    color: var(--text);
+    font: inherit; font-size: 1.02rem;
+    cursor: pointer;
+    transition: transform 0.45s var(--spring);
+  }
+  .thing:hover { transform: translateY(-3px) scale(1.04); }
+  .thing:active { transform: scale(0.95); transition-duration: 0.12s; }
+  .thing-name { font-weight: 600; }
+  .thing-detail { color: var(--grey); font-size: 0.85rem; font-variant-numeric: tabular-nums; }
+  .thing.is-known .thing-detail { color: var(--accent); }
+  .thing.is-known::before { content: ""; align-self: center; width: 0.5em; height: 0.5em; border-radius: 50%; background: var(--accent); }
+  .thing.is-open { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent), var(--shadow); }
+  .quiet { margin: 0; color: var(--grey); }
+  .privacy { margin: 1.1rem auto 0; max-width: 38rem; color: var(--grey); font-size: 0.85rem; line-height: 1.45; }
+
+  /* The details sheet slides in from the right. From 1280 px wide the video makes room for it. */
+  .details {
+    border-radius: var(--radius-big);
+    padding: 1.3rem 1.4rem 1.5rem;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    animation: sheet-in 0.55s var(--ease-out);
+  }
+  @keyframes sheet-in { from { opacity: 0; transform: translateX(48px); } to { opacity: 1; transform: none; } }
+  @media (min-width: 1280px) {
+    .stage.has-details { grid-template-columns: minmax(0, 1fr) clamp(360px, 27vw, 470px); }
+    .details { position: sticky; top: calc(var(--nav-space) + 8px); max-height: calc(100svh - var(--nav-space) - 24px); }
+  }
+  @media (max-width: 1279.98px) {
+    .details {
+      position: fixed; z-index: 40;
+      top: calc(var(--nav-space) + 4px); right: 16px; bottom: 16px;
+      width: min(440px, calc(100vw - 32px));
+    }
+  }
+  .details-top { display: flex; align-items: center; justify-content: space-between; margin-bottom: 1rem; }
+  .details-label { font-size: 0.8rem; font-weight: 600; letter-spacing: 0.14em; text-transform: uppercase; color: var(--grey); }
+  .round {
+    width: 2.3rem; height: 2.3rem; padding: 0;
+    display: grid; place-items: center;
+    border-radius: 50%;
+    border: 1px solid var(--hairline);
+    background: var(--accent-soft);
+    color: var(--text);
+    cursor: pointer;
+    transition: transform 0.45s var(--spring);
+  }
+  .round:hover { transform: scale(1.08); }
+  .round:active { transform: scale(0.92); transition-duration: 0.12s; }
+  .round svg { width: 0.9rem; height: 0.9rem; }
+  .photo {
+    display: block;
+    width: 100%; max-height: 32svh;
+    object-fit: contain;
+    background: rgba(0, 0, 0, 0.85);
+    border-radius: 20px;
+    margin-bottom: 1.1rem;
+  }
+  .details-title { font-size: clamp(1.7rem, 2.2vw, 2.3rem); font-weight: 700; letter-spacing: -0.025em; line-height: 1.1; overflow-wrap: anywhere; }
+  .details-meta { margin-top: 0.45rem; color: var(--grey); font-size: 0.85rem; font-variant-numeric: tabular-nums; }
+  .details-role { margin-top: 0.5rem; color: var(--accent); font-weight: 600; font-size: 1.05rem; }
+  .details-content { margin-top: 1.2rem; }
+  .details-content p { margin: 0 0 0.8rem; }
+  .details-content ul { margin: 0 0 1rem; padding-left: 1.15em; }
+  .details-content li + li { margin-top: 0.3rem; }
+  .story p { color: var(--grey); white-space: pre-line; }
+  .looking { color: var(--grey); }
+  .problem { color: var(--warn); font-weight: 500; }
+  .specs { display: grid; grid-template-columns: minmax(0, 0.85fr) minmax(0, 1.15fr); margin: 0.4rem 0 1rem; }
+  .specs dt, .specs dd { margin: 0; padding: 0.55rem 0; border-top: 1px solid var(--hairline); overflow-wrap: anywhere; }
+  .specs dt { color: var(--grey); padding-right: 1rem; }
+
+  /* ---- the chat card ---- */
+  .chat {
+    max-width: 920px; margin: 0 auto;
+    border-radius: var(--radius-big);
+    padding: clamp(18px, 2.2vw, 30px);
+    display: grid; grid-template-rows: auto minmax(0, 1fr) auto; gap: 1rem;
+  }
+  .chat-top { display: flex; align-items: center; justify-content: space-between; gap: 1rem; }
+  .chat-title { font-size: 0.8rem; font-weight: 600; letter-spacing: 0.14em; text-transform: uppercase; color: var(--grey); }
+  .messages {
+    list-style: none; margin: 0; padding: 0 0.3rem 0 0;
+    height: min(52svh, 520px);
+    overflow-y: auto;
+    display: flex; flex-direction: column; gap: 0.9rem;
+  }
+  .hint { color: var(--grey); margin: auto 0; text-align: center; padding: 0 1rem; }
+  .msg { max-width: 88%; overflow-wrap: anywhere; animation: msg-in 0.5s var(--spring); }
+  @keyframes msg-in { from { opacity: 0; transform: translateY(12px) scale(0.97); } to { opacity: 1; transform: none; } }
+  .msg .text { margin: 0; white-space: pre-wrap; }
+  .msg.question {
+    align-self: flex-end;
+    background: var(--accent); color: var(--accent-text);
+    padding: 0.65rem 1.05rem;
+    border-radius: 22px 22px 6px 22px;
+  }
+  .msg.answer {
+    align-self: flex-start;
+    background: var(--surface);
+    border: 1px solid var(--hairline);
+    padding: 0.75rem 1.1rem;
+    border-radius: 22px 22px 22px 6px;
+  }
+  .msg.error { align-self: flex-start; color: var(--warn); padding: 0.4rem 0.2rem; font-weight: 500; }
+  .msg.thinking { align-self: flex-start; color: var(--grey); padding-left: 0.2rem; }
+  .dots { display: inline-flex; gap: 0.25em; margin-left: 0.45em; vertical-align: middle; }
+  .dots i { width: 0.35em; height: 0.35em; border-radius: 50%; background: currentColor; animation: blink 1.2s infinite; }
+  .dots i:nth-child(2) { animation-delay: 0.2s; }
+  .dots i:nth-child(3) { animation-delay: 0.4s; }
+  @keyframes blink { 0%, 80%, 100% { opacity: 0.2; } 40% { opacity: 1; } }
+
+  .web { margin-top: 0.6rem; display: flex; flex-wrap: wrap; align-items: center; gap: 0.4rem 0.5rem; font-size: 0.85rem; }
+  .web-label { font-weight: 600; color: var(--grey); margin-right: 0.2rem; }
+  .source {
+    color: var(--accent); text-decoration: none;
+    background: var(--accent-soft);
+    border-radius: 999px;
+    padding: 0.12rem 0.7rem;
+    max-width: 100%;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    transition: transform 0.4s var(--spring);
+  }
+  .source:hover { transform: translateY(-1px) scale(1.04); }
+  .more { color: var(--grey); }
+
+  .ask-form { display: flex; gap: 0.7rem; }
+  .ask-form input {
+    flex: 1; min-width: 0;
+    background: var(--surface);
+    color: var(--text);
+    border: 1px solid var(--hairline);
+    border-radius: 999px;
+    padding: 0.8rem 1.25rem;
+    font: inherit; font-size: 1.05rem;
+  }
+  .ask-form input::placeholder { color: var(--grey); }
+  .ask-form input:focus-visible { outline: 3px solid var(--accent); outline-offset: 1px; }
+
+  /* ---- footer ---- */
+  .footer {
+    max-width: 1240px; margin: 0 auto;
+    padding: 2.4rem var(--gutter) 3rem;
+    border-top: 1px solid var(--hairline);
+    color: var(--grey); font-size: 0.85rem;
+    display: flex; flex-wrap: wrap; justify-content: space-between; gap: 0.6rem 2rem;
+  }
+  .footer p { margin: 0; max-width: 42rem; }
+
+  /* Narrow windows are not the target, but stay usable. */
+  @media (max-width: 760px) {
+    .nav-links { display: none; }
+    .nav { gap: 0.6rem; }
+    .brand { margin-right: auto; }
+    .status-item.wide { display: none; }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    html { scroll-behavior: auto; }
+    *, *::before, *::after { animation: none !important; transition: none !important; }
+    .js .reveal { opacity: 1; transform: none; }
+    .hero-text { transform: none !important; }
+  }
+</style>
+</head>
+<body>
+<div class="backdrop" aria-hidden="true"><span class="blob one"></span><span class="blob two"></span><span class="blob three"></span></div>
+
+<header class="nav glass" id="nav">
+  <a class="brand" href="#top">Robot Car Vision</a>
+  <nav class="nav-links" aria-label="Sections">
+    <a href="#watch">Live view</a>
+    <a href="#ask">Ask</a>
+  </nav>
+  <div class="status-pill" id="status" role="status">
+    <span class="dot" aria-hidden="true"></span>
+    <span class="status-state" id="liveText">Connecting</span>
+    <span class="status-item wide" id="source">&ndash;</span>
+    <span class="status-item"><span class="fps" id="fps">&ndash;</span> fps</span>
+    <span class="status-item wide" id="device">&ndash;</span>
+  </div>
+</header>
+
+<main>
+  <section class="hero" id="top">
+    <div class="hero-text" id="heroText">
+      <h1 class="hero-title">Robot Car Vision</h1>
+      <p class="hero-line">See what the car sees.</p>
+      <div class="hero-actions">
+        <a class="pill primary" href="#watch">Watch live</a>
+        <a class="pill secondary" href="#ask">Ask the assistant</a>
+      </div>
+    </div>
+  </section>
+
+  <section class="section wide" aria-label="Live view">
+    <div class="section-head reveal">
+      <h2>Live view</h2>
+      <p>Click anything in the picture, or a name below it, to see what it is.</p>
+    </div>
+    <!-- "Watch live" lands on the video itself, so the whole picture fits below the bar. -->
+    <div class="stage" id="watch">
+      <div class="shot reveal">
+        <div class="frame" id="frame">
+          <img id="video" src="/video" alt="Live camera view from the car, with labelled objects and faces">
+          <div class="waiting" id="waiting">Waiting for the camera&hellip;</div>
+          <div class="banners">
+            <div class="capsule warning" id="warning" role="alert" hidden>
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M12 3 2 21h20L12 3z" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linejoin="round"/>
+                <path d="M12 10v5" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/>
+                <circle cx="12" cy="18" r="1.3" fill="currentColor"/>
+              </svg>
+              <span id="warningText"></span>
+            </div>
+            <div class="greetings" id="greetings" aria-live="polite"></div>
+          </div>
+          <div class="offline" id="offline" hidden>
+            <div>Program not running<small>Start it again with python -m car_vision.app</small></div>
+          </div>
+        </div>
+        <div class="view-meta" id="viewMeta">
+          <span>Face recognition <span id="faces">&ndash;</span></span>
+          <span class="notes" id="notes"></span>
+        </div>
+
+        <div class="inview" aria-label="In view">
+          <h3>In view</h3>
+          <ul class="things" id="things"></ul>
+          <p class="quiet" id="nothing">Nothing detected right now</p>
+          <p class="privacy" id="privacy">A click on an object sends a small cut-out of the picture to the assistant's API. A click on a person sends nothing.</p>
+        </div>
+      </div>
+
+      <aside class="details glass" id="details" aria-label="Details of what was clicked" hidden>
+        <div class="details-top">
+          <span class="details-label">Details</span>
+          <button class="round" id="closeDetails" type="button" title="Close (Esc)">
+            <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3 3l10 10M13 3 3 13" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+            <span class="visually-hidden">Close</span>
+          </button>
+        </div>
+        <div id="detailsBody" aria-live="polite">
+          <img class="photo" id="detailPhoto" alt="The part of the picture that was clicked" hidden>
+          <div class="details-title" id="detailTitle"></div>
+          <div class="details-meta" id="detailMeta"></div>
+          <div class="details-role" id="detailRole" hidden></div>
+          <div class="details-content" id="detailContent"></div>
+        </div>
+      </aside>
+    </div>
+  </section>
+
+  <section class="section" id="ask" aria-label="Ask the assistant">
+    <div class="section-head reveal">
+      <h2>Ask the assistant.</h2>
+      <p>About the project, the team or anything else. Answers come from the team's notes, or from the web when the notes do not cover it.</p>
+    </div>
+    <div class="chat glass reveal" id="chat">
+      <div class="chat-top">
+        <span class="chat-title">Conversation</span>
+        <button class="pill secondary small" id="clear" type="button">New conversation</button>
+      </div>
+      <ol class="messages" id="messages" aria-live="polite">
+        <li class="hint" id="hint">Type a question below and press Enter.</li>
+      </ol>
+      <form class="ask-form" id="askForm" autocomplete="off">
+        <label class="visually-hidden" for="question">Your question</label>
+        <input id="question" type="text" maxlength="{{ max_question_chars }}" placeholder="Ask a question">
+        <button class="pill primary" id="send" type="submit">Send</button>
+      </form>
+    </div>
+  </section>
+</main>
+
+<footer class="footer">
+  <p>A click on an object sends a small cut-out of the picture to the assistant's API. A click on a person sends nothing.</p>
+  <p>Runs on this laptop. Nothing is sent to the car.</p>
+</footer>
+
+<script>
+"use strict";
+
+// Every piece of text from the server goes in with textContent, never as HTML.
+
+document.documentElement.classList.add("js");   // the reveal effects only apply when this script runs
+
+const POLL_MS = 500;           // the status is asked for twice a second
+const STATUS_TIMEOUT_MS = 2000;
+const MAX_SOURCES = 3;         // web answers list at most this many links
+const PHOTO_PREFIX = "data:image/jpeg;base64,";   // the only kind of photo address that is shown
+const AREA_TITLE = "Something the detector has no name for";
+const UNKNOWN_HINT = "Add a folder with photos and an about.md for them in data/people to show their details here.";
+
+const byId = (id) => document.getElementById(id);
+const video = byId("video"), frame = byId("frame"), waiting = byId("waiting"), offline = byId("offline");
+const warning = byId("warning"), warningText = byId("warningText"), greetings = byId("greetings");
+const statusPill = byId("status"), liveText = byId("liveText"), notes = byId("notes");
+const sourceText = byId("source"), fpsText = byId("fps"), deviceText = byId("device"), facesText = byId("faces");
+const things = byId("things"), nothing = byId("nothing"), stage = byId("watch");
+const details = byId("details"), closeButton = byId("closeDetails");
+const detailPhoto = byId("detailPhoto"), detailTitle = byId("detailTitle"), detailMeta = byId("detailMeta");
+const detailRole = byId("detailRole"), detailContent = byId("detailContent");
+const messages = byId("messages"), hint = byId("hint"), form = byId("askForm");
+const input = byId("question"), send = byId("send"), clearButton = byId("clear");
+const nav = byId("nav"), heroText = byId("heroText");
+
+// ---- small helpers -------------------------------------------------------
+
+function make(tag, className, text) {
+  const node = document.createElement(tag);
+  if (className) node.className = className;
+  if (text !== undefined) node.textContent = text;
+  return node;
+}
+const asText = (value) => (typeof value === "string" ? value : value == null ? "" : String(value));
+const asList = (value) => (Array.isArray(value) ? value : []);
+
+function setText(node, text) {
+  if (node.textContent !== text) node.textContent = text;
+}
+
+// The last value drawn for each part of the page, so only what changed is redrawn.
+const drawn = {};
+function changed(part, value) {
+  const text = JSON.stringify(value);
+  if (drawn[part] === text) return false;
+  drawn[part] = text;
+  return true;
+}
+function forgetDrawn() {
+  for (const part of Object.keys(drawn)) delete drawn[part];
+}
+
+// ---- the page coming alive: compact bar, slow headline, sections that rise in ----
+
+const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)");
+let scrollQueued = false;
+
+function onScroll() {
+  if (scrollQueued) return;
+  scrollQueued = true;
+  requestAnimationFrame(() => {
+    scrollQueued = false;
+    const y = window.scrollY;
+    nav.classList.toggle("is-compact", y > 24);
+    // The headline moves at 75 % of the page's speed and fades while the hero scrolls away.
+    if (!reducedMotion.matches && y < window.innerHeight) {
+      heroText.style.transform = "translateY(" + (y * 0.25).toFixed(1) + "px)";
+      heroText.style.opacity = Math.max(0, 1 - y / (window.innerHeight * 0.6)).toFixed(3);
+    }
+  });
+}
+window.addEventListener("scroll", onScroll, { passive: true });
+onScroll();
+
+if ("IntersectionObserver" in window && !reducedMotion.matches) {
+  const reveals = new IntersectionObserver((entries) => {
+    for (const entry of entries) {
+      if (!entry.isIntersecting) continue;
+      entry.target.classList.add("is-in");
+      reveals.unobserve(entry.target);
+    }
+  }, { threshold: 0.08 });
+  for (const section of document.querySelectorAll(".reveal")) reveals.observe(section);
+} else {
+  for (const section of document.querySelectorAll(".reveal")) section.classList.add("is-in");
+}
+
+// ---- the video -----------------------------------------------------------
+
+function fitVideo() {
+  const width = video.naturalWidth, height = video.naturalHeight;
+  const ready = width > 0 && height > 0;
+  waiting.hidden = ready;
+  if (!ready) return;
+  const ratio = (width / height).toFixed(4);
+  if (frame.style.getPropertyValue("--ratio") !== ratio) frame.style.setProperty("--ratio", ratio);
+}
+function restartVideo() {
+  video.src = "/video?t=" + Date.now();
+}
+video.addEventListener("load", fitVideo);
+video.addEventListener("error", () => setTimeout(restartVideo, 2000));
+
+// The picture may have black bars around it (object-fit: contain), so the
+// click is measured against the picture's own rectangle, not the element's.
+function pictureRect() {
+  const box = video.getBoundingClientRect();
+  const width = video.naturalWidth, height = video.naturalHeight;
+  if (!width || !height || !box.width || !box.height) return null;
+  const scale = Math.min(box.width / width, box.height / height);
+  const shownWidth = width * scale, shownHeight = height * scale;
+  return {
+    left: box.left + (box.width - shownWidth) / 2,
+    top: box.top + (box.height - shownHeight) / 2,
+    width: shownWidth,
+    height: shownHeight,
+  };
+}
+
+// The click as fractions of the picture (0 to 1 from the top-left), or null in the bars.
+function pointOnPicture(event) {
+  const picture = pictureRect();
+  if (!picture) return null;
+  const x = (event.clientX - picture.left) / picture.width;
+  const y = (event.clientY - picture.top) / picture.height;
+  if (x < 0 || x > 1 || y < 0 || y > 1) return null;
+  return { x, y };
+}
+
+video.addEventListener("mousemove", (event) => {
+  video.classList.toggle("is-clickable", pointOnPicture(event) !== null);
+});
+video.addEventListener("mouseleave", () => video.classList.remove("is-clickable"));
+video.addEventListener("click", (event) => {
+  const point = pointOnPicture(event);
+  if (point) inspect(point, null);
+});
+
+// ---- the status ----------------------------------------------------------
+
+function drawStatusLine(status) {
+  const connected = Boolean(status.connected);
+  statusPill.classList.toggle("is-live", connected);
+  statusPill.classList.toggle("is-down", !connected);
+  statusPill.classList.remove("is-offline");
+  setText(liveText, connected ? "Live" : "Reconnecting");
+  setText(sourceText, asText(status.source));
+  setText(fpsText, (Number(status.fps) || 0).toFixed(1));
+  setText(deviceText, asText(status.device));
+  setText(facesText, status.recognition ? "on" : "off");
+
+  const extra = { notes: asList(status.notes).map(asText), error: asText(status.error) };
+  if (changed("notes", extra)) {
+    const items = extra.notes.map((note) => make("span", "note", note));
+    if (extra.error) items.push(make("span", "stopped", extra.error));
+    notes.replaceChildren(...items);
+  }
+}
+
+// ---- in view: one pill per detected thing ----------------------------------
+
+const thingItems = new Map();    // key -> the <li> already on the page, reused so a click is never lost
+const thingEntries = new Map();  // key -> the newest entry from the status, read when it is clicked
+
+function readObject(raw) {
+  const box = asList(raw.box).map(Number);
+  return {
+    track_id: Number.isInteger(raw.track_id) ? raw.track_id : null,
+    label: asText(raw.label),
+    confidence: Number(raw.confidence) || 0,
+    box: box.length === 4 && box.every(Number.isFinite) ? box : null,
+    name: raw.name == null ? "" : asText(raw.name),
+  };
+}
+
+const percent = (confidence) => Math.round(confidence * 100) + "%";
+
+// What one pill says: a recognised person by name and role, anything else by label, track and confidence.
+function thingText(entry, roles) {
+  if (entry.name) return { name: entry.name, detail: roles.get(entry.name) || "", known: true };
+  const parts = [];
+  if (entry.track_id !== null) parts.push("#" + entry.track_id);
+  parts.push(percent(entry.confidence));
+  return { name: entry.label, detail: parts.join("  "), known: false };
+}
+
+function thingItem(key) {
+  const item = make("li");
+  const button = make("button", "thing glass");
+  button.type = "button";
+  button.append(make("span", "thing-name"), make("span", "thing-detail"));
+  button.addEventListener("click", () => inspectThing(key));
+  item.append(button);
+  return item;
+}
+
+function drawObjects(status) {
+  const roles = new Map(asList(status.people).map((p) => [asText(p.name), asText(p.role)]));
+  const entries = asList(status.objects).map(readObject);
+  thingEntries.clear();
+  const shown = entries.map((entry, index) => {
+    const key = entry.track_id !== null ? "track " + entry.track_id : "untracked " + index + " " + entry.label;
+    thingEntries.set(key, entry);
+    return { key, ...thingText(entry, roles) };
+  });
+  if (!changed("objects", shown)) return;
+
+  const items = shown.map((thing) => {
+    let item = thingItems.get(thing.key);
+    if (!item) {
+      item = thingItem(thing.key);
+      thingItems.set(thing.key, item);
+    }
+    const button = item.firstChild;
+    setText(button.firstChild, thing.name);
+    setText(button.lastChild, thing.detail);
+    button.classList.toggle("is-known", thing.known);
+    return item;
+  });
+  for (const key of [...thingItems.keys()]) {
+    if (!thingEntries.has(key)) thingItems.delete(key);
+  }
+  const same = items.length === things.children.length && items.every((item, i) => things.children[i] === item);
+  if (!same) things.replaceChildren(...items);
+  nothing.hidden = items.length > 0;
+}
+
+// A click in the list: the server finds it by track number, or by the middle of its box.
+function inspectThing(key) {
+  const entry = thingEntries.get(key);
+  if (!entry) return;
+  const body = { label: entry.label };
+  if (entry.track_id !== null) body.track_id = entry.track_id;
+  if (entry.box) {
+    const [x1, y1, x2, y2] = entry.box;
+    body.x = Math.min(Math.max((x1 + x2) / 2, 0), 1);
+    body.y = Math.min(Math.max((y1 + y2) / 2, 0), 1);
+  }
+  if (body.track_id === undefined && body.x === undefined) return;
+  inspect(body, key);
+}
+
+function clearObjects() {
+  things.replaceChildren();
+  thingItems.clear();
+  thingEntries.clear();
+  nothing.textContent = "Program not running";
+  nothing.hidden = false;
+}
+
+function drawReactions(status) {
+  const reactions = asList(status.reactions).map((r) => ({ kind: asText(r.kind), text: asText(r.text) }));
+  if (!changed("reactions", reactions)) return;
+
+  const alarm = reactions.find((r) => r.kind === "warning");
+  if (alarm) setText(warningText, alarm.text);
+  warning.hidden = !alarm;
+
+  // Keep the greetings already on screen, so they do not jump when another one arrives.
+  const wanted = reactions.filter((r) => r.kind === "greeting").map((r) => r.text);
+  for (const node of [...greetings.children]) {
+    if (!wanted.includes(node.textContent)) node.remove();
+  }
+  const present = new Set([...greetings.children].map((node) => node.textContent));
+  for (const text of wanted) {
+    if (!present.has(text)) greetings.append(make("div", "capsule greeting", text));
+  }
+}
+
+let online = null;          // null until the first answer, then true or false
+
+function setOnline(isOnline) {
+  if (online === isOnline) return;
+  const wasOffline = online === false;
+  online = isOnline;
+  offline.hidden = isOnline;
+  if (isOnline) {
+    if (wasOffline) restartVideo();
+    return;
+  }
+  // Show nothing stale: no list, no banners, no old numbers.
+  forgetDrawn();
+  clearObjects();
+  greetings.replaceChildren();
+  warning.hidden = true;
+  notes.replaceChildren();
+  statusPill.classList.remove("is-live", "is-down");
+  statusPill.classList.add("is-offline");
+  liveText.textContent = "Program not running";
+}
+
+async function poll() {
+  const started = performance.now();
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), STATUS_TIMEOUT_MS);
+  try {
+    const response = await fetch("/api/status", { cache: "no-store", signal: controller.signal });
+    if (!response.ok) throw new Error("status " + response.status);
+    const status = await response.json();
+    setOnline(true);
+    setText(nothing, "Nothing detected right now");
+    drawStatusLine(status);
+    drawObjects(status);
+    drawReactions(status);
+  } catch (error) {
+    setOnline(false);
+  } finally {
+    clearTimeout(timer);
+    fitVideo();
+    setTimeout(poll, Math.max(0, POLL_MS - (performance.now() - started)));
+  }
+}
+
+// ---- the chat ------------------------------------------------------------
+
+let busy = false;
+
+function scrollChat() {
+  messages.scrollTop = messages.scrollHeight;
+}
+
+function addMessage(kind, text) {
+  hint.hidden = true;
+  const item = make("li", "msg " + kind);
+  item.append(make("p", "text", text));
+  messages.append(item);
+  scrollChat();
+  return item;
+}
+
+function addThinking() {
+  hint.hidden = true;
+  const item = make("li", "msg thinking", "Thinking");
+  const dots = make("span", "dots");
+  dots.append(make("i"), make("i"), make("i"));
+  item.append(dots);
+  messages.append(item);
+  scrollChat();
+  return item;
+}
+
+// Links only for http: and https: addresses, shown by host name; the link keeps the full address.
+function webSources(urls) {
+  const safe = [];
+  for (const raw of urls) {
+    let url;
+    try {
+      url = new URL(asText(raw));
+    } catch (error) {
+      continue;
+    }
+    if (url.protocol === "http:" || url.protocol === "https:") safe.push(url);
+  }
+  const nodes = [];
+  for (const url of safe.slice(0, MAX_SOURCES)) {
+    const link = make("a", "source", url.hostname.replace(/^www\./, ""));
+    link.href = url.href;
+    link.title = url.href;
+    link.target = "_blank";
+    link.rel = "noopener noreferrer";
+    nodes.push(link);
+  }
+  if (safe.length > MAX_SOURCES) nodes.push(make("span", "more", "+" + (safe.length - MAX_SOURCES) + " more"));
+  return nodes;
+}
+
+function addAnswer(answer) {
+  const item = addMessage("answer", asText(answer.text));
+  if (answer.used_web) {
+    const web = make("div", "web");
+    web.append(make("span", "web-label", "From the web"), ...webSources(asList(answer.sources)));
+    item.append(web);
+    scrollChat();
+  }
+}
+
+function setBusy(isBusy) {
+  busy = isBusy;
+  send.disabled = isBusy;
+  clearButton.disabled = isBusy;
+}
+
+async function postJson(url, body) {
+  const response = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  let data = null;
+  try {
+    data = await response.json();
+  } catch (error) {
+    data = null;
+  }
+  return { response, data };
+}
+
+form.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const question = input.value.trim();
+  if (!question || busy) return;
+  addMessage("question", question);
+  input.value = "";
+  setBusy(true);
+  const thinking = addThinking();
+  try {
+    const { response, data } = await postJson("/api/ask", { question });
+    if (data && typeof data.error === "string") {
+      addMessage("error", data.error);
+    } else if (response.ok && data && typeof data.text === "string") {
+      addAnswer(data);
+    } else {
+      addMessage("error", "The program gave no answer (status " + response.status + "). Please ask again.");
+    }
+  } catch (error) {
+    addMessage("error", "Program not running: the question could not be sent.");
+  } finally {
+    thinking.remove();
+    setBusy(false);
+    input.focus();
+  }
+});
+
+clearButton.addEventListener("click", async () => {
+  if (busy) return;
+  try {
+    const { data } = await postJson("/api/reset", {});
+    if (data && typeof data.error === "string") {
+      addMessage("error", data.error);
+      return;
+    }
+    messages.replaceChildren(hint);
+    hint.hidden = false;
+  } catch (error) {
+    addMessage("error", "Program not running: the conversation could not be cleared.");
+  }
+  input.focus();
+});
+
+// ---- the details panel ---------------------------------------------------
+
+let lookup = 0;          // number of the newest click; answers to older clicks are ignored
+
+function openDetails(key) {
+  details.hidden = false;
+  stage.classList.add("has-details");   // from 1280 px wide the video makes room for the sheet
+  for (const [thingKey, item] of thingItems) item.firstChild.classList.toggle("is-open", thingKey === key);
+}
+
+function closeDetails() {
+  lookup += 1;                   // a late answer must not open the panel again
+  details.hidden = true;
+  stage.classList.remove("has-details");
+  for (const item of thingItems.values()) item.firstChild.classList.remove("is-open");
+}
+
+closeButton.addEventListener("click", closeDetails);
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && !details.hidden) closeDetails();
+});
+
+function setPhoto(address) {
+  const usable = typeof address === "string" && address.startsWith(PHOTO_PREFIX);
+  if (usable) detailPhoto.src = address;
+  else detailPhoto.removeAttribute("src");
+  detailPhoto.hidden = !usable;
+}
+
+function setRole(role) {
+  setText(detailRole, role);
+  detailRole.hidden = !role;
+}
+
+// The small line under the title: the detector's label, confidence and track number.
+function metaLine(target) {
+  if (target.kind === "area") return "No detector box here";
+  const parts = ["Detector: " + asText(target.label)];
+  const confidence = Number(target.confidence) || 0;
+  if (confidence > 0) parts.push(percent(confidence));
+  if (Number.isInteger(target.track_id)) parts.push("track #" + target.track_id);
+  return parts.join(" · ");
+}
+
+function titleFor(target) {
+  if (target.person) return asText(target.person.name);
+  if (target.kind === "person") return "Unknown person";
+  if (target.kind === "area") return AREA_TITLE;
+  return asText(target.label);
+}
+
+function showWaiting() {
+  setPhoto(null);
+  detailTitle.textContent = "Looking";
+  detailMeta.textContent = "";
+  setRole("");
+  detailContent.replaceChildren();
+}
+
+function showProblem(text) {
+  detailContent.replaceChildren(make("p", "problem", text));
+}
+
+function showLooking() {
+  const line = make("p", "looking", "Looking it up ...");
+  const dots = make("span", "dots");
+  dots.append(make("i"), make("i"), make("i"));
+  line.append(dots);
+  detailContent.replaceChildren(line);
+}
+
+function showTarget(target) {
+  setPhoto(target.photo);
+  detailTitle.textContent = titleFor(target);
+  detailMeta.textContent = metaLine(target);
+  setRole(target.person ? asText(target.person.role) : "");
+  if (target.person) detailContent.replaceChildren(...personNodes(target.person));
+  else if (target.kind === "person") detailContent.replaceChildren(make("p", "", UNKNOWN_HINT));
+  else detailContent.replaceChildren();
+}
+
+// A recognised person: every card line, then the story as paragraphs.
+function personNodes(person) {
+  const nodes = [];
+  const lines = asList(person.lines).map(asText).filter(Boolean);
+  if (lines.length) {
+    const list = make("ul");
+    for (const line of lines) list.append(make("li", "", line));
+    nodes.push(list);
+  }
+  const paragraphs = asText(person.story).split(/\n\s*\n/).map((p) => p.trim()).filter(Boolean);
+  if (paragraphs.length) {
+    const story = make("div", "story");
+    for (const paragraph of paragraphs) story.append(make("p", "", paragraph));
+    nodes.push(story);
+  }
+  return nodes;
+}
+
+// An object or an area, once the assistant has answered.
+function showInfo(info) {
+  const name = asText(info.name);
+  if (name) detailTitle.textContent = name;
+  const nodes = [];
+  if (asText(info.summary)) nodes.push(make("p", "", asText(info.summary)));
+  const specs = asList(info.specs).filter((spec) => spec && typeof spec === "object");
+  if (specs.length) {
+    const list = make("dl", "specs");
+    for (const spec of specs) list.append(make("dt", "", asText(spec.name)), make("dd", "", asText(spec.value)));
+    nodes.push(list);
+  }
+  if (info.used_web) {
+    const web = make("div", "web");
+    web.append(make("span", "web-label", "From the web"), ...webSources(asList(info.sources)));
+    nodes.push(web);
+  }
+  detailContent.replaceChildren(...nodes);
+}
+
+const errorText = (data, response, what) =>
+  data && typeof data.error === "string" ? data.error : "The program gave no answer (status " + response.status + "). " + what;
+
+// A click on the video ({x, y}) or on the list ({track_id, label, x, y}).
+async function inspect(body, key) {
+  const mine = ++lookup;
+  openDetails(key);
+  showWaiting();
+  let reply;
+  try {
+    reply = await postJson("/api/inspect", body);
+  } catch (error) {
+    if (mine === lookup) showProblem("Program not running: the click could not be sent.");
+    return;
+  }
+  if (mine !== lookup) return;
+  const { response, data } = reply;
+  if (!response.ok || !data || typeof data.id !== "string") {
+    detailTitle.textContent = "Nothing to show";
+    showProblem(errorText(data, response, "Please click again."));
+    return;
+  }
+  showTarget(data);
+  if (data.info && typeof data.info === "object") showInfo(data.info);
+  else if (data.describable === true) describe(data.id, mine);
+}
+
+async function describe(id, mine) {
+  showLooking();
+  let reply;
+  try {
+    reply = await postJson("/api/describe", { id });
+  } catch (error) {
+    if (mine === lookup) showProblem("Program not running: the look-up could not be sent.");
+    return;
+  }
+  if (mine !== lookup) return;           // something else was clicked meanwhile
+  const { response, data } = reply;
+  if (response.ok && data && typeof data.name === "string" && typeof data.error !== "string") showInfo(data);
+  else showProblem(errorText(data, response, "Please click it again."));
+}
+
+poll();
+</script>
+</body>
+</html>

@@ -27,7 +27,6 @@ recognizer:
   match_threshold: 0.42     # cosine similarity; lower = strangers match, higher = known people missed
   every_n_frames: 5         # faces are checked on every 5th frame to keep the video fast
   min_face_pixels: 40       # ignore faces smaller than this, they are too far to trust
-  people_file: data/people.json
   photos_dir: data/people   # one folder of photos per person
   embeddings_file: data/embeddings.npz
 
@@ -37,6 +36,7 @@ assistant:
   effort: low               # low, medium or high; low answers fastest
   max_tokens: 16000
   notes_file: data/knowledge.md
+  people_dir: data/people   # each person's about.md is also given to the assistant
   web_search: true          # look on the web when the notes do not have the answer
   web_search_max_uses: 3
   history_turns: 10         # how many earlier question-answer pairs are sent along

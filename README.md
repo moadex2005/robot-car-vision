@@ -1,6 +1,23 @@
 # ESP robot car: vision and assistant
 
-A phone on the car streams its camera to this laptop. The laptop labels objects, recognises enrolled people and shows their info card, and runs an assistant that answers from your notes. Nothing is sent to the car.
+A phone on the car streams its camera to this laptop. The laptop labels objects, recognises enrolled people, and serves a web page with the live video. A click on anything in the video opens a panel that says what it is. An assistant answers questions from your notes. Nothing is sent to the car.
+
+## The demo page
+
+```powershell
+.venv\Scripts\python.exe -m car_vision.app --open
+```
+
+- **Live video** with a box, a label and a track number on every object the detector finds.
+- **In view**: a list of those objects. Click one in the list, or click it in the video.
+- **Details panel**: a small photo of what you clicked, what it is, a short description and its specifications. For a person the camera recognises, it shows what you wrote about them in their `about.md` instead.
+- **Chat**: type a question; the assistant answers from `data/knowledge.md` and searches the web when the notes do not have the answer.
+
+Limits to know before the demo:
+
+- The detector knows 80 everyday kinds of object (person, chair, laptop, bottle and so on). Anything else gets no box. Click it anyway: the assistant's API looks at that part of the picture and searches the web if it has to.
+- The description and specifications come from a language model looking at a small picture. For an ordinary object they are typical values, and they can be wrong.
+- A click on an object sends a small cut-out of the picture to the API, costs one API call and takes a few seconds. A second click on the same tracked object is answered from memory. A click on a person sends nothing.
 
 ## Install (Windows 11)
 
@@ -68,13 +85,13 @@ Everything you can change is in `config.yaml`, with a comment beside each value.
 | `.venv\Scripts\python.exe -m car_vision.enroll` | Turns the photos in `data/people/` into saved face data |
 | `.venv\Scripts\python.exe -m car_vision.recognizer` | Names and info cards on the people it knows |
 | `.venv\Scripts\python.exe -m car_vision.assistant` | A typed chat with the assistant |
-| `.venv\Scripts\python.exe -m car_vision.app` | The full demo page in the browser |
+| `.venv\Scripts\python.exe -m car_vision.app` | The full demo page in the browser (add `--open` to open it) |
 
 Add `--source phone`, `--source webcam` or `--source file` to any camera command to pick the camera for that run.
 
 ## What only you can provide
 
-- **Face photos.** For each person, with their permission, make a folder `data/people/<id>/` holding 3 to 5 clear photos, then describe them in `data/people.json`. Run the enroll command after any change.
+- **People.** For each person, with their permission, make a folder `data/people/<id>/` (small letters, digits and underscores) holding 3 to 5 clear photos and an `about.md` that describes them. `data/people.example/about.md` shows the layout: a `# Name` heading, a `Role:` line, a few `- ` bullet lines for the card, then anything else you want the assistant to know. Run the enroll command after adding or changing photos. A folder with only an `about.md` is fine for now; the person is recognised once photos are added and enrolled.
 - **Notes.** Write what the assistant should know into `data/knowledge.md`.
 - **An API key.** Copy `.env.example` to `.env` and put your own Anthropic API key in it. The key stays on this laptop; never paste it into a chat.
 - **A sample clip.** Record about 2 minutes from the car's camera height and save it as `data/samples/car_clip.mp4`, so the program can be tested without the phone.

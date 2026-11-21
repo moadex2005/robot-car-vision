@@ -9,6 +9,7 @@ is never read.
 
 from __future__ import annotations
 
+import base64
 import re
 import threading
 import time
@@ -26,12 +27,15 @@ from car_vision.assistant import (
     Assistant,
     AssistantError,
     LLMReply,
+    ObjectInfo,
     build_system_prompt,
+    load_briefs,
     load_notes,
+    parse_object_info,
     people_line,
 )
 from car_vision.config import PROJECT_ROOT, ConfigError, load_config, section
-from car_vision.state import RecognizedFace, WorldState
+from car_vision.state import Detection, RecognizedFace, WorldState
 
 KEY_VARIABLE = "ANTHROPIC_API_KEY"
 FAKE_KEY = "sk-ant-test-RECOGNISABLE-FAKE-KEY-7f3a9c"
@@ -70,13 +74,20 @@ def notes_path(tmp_path: Path) -> Path:
 
 
 @pytest.fixture
-def settings(notes_path: Path) -> dict[str, Any]:
+def people_dir(tmp_path: Path) -> Path:
+    """A people folder that does not exist yet; tests add persons with add_person."""
+    return tmp_path / "people"
+
+
+@pytest.fixture
+def settings(notes_path: Path, people_dir: Path) -> dict[str, Any]:
     return {
         "provider": "anthropic",
         "model": "test-model-from-config",
         "effort": "low",
         "max_tokens": 16000,
         "notes_file": str(notes_path),
+        "people_dir": str(people_dir),
         "web_search": True,
         "web_search_max_uses": 3,
         "history_turns": 10,
@@ -401,7 +412,8 @@ def test_missing_notes_file_names_the_path(settings: dict, tmp_path: Path,
     settings["notes_file"] = str(missing)
     with pytest.raises(AssistantError) as caught:
         Assistant(settings, client=FakeClient())
-    assert str(missing) in str(caught.value)
+    assert "nowhere/knowledge.md" in str(caught.value)
+    assert str(tmp_path) not in str(caught.value)          # no full local path on screen
     assert FAKE_KEY not in str(caught.value)
 
 
@@ -745,7 +757,8 @@ def test_f3_notes_saved_as_ansi_give_a_plain_error(tmp_path: Path) -> None:
     path.write_bytes("Café notes".encode("cp1252"))
     with pytest.raises(AssistantError, match="UTF-8") as caught:
         load_notes(path)
-    assert str(path) in str(caught.value)
+    assert f"{tmp_path.name}/ansi.md" in str(caught.value)
+    assert str(path) not in str(caught.value)
     assert caught.value.__context__ is None
 
 
@@ -884,6 +897,452 @@ def test_f7_html_comments_do_not_reach_the_model() -> None:
     assert "TEMPLATE note" not in prompt and "inline" not in prompt and "<!--" not in prompt
     assert "# Project\nRover." in prompt
     assert "not written any notes" in build_system_prompt("<!-- only a comment -->")
+
+
+# ---- M6: person briefs ---------------------------------------------------------
+
+
+def add_person(people_dir: Path, person_id: str, text: str | bytes) -> Path:
+    """Make data/people/<id>/about.md in a temporary folder."""
+    folder = people_dir / person_id
+    folder.mkdir(parents=True, exist_ok=True)
+    about = folder / "about.md"
+    if isinstance(text, bytes):
+        about.write_bytes(text)
+    else:
+        about.write_text(text, encoding="utf-8")
+    return about
+
+
+def test_briefs_reach_the_system_prompt_in_sorted_order(settings: dict, people_dir: Path) -> None:
+    add_person(people_dir, "sara", "# Sara Ahmed\nRole: Team lead\n- Built the chassis\n")
+    add_person(people_dir, "omar", "# Omar\n<!-- team note -->\nWrote the vision code.\n")
+    fake = FakeClient()
+    bot = Assistant(settings, state=state_with("Sara Ahmed"), client=fake)
+    bot.ask("Who is this?")
+    bot.ask("And what did they build?")
+    first, second = fake.calls[0][0], fake.calls[1][0]
+    assert first == second
+    assert first.index('<person id="omar" name="Omar">') < \
+        first.index('<person id="sara" name="Sara Ahmed">')
+    assert "Built the chassis" in first and "Wrote the vision code." in first
+    assert "team note" not in first and "<!--" not in first
+    assert first.index("</notes>") < first.index("</people>")
+    # Nothing per-question goes into the system prompt.
+    assert "Who is this?" not in first
+
+
+def test_brief_without_a_heading_is_named_by_its_folder(people_dir: Path) -> None:
+    add_person(people_dir, "lina", "Lina tests the car.\n")
+    assert [(b.person_id, b.name) for b in load_briefs(people_dir)] == [("lina", "lina")]
+
+
+def test_folders_that_add_no_brief_are_left_out(people_dir: Path) -> None:
+    add_person(people_dir, "Not-An-Id", "# Bad\n")
+    add_person(people_dir, "empty", "<!-- only a comment -->\n  \n")
+    (people_dir / "no_about").mkdir()
+    add_person(people_dir, "zoe", "# Zoe\n")
+    assert [b.person_id for b in load_briefs(people_dir)] == ["zoe"]
+
+
+def test_missing_people_folder_adds_nothing(settings: dict, tmp_path: Path) -> None:
+    settings["people_dir"] = str(tmp_path / "nowhere")
+    fake = FakeClient()
+    Assistant(settings, client=fake).ask("hi")
+    assert "</people>" not in fake.calls[0][0]
+    assert fake.calls[0][0] == build_system_prompt(NOTES)
+
+
+def test_empty_people_folder_adds_nothing(settings: dict, people_dir: Path) -> None:
+    people_dir.mkdir()
+    fake = FakeClient()
+    Assistant(settings, client=fake).ask("hi")
+    assert "</people>" not in fake.calls[0][0]
+
+
+def warnings_in(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+
+
+def test_brief_in_a_wrong_encoding_is_skipped_with_one_warning(
+        settings: dict, people_dir: Path, caplog: pytest.LogCaptureFixture) -> None:
+    add_person(people_dir, "sara", "# Sára\nCafé".encode("cp1252"))
+    add_person(people_dir, "omar", "# Omar\n")
+    fake = FakeClient()
+    with caplog.at_level("WARNING", logger="car_vision.assistant"):
+        Assistant(settings, client=fake).ask("hi")         # the assistant still starts
+    assert '<person id="omar"' in fake.calls[0][0] and 'id="sara"' not in fake.calls[0][0]
+    warnings = warnings_in(caplog)
+    assert len(warnings) == 1
+    assert "sara/about.md" in warnings[0] and "UTF-8" in warnings[0]
+
+
+def test_an_about_file_that_cannot_be_read_is_skipped(
+        people_dir: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
+    locked = add_person(people_dir, "sara", "# Sara\n")
+    add_person(people_dir, "omar", "# Omar\n")
+    real_read_text = Path.read_text
+
+    def read_text(path: Path, *args: Any, **kwargs: Any) -> str:
+        if path == locked:
+            raise PermissionError("held by an editor")
+        return real_read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", read_text)
+    with caplog.at_level("WARNING", logger="car_vision.assistant"):
+        assert [b.person_id for b in load_briefs(people_dir)] == ["omar"]
+    warnings = warnings_in(caplog)
+    assert len(warnings) == 1 and "PermissionError" in warnings[0] and "sara/about.md" in warnings[0]
+
+
+def test_a_notes_file_that_cannot_be_read_gives_a_plain_error(
+        notes_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def read_text(_path: Path, *_args: Any, **_kwargs: Any) -> str:
+        raise PermissionError(f"held by an editor: {notes_path}")
+
+    monkeypatch.setattr(Path, "read_text", read_text)
+    with pytest.raises(AssistantError, match="could not be read") as caught:
+        load_notes(notes_path)
+    assert "PermissionError" in str(caught.value)
+    assert str(notes_path) not in str(caught.value)
+    assert caught.value.__context__ is None
+
+
+def test_each_invalid_folder_name_gives_one_warning(
+        people_dir: Path, caplog: pytest.LogCaptureFixture) -> None:
+    add_person(people_dir, "Sara", "# Sara\n")
+    add_person(people_dir, "omar-k", "# Omar\n")
+    add_person(people_dir, "lina", "# Lina\n")
+    with caplog.at_level("WARNING", logger="car_vision.assistant"):
+        assert [b.person_id for b in load_briefs(people_dir)] == ["lina"]
+    warnings = warnings_in(caplog)
+    assert len(warnings) == 2
+    assert any("people/Sara" in w for w in warnings) and any("people/omar-k" in w for w in warnings)
+
+
+def test_paths_inside_the_project_are_shown_relative_to_it() -> None:
+    assert assistant.shown_path(PROJECT_ROOT / "data" / "knowledge.md") == "data/knowledge.md"
+    about = PROJECT_ROOT / "data" / "people" / "sara" / "about.md"
+    assert assistant.shown_path(about) == "data/people/sara/about.md"
+
+
+def test_a_missing_notes_file_in_the_project_shows_the_short_path(settings: dict) -> None:
+    settings["notes_file"] = "data/no_such_notes_file.md"
+    with pytest.raises(AssistantError) as caught:
+        Assistant(settings, client=FakeClient())
+    assert "data/no_such_notes_file.md" in str(caught.value)
+    assert str(PROJECT_ROOT) not in str(caught.value)
+
+
+def test_brief_with_a_byte_order_mark(people_dir: Path) -> None:
+    add_person(people_dir, "sara", (BOM + "# Sara\n").encode("utf-8"))
+    assert load_briefs(people_dir)[0].name == "Sara"
+
+
+def test_missing_people_dir_setting_raises_config_error(settings: dict) -> None:
+    del settings["people_dir"]
+    with pytest.raises(ConfigError, match="people_dir"):
+        Assistant(settings, client=FakeClient())
+
+
+def test_chat_prompt_says_nothing_about_attached_pictures() -> None:
+    prompt = build_system_prompt(NOTES).lower()
+    assert "attached" not in prompt
+    assert "never guess who someone is from a picture" in prompt
+
+
+# ---- M6: the objects line --------------------------------------------------------
+
+
+def state_seeing(labels: list[str], age_seconds: float = 0.0) -> WorldState:
+    state = state_with("Sara")
+    detections = [Detection(label=label, confidence=0.8, box=(0, 0, 10, 10)) for label in labels]
+    state.update_detections(detections, (640, 480), now=time.monotonic() - age_seconds)
+    return state
+
+
+def test_objects_line_follows_the_people_line(settings: dict) -> None:
+    fake = FakeClient()
+    state = state_seeing(["laptop", "person", "cup", "laptop"])
+    Assistant(settings, state=state, client=fake).ask("What is on the table?")
+    assert fake.calls[0][1][-1]["content"] == (
+        "In front of the camera right now: Sara.\n"
+        "The object detector sees right now: cup, laptop.\n"
+        "What is on the table?")
+
+
+def test_no_objects_line_for_stale_detections(settings: dict) -> None:
+    fake = FakeClient()
+    state = state_seeing(["laptop"], age_seconds=settings["seen_within_seconds"] + 5)
+    Assistant(settings, state=state, client=fake).ask("Anything?")
+    assert "object detector" not in fake.calls[0][1][-1]["content"]
+
+
+def test_no_objects_line_with_only_people_in_view(settings: dict) -> None:
+    fake = FakeClient()
+    Assistant(settings, state=state_seeing(["person", "person"]), client=fake).ask("Anything?")
+    assert fake.calls[0][1][-1]["content"] == "In front of the camera right now: Sara.\nAnything?"
+
+
+# ---- M6: pictures --------------------------------------------------------------
+
+
+PICTURE = assistant.JPEG_MARKER + b"\xe0 a small fake jpeg"
+
+
+def test_user_turn_with_a_picture_has_the_documented_image_block() -> None:
+    turn = assistant.user_turn("What is it?", PICTURE)
+    assert turn["role"] == "user"
+    picture, text = turn["content"]
+    assert picture == {"type": "image",
+                       "source": {"type": "base64", "media_type": "image/jpeg",
+                                  "data": base64.standard_b64encode(PICTURE).decode("ascii")}}
+    assert text == {"type": "text", "text": "What is it?"}
+    assert assistant.user_turn("hi") == {"role": "user", "content": "hi"}
+
+
+@pytest.mark.parametrize("image", [
+    "not bytes",
+    b"\x89PNG\r\n\x1a\n not a jpeg",
+    b"",
+    assistant.JPEG_MARKER + b"x" * assistant.MAX_IMAGE_BYTES,
+])
+def test_check_image_refuses_anything_but_one_small_jpeg(image: Any) -> None:
+    with pytest.raises(ValueError):
+        assistant.check_image(image)
+
+
+def test_check_image_accepts_exactly_the_limit() -> None:
+    image = assistant.JPEG_MARKER + b"x" * (assistant.MAX_IMAGE_BYTES - 3)
+    assert assistant.check_image(bytearray(image)) == image
+
+
+# ---- M7: describe ----------------------------------------------------------------
+
+
+GOOD_ANSWER = """\
+NAME: Laptop
+ABOUT: A portable computer with a screen and keyboard.
+SPECS:
+- Screen: 14 to 16 inches (typical)
+- Weight: about 1.5 kg (typical)
+"""
+
+
+def described(settings: dict, label: str | None = "laptop", text: str = GOOD_ANSWER,
+              **reply: Any) -> tuple[ObjectInfo, FakeClient]:
+    fake = FakeClient([LLMReply(text=text, new_turns=({"role": "assistant", "content": []},),
+                                **reply)])
+    info = Assistant(settings, client=fake).describe(PICTURE, label)
+    return info, fake
+
+
+def test_describe_reads_the_answer(settings: dict) -> None:
+    info, _ = described(settings)
+    assert info == ObjectInfo(name="Laptop", summary="A portable computer with a screen and keyboard.",
+                              specs=(("Screen", "14 to 16 inches (typical)"),
+                                     ("Weight", "about 1.5 kg (typical)")))
+
+
+def test_describe_system_prompt_is_the_same_for_every_call(settings: dict, people_dir: Path) -> None:
+    add_person(people_dir, "sara", "# Sara\n")
+    fake = FakeClient()
+    bot = Assistant(settings, client=fake)
+    bot.describe(PICTURE, "laptop")
+    bot.describe(PICTURE, None)
+    assert fake.calls[0][0] == fake.calls[1][0] == assistant.DESCRIBE_PROMPT
+    # Its own prompt: neither the notes nor the people go with a picture.
+    assert NOTES.strip() not in assistant.DESCRIBE_PROMPT and "Sara" not in fake.calls[0][0]
+
+
+@pytest.mark.parametrize(("label", "sentence"), [
+    ("laptop", 'The object detector labelled this "laptop".'),
+    ("cell  phone ", 'The object detector labelled this "cell phone".'),
+    (None, "The object detector has no label for this. The visitor clicked the middle of the picture."),
+])
+def test_describe_sends_the_picture_and_the_label_line(settings: dict, label: str | None,
+                                                       sentence: str) -> None:
+    _, fake = described(settings, label)
+    turns = fake.calls[0][1]
+    assert turns == [assistant.user_turn(sentence, PICTURE)]
+    picture, text = turns[0]["content"]
+    assert base64.standard_b64decode(picture["source"]["data"]) == PICTURE
+    assert text == {"type": "text", "text": sentence}
+
+
+@pytest.mark.parametrize("web_search", [True, False])
+def test_describe_web_search_follows_the_setting(settings: dict, web_search: bool) -> None:
+    settings["web_search"] = web_search
+    _, fake = described(settings)
+    assert fake.calls[0][2] is web_search
+
+
+def test_describe_neither_sends_nor_changes_the_chat_history(settings: dict) -> None:
+    fake = FakeClient()
+    bot = Assistant(settings, client=fake)
+    bot.ask("one")
+    bot.describe(PICTURE, "laptop")
+    bot.ask("two")
+    assert len(fake.calls[1][1]) == 1                    # describe: only its own user turn
+    assert [t["content"] for t in fake.calls[2][1]] == ["one", ["block-1"], "two"]
+
+
+def test_describe_passes_sources_and_used_web_through(settings: dict) -> None:
+    info, _ = described(settings, used_web=True,
+                        sources=("https://a.example", "https://b.example", "https://a.example"))
+    assert info.used_web is True
+    assert info.sources == ("https://a.example", "https://b.example")
+
+
+@pytest.mark.parametrize("image", ["text", b"\x89PNG not a jpeg",
+                                   assistant.JPEG_MARKER + b"x" * assistant.MAX_IMAGE_BYTES])
+def test_describe_refuses_a_bad_picture_before_sending(settings: dict, image: Any) -> None:
+    fake = FakeClient()
+    with pytest.raises(ValueError):
+        Assistant(settings, client=fake).describe(image, "laptop")
+    assert fake.calls == []
+
+
+@pytest.mark.parametrize("label", ["x" * 61, 42, b"laptop", ["laptop"]])
+def test_describe_refuses_a_bad_label_before_sending(settings: dict, label: Any) -> None:
+    fake = FakeClient()
+    with pytest.raises(ValueError):
+        Assistant(settings, client=fake).describe(PICTURE, label)
+    assert fake.calls == []
+
+
+def test_describe_accepts_a_label_of_exactly_sixty_characters(settings: dict) -> None:
+    _, fake = described(settings, label="x" * 60)
+    assert len(fake.calls) == 1
+
+
+def test_a_second_describe_gives_up_when_busy_and_the_chat_still_works(
+        settings: dict, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(assistant, "DESCRIBE_WAIT_SECONDS", 0.2)
+    release = threading.Event()
+
+    class StuckOnPictures(FakeClient):
+        def complete(self, system: str, turns: list, allow_web: bool) -> LLMReply:
+            if isinstance(turns[-1]["content"], list):     # a describe call
+                release.wait(5)
+            return super().complete(system, turns, allow_web)
+
+    bot = Assistant(settings, client=StuckOnPictures())
+    first = threading.Thread(target=bot.describe, args=(PICTURE, "laptop"))
+    first.start()
+    time.sleep(0.05)
+    try:
+        with pytest.raises(AssistantError, match="still busy"):
+            bot.describe(PICTURE, "cup")
+        assert bot.ask("Is the chat free?").text       # its own lock: the chat does not wait
+    finally:
+        release.set()
+        first.join(5)
+    assert bot.describe(PICTURE, "cup").name           # free again once the first is done
+
+
+@pytest.mark.parametrize(("stop_reason", "says"), [("refusal", "declined"),
+                                                   ("max_tokens", "max_tokens")])
+def test_describe_refusal_and_max_tokens_raise(settings: dict, stop_reason: str, says: str) -> None:
+    response = message([text_block("NAME: Lap")], stop_reason=stop_reason)
+    bot = Assistant(settings, client=client_with(settings, FakeSDK([response])))
+    with pytest.raises(AssistantError, match=says):
+        bot.describe(PICTURE, "laptop")
+
+
+# ---- M7: reading the answer --------------------------------------------------------
+
+
+def test_parse_keys_in_any_case_and_in_bold() -> None:
+    text = ("**name:** Office chair\n**About**: A chair on wheels.\n"
+            "**SPECS:**\n* **Height:** 90 to 110 cm\n* Material: mesh and plastic\n")
+    assert parse_object_info(text, "chair") == (
+        "Office chair", "A chair on wheels.",
+        (("Height", "90 to 110 cm"), ("Material", "mesh and plastic")))
+
+
+def test_parse_about_over_several_lines() -> None:
+    text = "NAME: Cup\nABOUT: A cup for drinks.\nIt holds about 250 ml.\n\nIt is often ceramic.\nSPECS:\n"
+    name, summary, specs = parse_object_info(text, "cup")
+    assert summary == "A cup for drinks. It holds about 250 ml. It is often ceramic."
+    assert specs == ()
+
+
+def test_parse_keeps_six_specs_and_skips_lines_without_a_colon() -> None:
+    spec_lines = "".join(f"- Spec {n}: value {n}\n" for n in range(1, 9))
+    text = f"NAME: Robot\nABOUT: A robot.\nSPECS:\n- no colon here\n{spec_lines}- Empty:\n"
+    _, _, specs = parse_object_info(text, None)
+    assert specs == tuple((f"Spec {n}", f"value {n}") for n in range(1, 7))
+
+
+def test_parse_keeps_colons_inside_a_value() -> None:
+    _, _, specs = parse_object_info("NAME: Clock\nSPECS:\n- Shows: 12:45 style time\n", None)
+    assert specs == (("Shows", "12:45 style time"),)
+
+
+def test_parse_a_spec_named_like_a_key_stays_a_spec() -> None:
+    _, _, specs = parse_object_info("NAME: Laptop\nSPECS:\n- Name: ThinkPad\n- About: 14 inch\n", None)
+    assert specs == (("Name", "ThinkPad"), ("About", "14 inch"))
+
+
+@pytest.mark.parametrize(("label", "name"), [("cell phone", "Cell phone"), (None, "Unknown object"),
+                                             ("", "Unknown object")])
+def test_parse_without_a_name_line_uses_the_label_and_the_whole_text(label: str | None,
+                                                                    name: str) -> None:
+    text = "  I think this is a phone lying on a desk.\nIt has a dark case.  \n"
+    assert parse_object_info(text, label) == (
+        name, "I think this is a phone lying on a desk.\nIt has a dark case.", ())
+
+
+def test_parse_passes_the_unknown_and_person_names_through() -> None:
+    assert parse_object_info("NAME: Unknown object\nABOUT: I cannot tell.", None)[0] == "Unknown object"
+    assert parse_object_info("NAME: Person\nABOUT: A person.", "person")[0] == "Person"
+
+
+@pytest.mark.parametrize("sources", ["Sources:", "**Sources:**", "source: the web", "SOURCES:"])
+def test_parse_stops_the_specs_at_a_sources_line(sources: str) -> None:
+    text = (f"NAME: Laptop\nABOUT: A computer.\nSPECS:\n- Weight: 1.5 kg\n{sources}\n"
+            "- https://example.com/page\n- Shop: example.com\n")
+    assert parse_object_info(text, None)[2] == (("Weight", "1.5 kg"),)
+
+
+@pytest.mark.parametrize("line", ["- https://example.com/page", "- [1]: from the maker's page",
+                                  "- example.com/specs: 2 kg", "- HTTP://EXAMPLE.COM: x"])
+def test_parse_refuses_a_spec_named_like_a_link(line: str) -> None:
+    text = f"NAME: Laptop\nSPECS:\n- Weight: 1.5 kg\n{line}\n"
+    assert parse_object_info(text, None)[2] == (("Weight", "1.5 kg"),)
+
+
+@pytest.mark.parametrize("heading", ["## Specs", "**SPECS**", "Specs", "Specifications",
+                                     "SPECIFICATIONS:", "### **Specifications:**"])
+def test_parse_a_specs_heading_without_a_colon_starts_the_specs(heading: str) -> None:
+    text = f"NAME: Laptop\nABOUT: A computer.\n{heading}\n- Weight: 1.5 kg\n"
+    assert parse_object_info(text, None) == ("Laptop", "A computer.", (("Weight", "1.5 kg"),))
+
+
+@pytest.mark.parametrize("line", ["SPECS: - Weight: 1.5 kg", "**Specs:** Weight: 1.5 kg"])
+def test_parse_a_spec_on_the_specs_line_is_kept(line: str) -> None:
+    text = f"NAME: Laptop\n{line}\n- Screen: 14 inches\n"
+    assert parse_object_info(text, None)[2] == (("Weight", "1.5 kg"), ("Screen", "14 inches"))
+
+
+def test_parse_numbered_and_dash_bullets() -> None:
+    text = ("NAME: Laptop\nSPECS:\n1. Weight: 1.5 kg\n2) Screen: 14 inches\n"
+            "– Battery: 8 hours\n— **Price:** about 800 euros\n")
+    assert parse_object_info(text, None)[2] == (
+        ("Weight", "1.5 kg"), ("Screen", "14 inches"), ("Battery", "8 hours"),
+        ("Price", "about 800 euros"))
+
+
+@pytest.mark.parametrize(("label", "name"), [("laptop", "Laptop"), (None, "Unknown object")])
+def test_parse_an_empty_name_keeps_about_and_specs(label: str | None, name: str) -> None:
+    text = "NAME:\nABOUT: A computer.\nSPECS:\n- Weight: 1.5 kg\n"
+    assert parse_object_info(text, label) == (name, "A computer.", (("Weight", "1.5 kg"),))
+
+
+def test_parse_no_name_line_but_other_keys_keeps_them() -> None:
+    text = "ABOUT: A computer.\nSPECS:\n- Weight: 1.5 kg\n"
+    assert parse_object_info(text, "laptop") == ("Laptop", "A computer.", (("Weight", "1.5 kg"),))
 
 
 # ---- the one-module rule and the live test -------------------------------------

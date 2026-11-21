@@ -1,6 +1,6 @@
-"""People file, embeddings file, matching and face memory, tested with made-up numbers."""
+"""Person folders, embeddings file, matching and face memory, tested with made-up data."""
 
-import json
+import logging
 from pathlib import Path
 
 import numpy as np
@@ -8,11 +8,14 @@ import pytest
 
 from car_vision.config import ConfigError
 from car_vision.faces import (
+    TRACK_GAP_SECONDS,
     FaceMatcher,
     FaceMemory,
     Person,
+    has_about_text,
     load_embeddings,
     load_people,
+    parse_about,
     save_embeddings,
 )
 from car_vision.state import Detection, RecognizedFace
@@ -29,72 +32,206 @@ def one_hot(index: int, noise: float = 0.0, seed: int = 0) -> np.ndarray:
     return vector
 
 
-def write(tmp_path: Path, text: str) -> Path:
-    path = tmp_path / "people.json"
-    path.write_text(text, encoding="utf-8")
-    return path
+def person_folder(photos_dir: Path, person_id: str, about: str | bytes | None = None) -> Path:
+    """Make photos_dir/person_id/, with an about.md when one is given."""
+    folder = photos_dir / person_id
+    folder.mkdir(parents=True)
+    if isinstance(about, str):
+        (folder / "about.md").write_text(about, encoding="utf-8")
+    elif isinstance(about, bytes):
+        (folder / "about.md").write_bytes(about)
+    return folder
+
+
+SARA_ABOUT = """\
+# Sara Ahmed
+Role: Team lead
+
+- Built the car chassis
+- Fourth-year student
+
+Sara joined the project in the first week and wrote the motor control code.
+"""
+
+
+# ---- parse_about ------------------------------------------------------------------
+
+
+def test_parse_about_reads_name_role_lines_story_and_brief():
+    person = parse_about("sara", SARA_ABOUT)
+    assert person == Person(
+        "sara", "Sara Ahmed", "Team lead",
+        ("Built the car chassis", "Fourth-year student"),
+        "Sara joined the project in the first week and wrote the motor control code.",
+        SARA_ABOUT,
+    )
+
+
+def test_no_heading_gives_the_folder_name():
+    person = parse_about("sara", "Role: Team lead\n- Built the chassis\n")
+    assert person.name == "sara"
+    assert person.role == "Team lead"
+
+
+def test_no_role_and_no_bullets():
+    person = parse_about("sara", "# Sara Ahmed\n\nJust a story.\n")
+    assert (person.role, person.lines, person.story) == ("", (), "Just a story.")
+
+
+def test_role_in_any_letter_case():
+    assert parse_about("sara", "ROLE:  Driver \n").role == "Driver"
+    assert parse_about("sara", "role: Driver\n").role == "Driver"
+
+
+def test_star_and_dash_bullets_all_kept_in_order():
+    text = "# Sara\n- one\n* two\n- three\n  - four\n* five\n"
+    assert parse_about("sara", text).lines == ("one", "two", "three", "four", "five")
+
+
+def test_story_keeps_paragraphs_and_has_no_blank_ends():
+    text = ("\n\n# Sara\n\nFirst paragraph,\nstill the first.\n\n- a bullet\n\n\n"
+            "Second paragraph.\nRole: Team lead\n\n\n")
+    assert parse_about("sara", text).story == "First paragraph,\nstill the first.\n\nSecond paragraph."
+
+
+def test_only_the_first_heading_is_the_name():
+    person = parse_about("sara", "# Sara Ahmed\n# Later heading\n## Hobbies\nChess.\n")
+    assert person.name == "Sara Ahmed"
+    assert person.story == "# Later heading\n## Hobbies\nChess."
+
+
+def test_html_comments_are_left_out_of_lines_and_story_but_kept_in_brief():
+    text = ("<!-- a note\nfor the team -->\n# Sara\n- Built the chassis <!-- check -->\n"
+            "<!-- - hidden bullet -->\nStory <!-- secret --> here.\n")
+    person = parse_about("sara", text)
+    assert person.name == "Sara"
+    assert person.lines == ("Built the chassis",)
+    assert person.story == "Story  here."
+    assert person.brief == text
+
+
+def test_heading_loses_its_closing_hashes():
+    assert parse_about("sara", "# Sara Ahmed ##\n").name == "Sara Ahmed"
+    assert parse_about("sara", "# ##\n").name == "sara"
+
+
+@pytest.mark.parametrize("line", ["Role: Team lead", "Role : Team lead", "**Role:** Team lead",
+                                  "**Role**: Team lead", "ROLE:Team lead"])
+def test_role_line_forms(line):
+    person = parse_about("sara", f"# Sara\n{line}\n")
+    assert person.role == "Team lead"
+    assert person.story == ""
+
+
+def test_only_the_first_role_line_is_the_role_a_later_one_stays_in_the_story():
+    person = parse_about("sara", "Role: Team lead\nRole: Driver in 2025\n")
+    assert person.role == "Team lead"
+    assert person.story == "Role: Driver in 2025"
+
+
+def test_tab_plus_and_bullet_sign_bullets():
+    text = "-\tone\n+ two\n• three\n•\tfour\n-\n-5 degrees is cold\n---\n"
+    person = parse_about("sara", text)
+    assert person.lines == ("one", "two", "three", "four")
+    assert person.story == "-5 degrees is cold\n---"
+
+
+def test_has_about_text_ignores_comments():
+    assert not has_about_text(parse_about("sara", "<!-- only a comment -->\n\n"))
+    assert not has_about_text(Person("sara", "sara"))
+    assert has_about_text(parse_about("sara", "<!-- note -->\n# Sara\n"))
+
+
+def test_empty_about_gives_just_the_folder_name():
+    assert parse_about("sara", "") == Person("sara", "sara")
+
+
+def test_windows_line_endings():
+    person = parse_about("sara", "# Sara\r\nRole: Driver\r\n- one\r\n\r\nStory.\r\n")
+    assert (person.name, person.role, person.lines, person.story) == ("Sara", "Driver", ("one",), "Story.")
 
 
 # ---- load_people ------------------------------------------------------------------
 
 
-def test_load_people_reads_names_roles_and_lines(tmp_path):
-    path = write(tmp_path, json.dumps({
-        "sara": {"name": "Sara Ahmed", "role": "Team lead", "lines": ["Built the car chassis", "Fourth-year student"]},
-        "omar": {"name": "Omar Ali"},
-    }))
-    people = load_people(path)
-    assert people["sara"] == Person("sara", "Sara Ahmed", "Team lead",
-                                    ("Built the car chassis", "Fourth-year student"))
-    assert people["omar"] == Person("omar", "Omar Ali", "", ())
+def test_load_people_makes_one_person_per_folder_in_name_order(tmp_path):
+    person_folder(tmp_path, "sara", SARA_ABOUT)
+    person_folder(tmp_path, "omar")                         # photos only, no about.md
+    (tmp_path / "readme.txt").write_text("not a folder", encoding="utf-8")
+    people = load_people(tmp_path)
+    assert list(people) == ["omar", "sara"]
+    assert people["sara"].name == "Sara Ahmed"
+    assert people["omar"] == Person("omar", "omar")
 
 
-def test_load_people_accepts_the_notepad_byte_order_mark(tmp_path):
-    path = tmp_path / "people.json"
-    path.write_text('{"sara": {"name": "Sara Ahmed"}}', encoding="utf-8-sig")
-    assert load_people(path)["sara"].name == "Sara Ahmed"
+def test_more_than_three_bullets_are_all_kept(tmp_path):
+    person_folder(tmp_path, "sara", "# Sara\n- one\n- two\n- three\n- four\n- five\n")
+    assert load_people(tmp_path)["sara"].lines == ("one", "two", "three", "four", "five")
 
 
-def test_the_example_people_file_loads():
-    people = load_people(ROOT / "data" / "people.example.json")
-    assert len(people) == 2
-    assert all(person.name for person in people.values())
+def test_byte_order_mark_is_accepted(tmp_path):
+    person_folder(tmp_path, "sara", "﻿# Sara Ahmed\n- one\n".encode("utf-8"))
+    person = load_people(tmp_path)["sara"]
+    assert person.name == "Sara Ahmed"
+    assert not person.brief.startswith("﻿")
 
 
-def test_missing_people_file(tmp_path):
-    with pytest.raises(ConfigError, match="people.json") as caught:
-        load_people(tmp_path / "people.json")
-    assert "not found" in str(caught.value)
+def test_wrong_encoding_keeps_that_person_by_folder_name_and_reports_it_once(tmp_path):
+    person_folder(tmp_path, "sara", "# Sára Ahmed\n- one\n".encode("cp1252"))
+    person_folder(tmp_path, "omar", "# Omar Ali\n")
+    problems = {}
+    people = load_people(tmp_path, problems)
+    assert people["sara"] == Person("sara", "sara")             # no role, lines, story or brief
+    assert people["omar"].name == "Omar Ali"                    # the others load normally
+    assert list(problems) == ["sara"]
+    assert "not saved as UTF-8" in problems["sara"]
+    assert str(Path("sara") / "about.md") in problems["sara"]
 
 
-def test_invalid_json_names_the_file_and_the_line(tmp_path):
-    path = write(tmp_path, '{\n  "sara": {"name": "Sara Ahmed",}\n}')
-    with pytest.raises(ConfigError, match=r"people\.json is not valid JSON.*line 2"):
-        load_people(path)
+def test_wrong_encoding_without_a_problems_dict_gives_one_warning(tmp_path, caplog):
+    person_folder(tmp_path, "sara", "# Sára Ahmed\n".encode("cp1252"))
+    with caplog.at_level(logging.WARNING, logger="car_vision.faces"):
+        people = load_people(tmp_path)
+    assert people == {"sara": Person("sara", "sara")}
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1 and "about.md" in warnings[0] and "UTF-8" in warnings[0]
 
 
-def test_top_level_must_be_an_object(tmp_path):
-    with pytest.raises(ConfigError, match="people.json must be one object"):
-        load_people(write(tmp_path, '[{"name": "Sara Ahmed"}]'))
+def test_invalid_folder_names_are_skipped_with_one_warning_each(tmp_path, caplog):
+    person_folder(tmp_path, "sara", SARA_ABOUT)
+    for bad in ("Omar", "lina haddad", "nora-f"):
+        person_folder(tmp_path, bad)
+    with caplog.at_level(logging.WARNING, logger="car_vision.faces"):
+        people = load_people(tmp_path)
+    assert list(people) == ["sara"]
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 3
+    assert all(any(bad in message for message in warnings) for bad in ("Omar", "lina haddad", "nora-f"))
 
 
-def test_entry_without_name(tmp_path):
-    with pytest.raises(ConfigError, match=r"people\.json, person 'sara': 'name' is missing"):
-        load_people(write(tmp_path, '{"sara": {"role": "Team lead"}}'))
+def test_invalid_folder_names_go_into_the_problems_dict_with_the_rule(tmp_path):
+    person_folder(tmp_path, "sara", SARA_ABOUT)
+    person_folder(tmp_path, "Luran")
+    person_folder(tmp_path, "sara-ahmed")
+    problems = {}
+    assert list(load_people(tmp_path, problems)) == ["sara"]
+    assert sorted(problems) == ["Luran", "sara-ahmed"]
+    assert all("small letters, digits and underscores" in message for message in problems.values())
+    assert "'Luran'" in problems["Luran"]
 
 
-@pytest.mark.parametrize("entry, field", [
-    ('"Sara Ahmed"', "must be an object"),
-    ('{"name": 7}', "'name' must be text"),
-    ('{"name": ""}', "'name' must be text"),
-    ('{"name": "Sara", "role": ["lead"]}', "'role' must be text"),
-    ('{"name": "Sara", "lines": "Built the chassis"}', "'lines' must be a list of text"),
-    ('{"name": "Sara", "lines": ["ok", 3]}', "'lines' must be a list of text"),
-])
-def test_wrong_value_types(tmp_path, entry, field):
-    with pytest.raises(ConfigError, match="people.json") as caught:
-        load_people(write(tmp_path, '{"sara": ' + entry + '}'))
-    assert field in str(caught.value)
+def test_missing_or_empty_photo_folder_gives_nobody(tmp_path):
+    assert load_people(tmp_path / "does-not-exist") == {}
+    assert load_people(tmp_path) == {}
+
+
+def test_the_example_about_file_parses():
+    text = (ROOT / "data" / "people.example" / "about.md").read_text(encoding="utf-8-sig")
+    person = parse_about("nora", text)
+    assert person.name == "Nora Fielding"
+    assert person.role and len(person.lines) > 3 and person.story
+    assert "<!--" not in person.story
+    assert not list((ROOT / "data" / "people.example").glob("*.jpg"))      # never enrolled
 
 
 # ---- embeddings file ---------------------------------------------------------------
@@ -123,6 +260,22 @@ def test_mismatched_lengths_say_to_enroll(tmp_path):
     with pytest.raises(ConfigError, match="2 ids but 3") as caught:
         load_embeddings(path)
     assert "car_vision.enroll" in str(caught.value)
+
+
+def test_one_dimensional_embeddings_say_to_enroll(tmp_path):
+    path = tmp_path / "embeddings.npz"
+    np.savez(path, ids=np.array(["sara"]), embeddings=np.zeros(1, np.float32))
+    with pytest.raises(ConfigError, match="one face vector per row") as caught:
+        load_embeddings(path)
+    assert "car_vision.enroll" in str(caught.value)
+
+
+def test_vectors_of_the_wrong_size_say_to_enroll(tmp_path):
+    path = tmp_path / "embeddings.npz"
+    save_embeddings(path, ["sara"], np.stack([one_hot(0)]))
+    assert load_embeddings(path, vector_size=SIZE)[0] == ["sara"]
+    with pytest.raises(ConfigError, match=f"{SIZE} numbers, but the face model makes 512"):
+        load_embeddings(path, vector_size=512)
 
 
 def test_damaged_embeddings_file(tmp_path):
@@ -209,12 +362,27 @@ def test_tracked_face_follows_its_person_box():
     assert moved[0].track_id == 4
 
 
-def test_tracked_face_disappears_with_its_track():
+def test_tracked_face_disappears_when_its_track_is_gone_too_long():
     memory = FaceMemory()
     memory.remember([face((120, 60, 160, 110), track_id=4)], [person(4, (100, 50, 200, 400))], now=0.0)
-    assert memory.current([person(9, (100, 50, 200, 400))], now=0.1) == []
+    assert len(memory.current([person(9, (100, 50, 200, 400))], now=0.1)) == 1     # missing since 0.1
+    assert len(memory.current([], now=0.1 + TRACK_GAP_SECONDS - 0.01)) == 1         # still within the gap
+    assert memory.current([], now=0.1 + TRACK_GAP_SECONDS + 0.01) == []
     # It stays gone, even if a box with that number shows up again later.
-    assert memory.current([person(4, (100, 50, 200, 400))], now=0.2) == []
+    assert memory.current([person(4, (100, 50, 200, 400))], now=0.5) == []
+
+
+def test_tracked_face_waits_where_it_was_and_follows_the_track_when_it_comes_back():
+    memory = FaceMemory()
+    memory.remember([face((120, 60, 160, 110), track_id=4)], [person(4, (100, 50, 200, 400))], now=0.0)
+    assert memory.current([person(4, (110, 50, 210, 400))], now=0.05)[0].box == (130, 60, 170, 110)
+    # One frame without the person box: the face stays at its last place.
+    assert memory.current([], now=0.1)[0].box == (130, 60, 170, 110)
+    # The box is back within the gap: the face follows it again.
+    assert memory.current([person(4, (130, 70, 230, 420))], now=0.3)[0].box == (150, 80, 190, 130)
+    # And a new gap starts from zero.
+    assert len(memory.current([], now=0.35)) == 1
+    assert len(memory.current([], now=0.35 + TRACK_GAP_SECONDS - 0.01)) == 1
 
 
 def test_untracked_face_expires_after_max_age():

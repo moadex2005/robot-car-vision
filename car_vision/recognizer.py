@@ -22,6 +22,7 @@ import argparse
 import logging
 import time
 from collections.abc import Sequence
+from pathlib import Path
 from typing import Any
 
 import cv2
@@ -30,7 +31,14 @@ import numpy as np
 from car_vision import draw
 from car_vision.config import ConfigError, load_config, require, resolve_path, section
 from car_vision.detector import Detector, clip_box
-from car_vision.faces import FaceMatcher, FaceMemory, Person, load_embeddings, load_people
+from car_vision.faces import (
+    FaceMatcher,
+    FaceMemory,
+    Person,
+    has_about_text,
+    load_embeddings,
+    load_people,
+)
 from car_vision.state import UNKNOWN, Box, Detection, RecognizedFace, WorldState
 from car_vision.stream import SOURCES, FpsCounter, FrameSource
 
@@ -40,6 +48,7 @@ DEVICES = ("auto", "cuda", "cpu")
 FACE_TASKS = ["detection", "recognition"]       # skip landmarks, gender and age
 GPU_PROVIDER = "CUDAExecutionProvider"
 CPU_PROVIDER = "CPUExecutionProvider"
+FACE_VECTOR_SIZE = 512                           # every InsightFace model pack makes 512 numbers per face
 
 
 # ---- loading the InsightFace models (shared with car_vision.enroll) -----------
@@ -67,12 +76,37 @@ def face_model_providers(face_model: Any) -> dict[str, str]:
     return used
 
 
+class FaceModelError(Exception):
+    """The face models could not be loaded; the message says why in one line."""
+
+
+def first_line(error: BaseException) -> str:
+    """The first line of an error message, or the error's kind when it has no message."""
+    lines = str(error).strip().splitlines()
+    return lines[0].strip() if lines else type(error).__name__
+
+
 def load_face_model(settings: dict) -> Any:
     """InsightFace FaceAnalysis with only its detection and recognition models.
 
-    The model pack is downloaded into models_dir on the first run. The graphics
-    card is used when device allows it; if it cannot be used, the models run on
-    the processor and a warning is logged.
+    A wrong setting raises ConfigError. Any other failure (no network for the
+    first download, a broken library) raises FaceModelError with a short reason,
+    so the caller can stop with one plain line instead of a traceback.
+    """
+    try:
+        return build_face_model(settings)
+    except ConfigError:
+        raise
+    except Exception as error:                       # downloads and DLLs can fail in many ways
+        log.debug("The face models could not be loaded", exc_info=True)
+        raise FaceModelError(f"the face models could not be loaded: {first_line(error)}") from error
+
+
+def build_face_model(settings: dict) -> Any:
+    """Load the model pack, downloading it into models_dir on the first run.
+
+    The graphics card is used when device allows it; if it cannot be used, the
+    models run on the processor and a warning is logged.
     """
     pack: str = require(settings, "model_pack", str)
     models_dir = resolve_path(require(settings, "models_dir", str))
@@ -126,13 +160,17 @@ def embedding_of(face: Any) -> np.ndarray | None:
 
 
 def track_for(face_box: Box, detections: Sequence[Detection]) -> int | None:
-    """Track number of the smallest person box that contains the middle of the face."""
+    """Track number of the smallest tracked person box that contains the middle of the face.
+
+    Person boxes without a track number are passed over, so a small untracked
+    box cannot hide the tracked one around it. None when no tracked box holds the face.
+    """
     middle_x = (face_box[0] + face_box[2]) / 2
     middle_y = (face_box[1] + face_box[3]) / 2
     best: Detection | None = None
     best_area = 0
     for detection in detections:
-        if detection.label != "person":
+        if detection.label != "person" or detection.track_id is None:
             continue
         x1, y1, x2, y2 = detection.box
         if not (x1 <= middle_x <= x2 and y1 <= middle_y <= y2):
@@ -151,13 +189,13 @@ class Recognizer:
                  matcher: FaceMatcher | None = None) -> None:
         threshold = float(require(settings, "match_threshold", (int, float)))
         self.min_face_pixels: int = require(settings, "min_face_pixels", int)
-        people_file: str = require(settings, "people_file", str)
+        photos_dir: str = require(settings, "photos_dir", str)
         embeddings_file: str = require(settings, "embeddings_file", str)
 
         # Cheap files first, so a mistake in them shows before the slow model load.
-        self._people = people if people is not None else load_people(resolve_path(people_file))
+        self._people = people if people is not None else load_people(resolve_path(photos_dir))
         if matcher is None:
-            ids, embeddings = load_embeddings(resolve_path(embeddings_file))
+            ids, embeddings = load_embeddings(resolve_path(embeddings_file), FACE_VECTOR_SIZE)
             matcher = FaceMatcher(ids, embeddings, threshold)
         self._matcher = matcher
         self._warn_about_mismatches()
@@ -169,7 +207,7 @@ class Recognizer:
         return face_model_providers(self._model)
 
     def person(self, person_id: str) -> Person | None:
-        """The info card of an enrolled person, or None."""
+        """What the team wrote about a person (their folder and about.md), or None."""
         return self._people.get(person_id)
 
     def recognize(self, frame: np.ndarray,
@@ -225,39 +263,58 @@ class Recognizer:
         return person.name if person is not None else person_id
 
     def _warn_about_mismatches(self) -> None:
+        """One warning when the person folders and the saved faces do not agree."""
         enrolled = self._matcher.person_ids
-        no_photos = sorted(set(self._people) - enrolled)
-        no_card = sorted(enrolled - set(self._people))
+        not_enrolled = sorted(set(self._people) - enrolled)
+        no_folder = sorted(enrolled - set(self._people))
         problems = []
-        if no_photos:
-            problems.append(f"no saved face for {', '.join(no_photos)} (run the enroll command)")
-        if no_card:
-            problems.append(f"saved faces for {', '.join(no_card)} who are not in the people file "
+        if not_enrolled:
+            problems.append(f"not enrolled yet, so never recognised: {', '.join(not_enrolled)} "
+                            "(add photos to their folder and run the enroll command)")
+        if no_folder:
+            problems.append(f"saved faces for {', '.join(no_folder)} who have no person folder "
                             "(they are shown by id, without an info card)")
         if problems:
-            log.warning("Face data does not match the people file: %s", "; ".join(problems))
+            log.warning("Face data does not match the person folders: %s", "; ".join(problems))
 
 
 # ---- running this file on its own -----------------------------------------------
 
 
 def load_known_faces(settings: dict) -> tuple[dict[str, Person], FaceMatcher]:
-    """People and saved faces for the live view. A missing or broken file is
-    reported in plain words and everyone is shown as Unknown, instead of stopping."""
+    """People (from the folders under photos_dir) and saved faces for the live view.
+
+    A missing folder or file, or a broken one, is reported in plain words and
+    the program carries on, showing the faces it cannot name as Unknown.
+    """
     threshold = float(require(settings, "match_threshold", (int, float)))
+    people = load_people_with_notes(resolve_path(require(settings, "photos_dir", str)))
     try:
-        people = load_people(resolve_path(require(settings, "people_file", str)))
-    except ConfigError as error:
-        print(f"Note: {error}")
-        people = {}
-    try:
-        ids, embeddings = load_embeddings(resolve_path(require(settings, "embeddings_file", str)))
+        ids, embeddings = load_embeddings(resolve_path(require(settings, "embeddings_file", str)),
+                                          FACE_VECTOR_SIZE)
     except ConfigError as error:
         print(f"Note: {error}")
         ids, embeddings = [], np.zeros((0, 0), dtype=np.float32)
     if not ids:
         print("Nobody is enrolled yet, so every face is shown as Unknown.")
     return people, FaceMatcher(ids, embeddings, threshold)
+
+
+def load_people_with_notes(photos_dir: Path) -> dict[str, Person]:
+    """load_people, printing a note instead of stopping when something is missing."""
+    problems: dict[str, str] = {}             # folder name -> what is wrong with it
+    people = load_people(photos_dir, problems)
+    if not people:
+        print(f"Note: there are no person folders in {photos_dir}. Make one folder per person "
+              "with their photos and an about.md, then run the enroll command.")
+    for problem in problems.values():
+        print(f"Note: {problem}")
+    no_about = [person_id for person_id, person in people.items()
+                if not has_about_text(person) and person_id not in problems]
+    if no_about:
+        print(f"Note: no about.md (or an empty one) for {', '.join(no_about)}; "
+              "they are shown by folder name, with no card text.")
+    return people
 
 
 def describe_faces(faces: Sequence[RecognizedFace]) -> str:
@@ -288,7 +345,7 @@ def main(argv: list[str] | None = None) -> int:
         people, matcher = load_known_faces(settings)
         detector = Detector(section(config, "detector"))
         recognizer = Recognizer(settings, people=people, matcher=matcher)
-    except ConfigError as error:
+    except (ConfigError, FaceModelError) as error:
         print(f"Cannot start: {error}")
         return 1
 

@@ -25,6 +25,13 @@ picture sizes it offers and, with stream.phone_picture set to auto, asks for
 the smallest one that is still sharp enough: smaller pictures arrive sooner.
 set_phone_picture() changes that choice for this run (the camera box again).
 
+The choice also decides how large the pictures are that the loop works on.
+With auto or keep, the phone's pictures are shrunk into the stream.width x
+stream.height box from config.yaml, as before. With a chosen size the phone
+offers, the box becomes that size (at most 1920 x 1080), so the detector, the
+recogniser, the photos for the assistant and the video on the page all get
+the sharper picture. A clip or the webcam always keeps the config box.
+
 Every part can be handed in from outside, so the tests run the loop with
 fakes and need no camera, model or graphics card.
 """
@@ -50,7 +57,7 @@ from car_vision.phone import (Fetch, Size, area, ask_for_size, best_size, parse_
 from car_vision.reactions import Reaction, ReactionEngine
 from car_vision.recognizer import Recognizer, load_known_faces
 from car_vision.state import Box, Detection, RecognizedFace, WorldSnapshot, WorldState
-from car_vision.stream import FpsCounter, FrameSource
+from car_vision.stream import FpsCounter, FrameSource, fitted_size
 
 log = logging.getLogger(__name__)
 
@@ -73,6 +80,8 @@ BAD_PICTURE_SETTING = "stream.phone_picture must be auto, keep or a size like 12
 NOT_A_PICTURE_CHOICE = "Choose auto, keep or one of the sizes the phone offers, like 640x360."
 READ_BACK_TRIES = 2            # after a change the size is read back from the phone, once more if it lags
 READ_BACK_WAIT_SECONDS = 1.0   # ... this long later
+STREAM_SETTLE_SECONDS = 0.5    # the phone's stream needs this long to switch to a new picture size
+MAX_SHOWN_SIZE = (1920, 1080)  # a chosen picture size is shown at most this large
 
 
 @dataclass(frozen=True)
@@ -137,8 +146,9 @@ class Pipeline:
         phone_url = self._stream_settings.get("phone_url")
         self._phone_url: str | None = phone_url if isinstance(phone_url, str) else None
         self._picture_choice: str = configured_picture_choice(self._stream_settings)
-        self._box: Size = (require(self._stream_settings, "width", int),
-                           require(self._stream_settings, "height", int))
+        # The box from config.yaml: used for auto and keep, and by auto to pick a size.
+        self._config_box: Size = (require(self._stream_settings, "width", int),
+                                  require(self._stream_settings, "height", int))
         self._fetch = phone_fetch              # None: really ask the phone (tests pass a fake)
         self._make_source: SourceFactory = source_factory if source_factory is not None else FrameSource
         # Cheap parts first, so a wrong setting or a missing clip shows before the slow model loads.
@@ -175,6 +185,7 @@ class Pipeline:
         self._failures = 0                     # broken frames in a row
         self._last_drawn: np.ndarray | None = None
         self._lost_line: str | None = None     # the line already drawn on the last frame, if any
+        self._frame_size: tuple[int, int] | None = None   # (width, height) of the last frame worked on
 
     # ---- public ------------------------------------------------------------
 
@@ -243,8 +254,9 @@ class Pipeline:
     def set_phone_picture(self, choice: str) -> None:
         """Choose the phone's picture size for this run: "auto", "keep" or a size like "640x360".
 
-        config.yaml is not written. The phone is asked in a thread of its own,
-        so this returns at once. Raises ValueError with a plain message for
+        config.yaml is not written. The box the phone's pictures are fitted into
+        changes at once (see shown_box); the phone is asked in a thread of its
+        own, so this returns at once. Raises ValueError with a plain message for
         anything else, and for a size the phone does not offer.
         """
         wanted = picture_choice(choice)
@@ -257,6 +269,7 @@ class Pipeline:
                 raise ValueError(f"The phone does not offer {size[0]} x {size[1]}. "
                                  "Choose one of the sizes in the list.")
             self._picture_choice = wanted
+            self._set_phone_box()
         log.info("Phone picture: %s", wanted)
         self._check_phone_picture()
 
@@ -375,11 +388,12 @@ class Pipeline:
             if wanted is None or not self._is_newest(work):
                 return
             log.info("Asking the phone for %s pictures instead of %s", size_text(wanted), size_text(current))
-            if ask_for_size(url, wanted, self._fetch):
-                self._read_back(url, work, wanted, offered)
+            if ask_for_size(url, wanted, self._fetch) and self._read_back(url, work, wanted, offered):
+                self._open_stream_again(work)
 
-    def _read_back(self, url: str, work: int, wanted: Size, offered: list[Size]) -> None:
+    def _read_back(self, url: str, work: int, wanted: Size, offered: list[Size]) -> bool:
         """Keep what the phone says it sends after the change; once more a moment later if it lags.
+        True when the phone now sends the size that was asked for.
 
         Only the current size is taken from these answers. The list of offered
         sizes stays the one read before the change: while its camera restarts,
@@ -389,10 +403,28 @@ class Pipeline:
             if attempt > 0:
                 self._stop.wait(READ_BACK_WAIT_SECONDS)
             if not self._is_newest(work):
-                return
+                return False
             current, _listed_during_restart = read_picture_sizes(url, self._fetch)
-            if current is None or not self._keep_picture(work, current, offered) or current == wanted:
+            if current is None or not self._keep_picture(work, current, offered):
+                return False
+            if current == wanted:
+                return True
+        return False
+
+    def _open_stream_again(self, work: int) -> None:
+        """After the phone changed its picture size, read its stream afresh.
+
+        Seen on the real phone: the stream reader fixes the frame size when it
+        opens the stream, so without this the frames stay the old size however
+        large the phone's pictures are now. The short wait lets the phone send
+        its first pictures in the new size before the stream is opened again.
+        """
+        self._stop.wait(STREAM_SETTLE_SECONDS)
+        with self._lock:
+            if work != self._picture_round or self._source.source != "phone":
                 return
+            source = self._source
+        source.reopen()
 
     def _wanted_size(self, current: Size, offered: list[Size]) -> Size | None:
         """The size to ask the phone for under the present choice; None to leave it as it is."""
@@ -401,7 +433,7 @@ class Pipeline:
         if choice == "keep":
             return None
         if choice == "auto":
-            return best_size(offered, current, *self._box)
+            return best_size(offered, current, *self._config_box)
         size = parse_size(choice)
         if size not in offered:
             log.warning("stream.phone_picture is %s, but the phone does not offer that size; "
@@ -414,12 +446,28 @@ class Pipeline:
             return work == self._picture_round
 
     def _keep_picture(self, work: int, current: Size, offered: list[Size]) -> bool:
-        """Keep what the phone said, unless a newer round began meanwhile (then False)."""
+        """Keep what the phone said, unless a newer round began meanwhile (then False).
+
+        Now that the offered sizes are known, a chosen size can take effect: the
+        phone source gets its box here.
+        """
         with self._lock:
             if work != self._picture_round:
                 return False
             self._picture = PhonePicture(current, tuple(offered))
+            self._set_phone_box()
             return True
+
+    def _set_phone_box(self) -> None:
+        """Give the phone source the box for the present choice. Call with self._lock held.
+
+        Holding the lock means two threads can never leave an older box behind.
+        A clip or the webcam is left alone: it keeps the box from config.yaml.
+        """
+        if self._source.source != "phone":
+            return
+        box = shown_box(self._picture_choice, self._picture, self._config_box)
+        self._source.set_box(*box)
 
     # ---- the loop thread -----------------------------------------------------
 
@@ -432,7 +480,9 @@ class Pipeline:
         picture, and the assistant must not be told about people that camera saw."""
         self._generation += 1
         self._switched_at = time.monotonic()
-        self._picture = None                    # the new phone has not said yet
+        # The new phone has not said yet. Its source starts with the config box,
+        # and gets the chosen box once it says it offers that size (_keep_picture).
+        self._picture = None
         self._picture_round += 1                # what the old phone still says is ignored
         self._view = None
         self._error = None
@@ -479,6 +529,7 @@ class Pipeline:
         self._memory = FaceMemory()
         self._fps = FpsCounter()
         self._lost_line = None
+        self._frame_size = None
         if switched and self._last_drawn is not None:
             self._last_drawn = np.full_like(self._last_drawn, DARK_LEVEL)
             self._show_stream_lost(source)          # no frame yet, so: "Connecting to the phone ..."
@@ -491,7 +542,8 @@ class Pipeline:
         self._frames += 1
 
         detections = self._detector.detect(frame)
-        if self._recognizer is not None and index % self.every_n_frames == 0:
+        resized = self._note_frame_size(frame)
+        if self._recognizer is not None and (index % self.every_n_frames == 0 or resized):
             found = self._recognizer.recognize(frame, detections)
             self._memory.remember(found, detections, now)
         faces = self._memory.current(detections, now)
@@ -520,6 +572,21 @@ class Pipeline:
             # Seen on the real phone: when its camera app restarts, it sends its own
             # picture size again (1920 x 1080), so the chosen size is asked for once more.
             self._check_phone_picture()
+
+    def _note_frame_size(self, frame: np.ndarray) -> bool:
+        """True when this frame is not the size of the one before from this camera.
+
+        That happens when another picture size is chosen or the phone changes
+        its own. The remembered faces are then forgotten, because their boxes are
+        in the old size's pixels; the caller checks the faces again at once.
+        (The detector starts its tracker again by itself.)
+        """
+        height, width = frame.shape[:2]
+        resized = self._frame_size is not None and (width, height) != self._frame_size
+        self._frame_size = (width, height)
+        if resized:
+            self._memory = FaceMemory()
+        return resized
 
     def _too_many_failures(self, error: Exception, generation: int) -> bool:
         """Log a skipped frame. True when too many failed in a row and the loop must stop."""
@@ -653,6 +720,20 @@ def picture_status(picture: PhonePicture | None, choice: str) -> dict[str, Any] 
     return {"current": size_text(picture.current),
             "offered": [size_text(size) for size in offered],
             "choice": choice}
+
+
+def shown_box(choice: str, picture: PhonePicture | None, config_box: Size) -> Size:
+    """The box the phone's pictures are fitted into, as (width, height).
+
+    A chosen size the phone offers gives that size, at most 1920 x 1080 with
+    its shape kept (a 3840 x 2160 choice gives 1920 x 1080). Everything else
+    gives the box from config.yaml: auto, keep, a size the phone does not
+    offer, and any size before the phone has said what it offers.
+    """
+    size = parse_size(choice)
+    if size is None or picture is None or size not in picture.offered:
+        return config_box
+    return fitted_size(size[0], size[1], *MAX_SHOWN_SIZE)
 
 
 CardOf = Callable[[RecognizedFace], Person]     # the person a known face belongs to

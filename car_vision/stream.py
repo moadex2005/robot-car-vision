@@ -4,6 +4,10 @@ A background thread reads the camera as fast as frames arrive and keeps only
 the newest one. Whoever asks for a frame always gets the latest picture, so a
 slow model never makes the video fall behind the real world.
 
+Every frame is shrunk to fit inside a box, stream.width x stream.height from
+config.yaml to begin with. set_box() changes that box while the video runs:
+the pipeline does that when a picture size is chosen in the Camera box.
+
 The phone is read with FFmpeg (through OpenCV), asked to keep no buffer.
 FFmpeg reads and decodes outside Python's global lock, so it does not slow
 the detector running in another thread. A reader written in Python was tried
@@ -126,7 +130,11 @@ class FrameSource:
 
         self.fps = FpsCounter()
         self._lock = threading.Lock()
+        # Frames are shrunk to fit inside this (width, height). It starts as the
+        # configured size; set_box() may change it while the reader runs.
+        self._box: tuple[int, int] = (self.width, self.height)
         self._first_frame = threading.Event()
+        self._reopen = threading.Event()   # set by reopen(); the reader thread opens the stream again
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._frame: np.ndarray | None = None
@@ -163,6 +171,31 @@ class FrameSource:
                 return None, self._sequence
             return self._frame.copy(), self._sequence
 
+    def set_box(self, max_width: int, max_height: int) -> None:
+        """Fit the frames from the next one on inside max_width x max_height.
+
+        Safe to call from another thread while the reader runs: the width and
+        the height are stored together, so a frame is never fitted with the
+        new width and the old height. Frames are still never enlarged.
+        Raises ValueError for a side that is not a whole number above 0.
+        """
+        for side in (max_width, max_height):
+            if not isinstance(side, int) or isinstance(side, bool) or side < 1:
+                raise ValueError(f"set_box needs whole numbers above 0, got {max_width!r} x {max_height!r}")
+        with self._lock:
+            self._box = (max_width, max_height)
+
+    def reopen(self) -> None:
+        """Close the stream and open it again at once, without calling it lost.
+
+        Needed when the phone starts sending another picture size: OpenCV's
+        FFmpeg reader fixes the frame size when the stream is opened and keeps
+        scaling every later picture to that size (seen on the real phone: after
+        asking for 1920 x 1080 the frames stayed 640 x 360). Safe to call from
+        another thread; the reader thread does the work before its next frame.
+        """
+        self._reopen.set()
+
     def wait_for_frame(self, timeout: float = 10.0) -> bool:
         """Block until the first frame arrives. False when it never did."""
         return self._first_frame.wait(timeout)
@@ -189,6 +222,11 @@ class FrameSource:
         frames_since_open = 0
         try:
             while not self._stop.is_set():
+                if self._reopen.is_set():              # reopen() was called: start the stream afresh
+                    self._reopen.clear()
+                    if capture is not None:
+                        capture.release()
+                        capture = None
                 if capture is None:
                     capture = self._open()
                     frames_since_open = 0
@@ -253,12 +291,15 @@ class FrameSource:
         return capture
 
     def _fit(self, frame: np.ndarray) -> np.ndarray:
-        """Shrink the frame to fit inside width x height without changing its shape.
+        """Shrink the frame to fit inside the box without changing its shape.
 
-        A wide 1920 x 1080 phone picture becomes 640 x 360, not a squashed 640 x 480:
-        squashed faces are harder to recognise.
+        With the 640 x 480 box from config.yaml, a wide 1920 x 1080 phone picture
+        becomes 640 x 360, not a squashed 640 x 480: squashed faces are harder
+        to recognise.
         """
-        size = fitted_size(frame.shape[1], frame.shape[0], self.width, self.height)
+        with self._lock:
+            max_width, max_height = self._box       # both sides read together
+        size = fitted_size(frame.shape[1], frame.shape[0], max_width, max_height)
         if size == (frame.shape[1], frame.shape[0]):
             return frame
         return cv2.resize(frame, size, interpolation=cv2.INTER_AREA)

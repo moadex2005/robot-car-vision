@@ -130,10 +130,12 @@ class FakeAssistant:
         self.questions = []
         self.looked_up = []                 # (image, label) of every describe call
         self.follow_ups = []                # (image, label, info, earlier, question) of every follow_up call
+        self.marked = []                    # the marked copy given with every follow_up call, or None
         self.resets = 0
 
-    def follow_up(self, image, label, info, earlier, question):
+    def follow_up(self, image, label, info, earlier, question, marked=None):
         self.follow_ups.append((image, label, info, earlier, question))
+        self.marked.append(marked)
         error = self.follow_up_errors.pop(0) if self.follow_up_errors else None
         if error is not None:
             raise error
@@ -796,6 +798,161 @@ def test_inspection_store_keeps_the_description_and_the_pairs():
     store.set_info("made-up", STORED_LAPTOP_INFO)               # an expired id changes nothing
     store.add_pair("made-up", "a", "b")
     assert store.get("made-up") is None
+
+
+# ---- /api/follow_up with a marked part ------------------------------------------------------
+
+STROKES = [{"points": [[0.2, 0.3], [0.25, 0.35], [0.3, 0.4]]}, {"points": [[1, 0]]}]
+
+
+class FakeMarking:
+    """Stands in for marking.mark_photo and remembers what it was given."""
+
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, photo, strokes, quality=85):
+        self.calls.append((photo, strokes))
+        return b"marked copy"
+
+
+@pytest.fixture
+def fake_marking(monkeypatch):
+    marking = FakeMarking()
+    monkeypatch.setattr(app_module, "mark_photo", marking)
+    return marking
+
+
+def ask_about_a_part(client, inspection_id, strokes=STROKES, question="What is this part?"):
+    return client.post("/api/follow_up", json={"id": inspection_id, "question": question, "strokes": strokes})
+
+
+def test_strokes_are_drawn_on_the_stored_photo_and_the_assistant_gets_the_marked_copy(fake_marking):
+    assistant = FakeAssistant()
+    client = client_for(assistant)
+    inspection, _described = inspect_then_describe(client)
+    response = ask_about_a_part(client, inspection["id"])
+    assert response.status_code == 200
+    assert response.get_json()["text"] == "Answer 1"
+    assert fake_marking.calls == [(PHOTO, [[(0.2, 0.3), (0.25, 0.35), (0.3, 0.4)], [(1.0, 0.0)]])]
+    assert assistant.follow_ups == [(PHOTO, "laptop", STORED_LAPTOP_INFO, (), "What is this part?")]
+    assert assistant.marked == [b"marked copy"]                 # the original photo still goes first
+
+
+def test_the_real_marking_gives_the_assistant_a_picture_of_the_same_size():
+    assistant = FakeAssistant()
+    client = client_for(assistant, FakePipeline(target=AREA))
+    inspection, _described = inspect_then_describe(client)
+    assert ask_about_a_part(client, inspection["id"]).status_code == 200
+    marked = cv2.imdecode(np.frombuffer(assistant.marked[0], np.uint8), cv2.IMREAD_COLOR)
+    assert marked.shape == cv2.imdecode(np.frombuffer(PHOTO, np.uint8), cv2.IMREAD_COLOR).shape
+    assert assistant.marked[0] != PHOTO
+    assert assistant.follow_ups[0][1] is None                   # an area still has no label
+
+
+def test_without_strokes_no_marked_copy_is_sent(fake_marking):
+    assistant = FakeAssistant()
+    client = client_for(assistant)
+    inspection, _described = inspect_then_describe(client)
+    ask_more(client, inspection["id"])
+    assert assistant.marked == [None] and fake_marking.calls == []
+
+
+def test_a_marked_question_is_kept_with_a_note_for_the_later_questions(fake_marking):
+    assistant = FakeAssistant()
+    client = client_for(assistant)
+    inspection, _described = inspect_then_describe(client)
+    ask_about_a_part(client, inspection["id"], question="What is this part?")
+    ask_more(client, inspection["id"], "And how heavy is it?")
+    assert assistant.follow_ups[1][3] == (("(about a part the visitor marked) What is this part?", "Answer 1"),)
+    assert assistant.marked == [b"marked copy", None]
+
+
+def test_a_failed_marked_question_is_not_kept(fake_marking):
+    assistant = FakeAssistant(follow_up_errors=[AssistantError("The assistant is still busy."), None])
+    client = client_for(assistant)
+    inspection, _described = inspect_then_describe(client)
+    assert "error" in ask_about_a_part(client, inspection["id"]).get_json()
+    ask_more(client, inspection["id"], "Again?")
+    assert assistant.follow_ups[1][3] == ()
+
+
+def test_the_most_strokes_and_points_and_the_edges_are_accepted(fake_marking):
+    assistant = FakeAssistant()
+    client = client_for(assistant)
+    inspection, _described = inspect_then_describe(client)
+    full = [{"points": [[0, 0], [1, 1]] * 200}] * 12             # 12 strokes of 400 points
+    assert ask_about_a_part(client, inspection["id"], full).status_code == 200
+    assert len(fake_marking.calls[0][1]) == 12 and len(fake_marking.calls[0][1][0]) == 400
+
+
+@pytest.mark.parametrize("strokes", [
+    "not a list",
+    {"points": [[0.5, 0.5]]},
+    None,
+    5,
+    [],                                                           # say nothing instead of an empty marking
+    [{"points": [[0.5, 0.5]]}] * 13,                              # more than 12 strokes
+    [{"points": []}],                                             # a stroke with no point
+    [{"points": [[0.5, 0.5]] * 401}],                             # more than 400 points
+    [[[0.5, 0.5]]],                                               # a stroke that is not {"points": ...}
+    [{"dots": [[0.5, 0.5]]}],
+    [{"points": "0.5, 0.5"}],
+    [{"points": [[0.5]]}],                                        # a point that is not two numbers
+    [{"points": [[0.5, 0.5, 0.5]]}],
+    [{"points": [{"x": 0.5, "y": 0.5}]}],
+    [{"points": [["0.5", 0.5]]}],
+    [{"points": [[True, 0.5]]}],
+    [{"points": [[None, 0.5]]}],
+    [{"points": [[1.01, 0.5]]}],                                  # outside 0 to 1
+    [{"points": [[0.5, -0.01]]}],
+    [{"points": [[0.5, 0.5]]}, {"points": [[2, 0.5]]}],          # one bad stroke among good ones
+])
+def test_bad_strokes_are_refused_with_a_plain_message(fake_marking, strokes):
+    assistant = FakeAssistant()
+    client = client_for(assistant)
+    inspection, _described = inspect_then_describe(client)
+    response = ask_about_a_part(client, inspection["id"], strokes)
+    assert response.status_code == 400
+    assert isinstance(response.get_json()["error"], str)
+    assert assistant.follow_ups == [] and fake_marking.calls == []
+
+
+@pytest.mark.parametrize("raw", [
+    '[{"points": [[NaN, 0.5]]}]',
+    '[{"points": [[0.5, Infinity]]}]',
+    '[{"points": [[1' + "0" * 400 + ', 0.5]]}]',                 # too big for a float
+])
+def test_strokes_that_are_not_finite_numbers_are_refused(fake_marking, raw):
+    assistant = FakeAssistant()
+    client = client_for(assistant)
+    inspection, _described = inspect_then_describe(client)
+    body = '{"id": "%s", "question": "What is this part?", "strokes": %s}' % (inspection["id"], raw)
+    response = client.post("/api/follow_up", data=body, content_type="application/json")
+    assert response.status_code == 400
+    assert assistant.follow_ups == [] and fake_marking.calls == []
+
+
+@pytest.mark.parametrize("target", [SARA_TARGET, STRANGER])
+def test_strokes_for_a_person_are_refused_and_nothing_is_sent(fake_marking, target):
+    assistant = FakeAssistant()
+    client = client_for(assistant, FakePipeline(target=target))
+    inspection = client.post("/api/inspect", json={"x": 0.2, "y": 0.3}).get_json()
+    response = ask_about_a_part(client, inspection["id"])
+    assert response.status_code == 400
+    assert isinstance(response.get_json()["error"], str)
+    assert assistant.questions == [] and assistant.follow_ups == [] and fake_marking.calls == []
+
+
+def test_a_marking_with_an_unknown_id_is_404(fake_marking):
+    response = ask_about_a_part(client_for(), "not-a-real-id")
+    assert response.status_code == 404
+    assert fake_marking.calls == []
+
+
+def test_unavailable_assistant_follow_up_takes_a_marked_copy():
+    with pytest.raises(AssistantError, match="not available"):
+        UnavailableAssistant("not available").follow_up(PHOTO, "laptop", None, (), "What?", marked=PHOTO)
 
 
 # ---- /api/camera -------------------------------------------------------------------------
@@ -1486,7 +1643,7 @@ def test_template_has_the_phone_picture_row():
     assert '<label class="field-label" for="pictureChoice">Picture from the phone</label>' in page
     assert '<option value="auto">Automatic (smallest that is sharp enough)</option>' in page
     assert '<option value="keep">Leave the phone as it is</option>' in page
-    assert "Smaller pictures arrive sooner." in page and '" The page shows "' in page and '" either way."' in page
+    assert '<span id="pictureHint">Smaller pictures arrive sooner.</span>' in page and '" The page shows "' in page
     assert 'id="pictureNow"' in page and '"The phone sends "' in page
     assert '"/api/camera/picture", { choice: pictureChoice.value }' in page   # only the choice is sent
     assert 'pictureRow.hidden = picture === null;' in page
@@ -1502,9 +1659,74 @@ def test_template_has_the_follow_up_chat():
     page = rendered_page()
     assert '<label class="visually-hidden" for="followQuestion">Ask about this</label>' in page
     assert '<input id="followQuestion" type="text" maxlength="2000" placeholder="Ask about this">' in page
-    assert '"/api/follow_up", { id, question }' in page              # only the id and the question
+    assert "const body = { id, question };" in page                   # the id and the question ...
+    assert "if (strokes) body.strokes = strokes;" in page              # ... and the points of a marking
+    assert 'postJson("/api/follow_up", body)' in page
     assert "MAX_FOLLOW_UPS = 10" in page
     assert "Follow-up questions about an object send the same cut-out again." in page
+
+
+def test_template_picture_help_says_what_the_choice_costs():
+    page = TEMPLATE.read_text(encoding="utf-8")
+    assert '"Sharper, but a little later and slower."' in page
+    assert '"Smaller pictures arrive sooner."' in page
+    assert 'pictureChoice.value !== "auto" && pictureChoice.value !== "keep"' in page
+    assert '" × " + video.naturalHeight + "."' in page                 # the real size of the video's pictures
+    assert "either way" not in page
+
+
+def test_template_full_view_never_depends_on_the_fullscreen_api():
+    """The owner's browser pane neither grants nor refuses requestFullscreen(): the button
+    must still fill the window, and it is never hidden."""
+    page = rendered_page()
+    assert 'id="fullButton" type="button" aria-label="Full screen" title="Full screen (F)">' in page   # not hidden
+    script = page[page.index("function enterFullView()"):page.index("function leaveFullView()")]
+    assert script.index('stage.classList.add("is-full")') < script.index("stage.requestFullscreen()")
+    assert 'document.documentElement.classList.add("full-view")' in script
+    assert "stage.requestFullscreen().catch(() => {})" in script     # refused: the view stays
+    assert "fullButton.hidden" not in page
+    assert "overflow: hidden" in css_rule(page, "html.full-view, html.full-view body")
+    full = css_rule(page, ".stage.is-full")
+    assert "position: fixed" in full and "inset: 0" in full and "background: #000" in full
+
+
+def test_template_escape_closes_the_camera_box_then_the_full_view_then_the_panel():
+    page = TEMPLATE.read_text(encoding="utf-8")
+    body = page[page.index("function closeTopmost()"):page.index('document.addEventListener("keydown"')]
+    order = [body.index("closeCameraBox(true)"), body.index("leaveFullView()"), body.index("closeDetails()")]
+    assert order == sorted(order)
+    change = page[page.index('document.addEventListener("fullscreenchange"'):]
+    assert "!document.fullscreenElement && fullView" in change[:600]   # the browser's Escape leaves the view too
+
+
+def test_template_has_the_brush_on_the_photo():
+    page = rendered_page()
+    around = ids_around(page)
+    assert "photoBox" in around["brushCanvas"] and "details" in around["brushCanvas"]
+    assert "details" in around["brushButton"] and "details" in around["brushClear"]
+    assert 'id="brushButton" type="button" aria-pressed="false"' in page and "Mark a part" in page
+    assert 'id="brushClear" type="button" hidden>Clear</button>' in page
+    assert 'id="followPart" type="button" hidden>What is this part?</button>' in page
+    assert "followForm" in around["followPart"]
+    assert '"Ask about the marked part"' in page and '"marked part"' in page
+    assert "A marked part is sent as the same cut-out with your outline drawn on it." in page
+    assert page.count("A marked part is sent as the same cut-out") == 2   # under the list and in the footer
+
+
+def test_template_brush_follows_the_rules_of_the_marking():
+    page = TEMPLATE.read_text(encoding="utf-8")
+    assert "MAX_STROKES = 12" in page and "MAX_STROKE_POINTS = 400" in page
+    assert "BRUSH_SHARE = 0.06" in page and "MIN_STEP_SHARE = 0.005" in page
+    assert "setPointerCapture(event.pointerId)" in page               # a drag that leaves the photo ends cleanly
+    for event in ("pointerdown", "pointermove", "pointerup", "pointercancel", "lostpointercapture"):
+        assert f'photoBox.addEventListener("{event}"' in page
+    brushing = css_rule(page, ".photo-box.is-brushing, .photo-box.is-brushing .photo")
+    assert "touch-action: none" in brushing and "user-select: none" in brushing
+    assert "pointer-events: none" in css_rule(page, ".brush-canvas")
+    assert "new ResizeObserver(placeBrushCanvas).observe(detailPhoto)" in page   # stays over the picture
+    assert "requestAnimationFrame" not in page[page.index("// ---- the brush"):page.index("// ---- asking more")]
+    # Never for a person: the tools are shown only for something the API may see.
+    assert 'allowBrush(data.describable === true && data.kind !== "person" && !data.person)' in page
 
 
 # ---- which files may use flask --------------------------------------------------------------

@@ -18,6 +18,7 @@ import pytest
 from car_vision import pipeline as pipeline_module
 from car_vision.config import ConfigError
 from car_vision.faces import Person
+from car_vision.phone import parse_size
 from car_vision.pipeline import NOBODY_ENROLLED, Pipeline
 from car_vision.reactions import WARNING_TEXT, ReactionEngine
 from car_vision.state import Detection, RecognizedFace, WorldState
@@ -66,7 +67,11 @@ class FakeSource:
         self.stopped = False
         width, height = size
         self.picture = np.full((height, width, 3), 60, dtype=np.uint8) if picture is None else picture
+        self.boxes = []                                 # every box set_box() was given, in order
         self._lock = threading.Lock()
+
+    def set_box(self, max_width, max_height):
+        self.boxes.append((max_width, max_height))
 
     def start(self):
         self.started = True
@@ -74,6 +79,9 @@ class FakeSource:
 
     def stop(self):
         self.stopped = True
+
+    def reopen(self):
+        self.reopens = getattr(self, "reopens", 0) + 1
 
     def read(self):
         with self._lock:
@@ -933,6 +941,27 @@ def test_the_offered_sizes_survive_a_phone_that_lists_one_size_while_its_camera_
     assert picture_of(pipeline) == {"current": "640x360", "offered": BY_AREA, "choice": "auto"}
 
 
+def test_the_stream_is_opened_again_after_the_phone_changed_its_size(make, monkeypatch):
+    """Seen on the real phone: the stream reader keeps the frame size it found when it opened
+    the stream, so after a change the frames stayed 640 x 360 until the stream was reopened."""
+    monkeypatch.setattr(pipeline_module, "STREAM_SETTLE_SECONDS", 0.01)
+    source = phone_source(frames=3)
+    pipeline = make(source=source, phone_fetch=FakePhoneApp(), config=picture_config("auto")).start()
+    assert wait_until(lambda: getattr(source, "reopens", 0) == 1)      # 1920x1080 -> 640x360
+    pipeline.set_phone_picture("1280x720")
+    assert wait_until(lambda: getattr(source, "reopens", 0) == 2)
+
+
+def test_the_stream_is_left_alone_when_the_phone_already_sends_the_chosen_size(make, monkeypatch):
+    monkeypatch.setattr(pipeline_module, "STREAM_SETTLE_SECONDS", 0.01)
+    source = phone_source(frames=3)
+    app = FakePhoneApp(current="640x360")
+    pipeline = make(source=source, phone_fetch=app, config=picture_config("auto")).start()
+    assert wait_until(lambda: picture_of(pipeline) is not None)
+    time.sleep(0.1)
+    assert getattr(source, "reopens", 0) == 0 and app.sizes_asked == []
+
+
 def test_the_chosen_size_is_asked_for_again_when_the_phone_drops_out_and_returns(make):
     """Seen on the real phone: its camera app restarted and sent 1920 x 1080 again."""
     app = FakePhoneApp()
@@ -1024,6 +1053,7 @@ def test_the_webcam_and_a_clip_never_ask_anything(make, kind):
     time.sleep(0.05)
     assert app.calls == []
     assert picture_of(pipeline) is None
+    assert source.boxes == []                               # its box is never changed
 
 
 def test_another_camera_app_changes_nothing_and_shows_nothing(make):
@@ -1150,6 +1180,216 @@ def test_picture_status_sorts_the_sizes_from_small_to_large():
     assert pipeline_module.picture_status(picture, "auto") == {
         "current": "1920x1080", "offered": ["640x360", "640x480", "800x450", "1280x720"], "choice": "auto"}
     assert pipeline_module.picture_status(None, "auto") is None
+
+
+# ---- the box the phone's pictures are fitted into -----------------------------------------
+
+CONFIG_BOX = (640, 480)
+
+
+def offering(*sizes):
+    """What a phone sending 1920 x 1080 said, offering these sizes."""
+    return pipeline_module.PhonePicture((1920, 1080), tuple(parse_size(size) for size in sizes))
+
+
+def test_shown_box_for_each_kind_of_choice():
+    picture = offering(*REAL_OFFERED)
+    shown_box = pipeline_module.shown_box
+    assert shown_box("auto", picture, CONFIG_BOX) == CONFIG_BOX
+    assert shown_box("keep", picture, CONFIG_BOX) == CONFIG_BOX
+    assert shown_box("1280x720", picture, CONFIG_BOX) == (1280, 720)
+    assert shown_box("1920x1080", picture, CONFIG_BOX) == (1920, 1080)
+    assert shown_box("320x240", picture, CONFIG_BOX) == (320, 240)        # smaller than the config box
+    assert shown_box("3840x2160", picture, CONFIG_BOX) == (1920, 1080)    # at most 1920 x 1080 ...
+    assert shown_box("1600x1200", picture, CONFIG_BOX) == (1440, 1080)    # ... with the shape kept
+    assert pipeline_module.MAX_SHOWN_SIZE == (1920, 1080)
+
+
+def test_shown_box_is_the_config_box_for_a_size_the_phone_does_not_offer_or_has_not_said():
+    assert pipeline_module.shown_box("1234x567", offering(*REAL_OFFERED), CONFIG_BOX) == CONFIG_BOX
+    assert pipeline_module.shown_box("1280x720", offering("640x360"), CONFIG_BOX) == CONFIG_BOX
+    assert pipeline_module.shown_box("1280x720", None, CONFIG_BOX) == CONFIG_BOX
+
+
+def test_a_chosen_size_sets_the_box_at_once_and_auto_puts_it_back(make):
+    app, source = FakePhoneApp(), phone_source()
+    pipeline = make(source=source, phone_fetch=app, config=picture_config("keep")).start()
+    assert wait_until(lambda: picture_of(pipeline) is not None)
+    assert source.boxes[-1] == CONFIG_BOX
+    pipeline.set_phone_picture("1920x1080")
+    assert source.boxes[-1] == (1920, 1080)                 # at once, without waiting for the phone
+    pipeline.set_phone_picture("3840x2160")
+    assert source.boxes[-1] == (1920, 1080)                 # the cap
+    pipeline.set_phone_picture("auto")
+    assert source.boxes[-1] == CONFIG_BOX                   # Automatic puts the box back at once
+    assert wait_until(lambda: picture_of(pipeline)["current"] == "640x360")
+    pipeline.set_phone_picture("1280x720")
+    assert source.boxes[-1] == (1280, 720)
+    pipeline.set_phone_picture("keep")
+    assert source.boxes[-1] == CONFIG_BOX
+    time.sleep(0.05)                                        # what the phone threads still do ...
+    assert source.boxes[-1] == CONFIG_BOX                   # ... leaves the newest choice's box
+
+
+@pytest.mark.parametrize("choice, box", [("1280x720", (1280, 720)), ("3840x2160", (1920, 1080))])
+def test_a_configured_size_sets_the_box_once_the_phone_says_it_offers_it(make, choice, box):
+    app, source = FakePhoneApp(gate=threading.Event()), phone_source()
+    pipeline = make(source=source, phone_fetch=app, config=picture_config(choice)).start()
+    assert wait_until(lambda: app.calls)
+    assert source.boxes == []                               # the config box until the phone answers
+    app.gate.set()
+    assert wait_until(lambda: (picture_of(pipeline) or {}).get("current") == choice)
+    assert set(source.boxes) == {box}
+
+
+def test_a_configured_size_the_phone_does_not_offer_keeps_the_config_box(make):
+    source = phone_source()
+    pipeline = make(source=source, phone_fetch=FakePhoneApp(), config=picture_config("1234x567")).start()
+    assert wait_until(lambda: picture_of(pipeline) is not None)
+    time.sleep(0.05)
+    assert set(source.boxes) == {CONFIG_BOX}
+
+
+def test_the_box_stays_when_the_phone_drops_out_and_returns(make):
+    app, source = FakePhoneApp(), phone_source(frames=3)
+    pipeline = make(source=source, phone_fetch=app, config=picture_config("1280x720")).start()
+    assert wait_until(lambda: (picture_of(pipeline) or {}).get("current") == "1280x720")
+    source.connected = False                                # the app restarts ...
+    assert wait_until(lambda: pipeline._lost_line is not None)
+    app.current = "1920x1080"                               # ... with its own size
+    source.connected = True
+    source.frames += 3
+    assert wait_until(lambda: app.sizes_asked == ["1280x720", "1280x720"])
+    assert wait_until(lambda: picture_of(pipeline)["current"] == "1280x720")
+    assert set(source.boxes) == {(1280, 720)}               # never back to the config box meanwhile
+
+
+def test_the_box_follows_the_choice_to_a_new_phone(make):
+    first, second = FakePhoneApp(), FakePhoneApp()
+    network = Network({"192.168.0.2:8080": first, "192.168.1.7:8080": second})
+    old, new = phone_source(), phone_source()
+    factory = SourceFactory(new)
+    pipeline = make(source=old, phone_fetch=network, source_factory=factory, config=picture_config("keep")).start()
+    assert wait_until(lambda: picture_of(pipeline) is not None)
+    pipeline.set_phone_picture("1280x720")
+    pipeline.use_phone(PHONE)
+    assert (factory.settings[-1]["width"], factory.settings[-1]["height"]) == CONFIG_BOX   # it starts with the config box
+    assert wait_until(lambda: (picture_of(pipeline) or {}).get("current") == "1280x720")
+    assert set(new.boxes) == {(1280, 720)}
+    assert second.sizes_asked == ["1280x720"]
+
+
+def test_a_new_phone_that_does_not_offer_the_chosen_size_gets_the_config_box(make):
+    first, second = FakePhoneApp(), FakePhoneApp(offered=["1920x1080", "640x360"])
+    network = Network({"192.168.0.2:8080": first, "192.168.1.7:8080": second})
+    new = phone_source()
+    pipeline = make(source=phone_source(), phone_fetch=network, source_factory=SourceFactory(new),
+                    config=picture_config("keep")).start()
+    assert wait_until(lambda: picture_of(pipeline) is not None)
+    pipeline.set_phone_picture("1280x720")
+    pipeline.use_phone(PHONE)
+    assert wait_until(lambda: picture_of(pipeline) is not None and len(second.calls) == 1)
+    time.sleep(0.05)
+    assert set(new.boxes) == {CONFIG_BOX}
+    assert picture_of(pipeline)["choice"] == "1280x720" and second.sizes_asked == []
+
+
+@pytest.mark.parametrize("kind", ["webcam", "file"])
+def test_a_clip_or_the_webcam_is_never_given_a_box_but_the_phone_after_it_is(make, kind):
+    clip, phone = FakeSource(frames=3), phone_source()
+    clip.source = kind
+    pipeline = make(source=clip, phone_fetch=FakePhoneApp(), source_factory=SourceFactory(phone),
+                    config=picture_config("1280x720")).start()
+    assert wait_until(lambda: pipeline.latest_jpeg() is not None)
+    pipeline.use_phone(PHONE)
+    assert wait_until(lambda: (picture_of(pipeline) or {}).get("current") == "1280x720")
+    assert clip.boxes == []
+    assert set(phone.boxes) == {(1280, 720)}
+
+
+class FakeCapture:
+    """A phone stream as FrameSource reads it: 1920 x 1080 pictures, as many as asked for."""
+
+    def __init__(self, size=(1920, 1080)):
+        width, height = size
+        self.picture = np.full((height, width, 3), 60, np.uint8)
+
+    def isOpened(self):
+        return True
+
+    def read(self):
+        time.sleep(0.005)
+        return True, self.picture.copy()
+
+    def release(self):
+        pass
+
+
+def test_the_chosen_size_is_the_size_of_the_video_and_of_what_the_models_see(make):
+    """With a real FrameSource (fed by a fake stream): the frames really change size."""
+    settings = {**CONFIG["stream"], "source": "phone"}
+    source = pipeline_module.FrameSource(settings, opener=FakeCapture)
+    sizes = []
+
+    class SizeDetector(FakeDetector):
+        def detect(self, frame):
+            sizes.append(frame.shape[:2])
+            return super().detect(frame)
+
+    pipeline = make(source=source, detector=SizeDetector(), phone_fetch=FakePhoneApp(),
+                    config=picture_config("keep")).start()
+    assert wait_until(lambda: picture_of(pipeline) is not None)
+    assert wait_until(lambda: pipeline.state.snapshot().frame_size == (640, 360))      # the config box
+    pipeline.set_phone_picture("1920x1080")
+    assert wait_until(lambda: pipeline.state.snapshot().frame_size == (1920, 1080))
+    assert wait_until(lambda: decoded(pipeline.latest_jpeg()).shape == (1080, 1920, 3))   # the page's video
+    assert sizes[-1] == (1080, 1920)                                                   # the detector's
+    assert pipeline.target(track_id=2) is not None                                     # clicks still work
+    pipeline.set_phone_picture("auto")
+    assert wait_until(lambda: pipeline.state.snapshot().frame_size == (640, 360))
+
+
+class ResizingSource(FakeSource):
+    """Sends `small` frames at 640 x 360, then the rest at 1280 x 720."""
+
+    def __init__(self, small, frames):
+        super().__init__(frames=frames)
+        self.small = small
+        self.large = np.full((720, 1280, 3), 60, np.uint8)
+
+    def read(self):
+        frame, sequence = super().read()
+        if frame is not None and sequence > self.small:
+            return self.large.copy(), sequence
+        return frame, sequence
+
+
+class RecognizesOnce(FakeRecognizer):
+    """Finds Sara on its first check only."""
+
+    def recognize(self, frame, detections=()):
+        found = super().recognize(frame, detections)
+        return found if self.calls == 1 else []
+
+
+def test_a_new_frame_size_forgets_the_remembered_faces_and_checks_again_at_once(make):
+    # every_n_frames is 3: without the new size, frame 3 would show Sara from memory.
+    detector, recognizer = FakeDetector(), RecognizesOnce()
+    pipeline = make(source=ResizingSource(small=2, frames=3), detector=detector, recognizer=recognizer).start()
+    assert wait_until(lambda: detector.calls == 3)
+    time.sleep(0.05)
+    assert recognizer.calls == 2                            # frame 1, and frame 3 at once (the new size)
+    assert pipeline.state.snapshot().faces == ()
+    assert pipeline.state.snapshot().frame_size == (1280, 720)
+
+
+@pytest.mark.parametrize("size, scale", [((640, 360), 1), ((1920, 1080), 3)])
+def test_the_close_warning_does_not_depend_on_the_frame_size(make, size, scale):
+    tall = Detection("person", 0.9, (200 * scale, 10 * scale, 400 * scale, 350 * scale), 1)   # 340 / 360
+    pipeline = make(source=FakeSource(size=size), detector=FakeDetector(detections=[tall]),
+                    recognizer=FakeRecognizer(faces=[]), reactions=ReactionEngine(CONFIG["reactions"])).start()
+    assert wait_until(lambda: pipeline.status()["reactions"])
+    assert pipeline.status()["reactions"] == [{"kind": "warning", "text": WARNING_TEXT}]
 
 
 # ---- start-up ---------------------------------------------------------------------------

@@ -6,6 +6,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+import pytest
 
 from car_vision import draw
 from car_vision.draw import caption_for, color_for, draw_detections, draw_status
@@ -74,6 +75,116 @@ def test_draw_status_writes_in_the_top_left_corner():
     draw_status(frame, "Detect FPS 15.0")
     assert frame[0:40, 0:200].any()
     assert not frame[100:, :].any()
+
+
+# ---- drawing on a larger frame ---------------------------------------------------
+
+
+def painted_rows(frame):
+    """(first, last) row with anything drawn on it."""
+    rows = np.flatnonzero(frame.any(axis=(1, 2)))
+    return int(rows[0]), int(rows[-1])
+
+
+def painted_columns(frame):
+    columns = np.flatnonzero(frame.any(axis=(0, 2)))
+    return int(columns[0]), int(columns[-1])
+
+
+def test_drawing_scale_follows_the_frame_width_and_never_shrinks():
+    assert draw.drawing_scale(640) == 1.0
+    assert draw.drawing_scale(320) == 1.0                  # never below today's sizes
+    assert draw.drawing_scale(1280) == 2.0
+    assert draw.drawing_scale(1920) == 3.0
+
+
+def caption_band_height(width, height):
+    """How many rows the caption band of a box takes on a frame of this size."""
+    frame = blank(width, height)
+    draw.draw_caption(frame, "person 0.87 #3", width // 4, height // 2, (200, 200, 200))
+    first, last = painted_rows(frame)
+    return last - first + 1
+
+
+def test_a_caption_at_1920_wide_is_about_three_times_as_tall_as_at_640():
+    small, large = caption_band_height(640, 360), caption_band_height(1920, 1080)
+    assert 2.5 <= large / small <= 3.5
+
+
+def test_at_640_wide_the_drawing_is_exactly_as_before():
+    """The same pixels as the drawing code before frames were scaled, written out by hand."""
+    text, color = "person 0.87 #3", color_for("person")
+    new = blank(640, 360)
+    draw_detections(new, [Detection("person", 0.87, (100, 120, 300, 300), 3)])
+    draw_status(new, "FPS 15.0")
+
+    old = blank(640, 360)
+    cv2.rectangle(old, (100, 120), (300, 300), color, 2)
+    (text_width, text_height), baseline = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+    top = 120 - (text_height + baseline + 6)
+    cv2.rectangle(old, (100, top), (100 + text_width + 6, 120), color, cv2.FILLED)
+    cv2.putText(old, text, (103, top + 3 + text_height), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                draw.text_color_on(color), 1, cv2.LINE_AA)
+    cv2.putText(old, "FPS 15.0", (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 4, cv2.LINE_AA)
+    cv2.putText(old, "FPS 15.0", (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv2.LINE_AA)
+    assert np.array_equal(new, old)
+
+
+def test_box_lines_grow_with_the_frame():
+    box = (300, 360, 900, 900)
+    new = blank(1920, 1080)
+    draw_detections(new, [Detection("person", 0.87, box, 3)])
+    expected = blank(1920, 1080)
+    cv2.rectangle(expected, box[:2], box[2:], color_for("person"), 6)    # 3 times the 2 used at 640
+    assert np.array_equal(new[400:], expected[400:])                     # below the caption
+
+
+@pytest.mark.parametrize("box", [(0, 0, 1919, 1079), (1880, 500, 1919, 560), (0, 1060, 30, 1079),
+                                 (1700, 0, 1919, 40)])
+def test_at_1920_wide_the_caption_is_never_cut_off_at_an_edge(box):
+    text = caption_for(Detection("traffic light", 0.66, box, 4))
+    (text_width, text_height), baseline = cv2.getTextSize(text, draw.FONT, 0.5 * 3, 3)
+    band = blank(1920, 1080)
+    draw.draw_caption(band, text, box[0], box[1], (200, 200, 200))
+    left, right = painted_columns(band)
+    top, bottom = painted_rows(band)
+    # The band is the text plus 9 pixels of padding on each side (3 at 640): all of it is
+    # in the frame. (At the right and bottom edges its last line of pixels falls just outside,
+    # as it always did at 640.)
+    assert right - left + 1 >= text_width + 2 * 9
+    assert bottom - top + 1 >= text_height + baseline + 2 * 9
+
+
+def test_the_status_line_grows_with_the_frame():
+    small, large = blank(640, 360), blank(1920, 1080)
+    draw_status(small, "Detect FPS 15.0")
+    draw_status(large, "Detect FPS 15.0")
+    small_top, small_bottom = painted_rows(small)
+    large_top, large_bottom = painted_rows(large)
+    assert 2.5 <= (large_bottom - large_top) / (small_bottom - small_top) <= 3.5
+    assert painted_columns(large)[1] < 1919 and large_bottom < 1080
+
+
+@pytest.mark.parametrize("corner", ["top-left", "bottom-right"])
+def test_at_1920_wide_the_info_card_is_three_times_as_wide_and_stays_inside(corner):
+    width, height, size = 1920, 1080, 240
+    left = 0 if corner == "top-left" else width - 1 - size
+    top = 0 if corner == "top-left" else height - 1 - size
+    face = RecognizedFace("Sara Ahmed", 0.7, (left, top, left + size, top + size), "sara")
+    frame = blank(width, height)
+    draw.draw_info_card(frame, face, Person("sara", "Sara Ahmed", "Team lead", ("Built the chassis",)))
+    x1, x2 = painted_columns(frame)
+    y1, y2 = painted_rows(frame)
+    assert x2 - x1 + 1 == draw.CARD_WIDTH * 3
+    assert 0 <= x1 and x2 <= width - 1 and 0 <= y1 and y2 <= height - 1
+    middle = (y1 + y2) // 2
+    assert all(tuple(frame[middle, x]) == draw.KNOWN_FACE_COLOR for x in (x1, x1 + 2, x2 - 2, x2))   # 3 px border
+    assert tuple(frame[middle, x1 + 3]) == tuple(frame[middle, x2 - 3]) == draw.CARD_BACKGROUND
+    small = blank(640, 360)
+    draw.draw_info_card(small, RecognizedFace("Sara Ahmed", 0.7, (0, 0, 80, 80), "sara"),
+                        Person("sara", "Sara Ahmed", "Team lead", ("Built the chassis",)))
+    small_y1, small_y2 = painted_rows(small)
+    assert 2.5 <= (y2 - y1) / (small_y2 - small_y1) <= 3.5
 
 
 ARABIC_NAME = "سارة"          # Sara, in Arabic letters

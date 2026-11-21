@@ -181,6 +181,31 @@ def test_wire_follow_up_sends_the_whole_short_conversation(settings: dict[str, A
     assert answer.text == "Aluminium." and answer.used_web is False
 
 
+def test_wire_follow_up_with_a_marked_picture_sends_two_pictures(settings: dict[str, Any]) -> None:
+    picture = bytes([0xFF, 0xD8, 0xFF, 0xE0]) + b"plain cut-out"
+    marked = bytes([0xFF, 0xD8, 0xFF, 0xE0]) + b"cut-out with a magenta outline"
+    info = assistant.ObjectInfo(name="Laptop", summary="A portable computer.", specs=())
+    wire = Wire([reply_json([{"type": "text", "text": "That part is the hinge."}])])
+    answer = bot_on(settings, wire).follow_up(picture, "laptop", info, [("How heavy?", "About 1.5 kg.")],
+                                              "What is this part?", marked=marked)
+
+    def image(data: bytes) -> dict[str, Any]:
+        return {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg",
+                                            "data": base64.standard_b64encode(data).decode("ascii")}}
+
+    messages = wire.bodies[0]["messages"]
+    assert [m["role"] for m in messages] == ["user", "assistant", "user", "assistant", "user"]
+    assert messages[0]["content"][0] == image(picture)
+    assert messages[2] == {"role": "user", "content": "How heavy?"}
+    assert messages[-1] == {"role": "user", "content": [
+        image(marked),
+        {"type": "text", "text": "The visitor brushed over part of the picture. In this second "
+                                 "copy that part is outlined in magenta. The question is about "
+                                 "the outlined part: What is this part?"}]}
+    assert "magenta outline" in wire.bodies[0]["system"][0]["text"]
+    assert answer.text == "That part is the hinge."
+
+
 def test_bom_from_a_piped_powershell_line_is_stripped_under_cp1252() -> None:
     assert assistant.clean(b"\xef\xbb\xbf/quit".decode("cp1252")) == "/quit"
 

@@ -3,7 +3,9 @@
 Served by Flask; this is the only module that imports flask. A click on the
 video goes to /api/inspect, which answers at once with a small photo of what
 was clicked; for an object, /api/describe then asks the assistant what it is,
-and /api/follow_up answers more questions about that one thing. The camera
+and /api/follow_up answers more questions about that one thing, also about a
+part the visitor brushed over (the page sends only the brush strokes; marking.py
+draws them on the server's own copy of the photo). The camera
 box on the page sends a phone's address to /api/camera, which switches the
 video to that phone and remembers the address for the next start, and the
 picture size to ask the phone for to /api/camera/picture.
@@ -41,6 +43,7 @@ from werkzeug.exceptions import HTTPException
 
 from car_vision.assistant import Assistant, AssistantError, ObjectInfo
 from car_vision.config import ConfigError, load_config, require, resolve_path, section
+from car_vision.marking import mark_photo
 from car_vision.phone import load_remembered, phone_url, remember, same_phone
 from car_vision.pipeline import Pipeline
 from car_vision.stream import SOURCES
@@ -64,6 +67,11 @@ PHOTO_PREFIX = "data:image/jpeg;base64,"
 GONE = "That is no longer in view."
 CLICK_AGAIN = "That click is too old. Please click the object again."
 
+MAX_STROKES = 12                 # brush strokes on one marked photo
+MAX_STROKE_POINTS = 400          # points in one stroke
+MARKED_PREFIX = "(about a part the visitor marked) "   # kept in front of a marked question
+NO_MARKING_FOR_PEOPLE = "A person's picture is never marked or sent anywhere."
+
 MAX_FOLLOW_UPS = 10              # questions about one clicked thing
 TOO_MANY_FOLLOW_UPS = (f"That is {MAX_FOLLOW_UPS} questions about this one already. "
                        "Click it again to start a new conversation about it.")
@@ -86,7 +94,8 @@ class UnavailableAssistant:
     def describe(self, image: bytes, label: str | None = None) -> Any:
         raise AssistantError(self.reason)
 
-    def follow_up(self, image: bytes, label: str | None, info: Any, earlier: Any, question: str) -> Any:
+    def follow_up(self, image: bytes, label: str | None, info: Any, earlier: Any, question: str,
+                  marked: bytes | None = None) -> Any:
         raise AssistantError(self.reason)
 
     def reset(self) -> None:
@@ -300,6 +309,46 @@ def as_fraction(number: int | float) -> float | None:
     return value if math.isfinite(value) and 0.0 <= value <= 1.0 else None
 
 
+# ---- reading the brush strokes ---------------------------------------------------------------
+
+
+STROKES_SHAPE = 'Send the marking as a list of strokes, like [{"points": [[0.4, 0.5], [0.42, 0.52]]}].'
+
+
+def read_strokes(strokes: Any) -> list[list[tuple[float, float]]] | str:
+    """The brush strokes from a /api/follow_up body as lists of (x, y), or the reason they are wrong.
+
+    Each point is two numbers from 0 to 1 across and down the photo. The
+    page sends at most MAX_STROKES strokes of at most MAX_STROKE_POINTS points.
+    """
+    if not isinstance(strokes, list) or not strokes:
+        return STROKES_SHAPE
+    if len(strokes) > MAX_STROKES:
+        return f"At most {MAX_STROKES} strokes can be marked, got {len(strokes)}."
+    result = []
+    for stroke in strokes:
+        points = stroke.get("points") if isinstance(stroke, dict) else None
+        if not isinstance(points, list):
+            return STROKES_SHAPE
+        if not points:
+            return "A stroke has no point."
+        if len(points) > MAX_STROKE_POINTS:
+            return f"A stroke can have at most {MAX_STROKE_POINTS} points, got {len(points)}."
+        read = [read_point(point) for point in points]
+        if any(point is None for point in read):
+            return "Each point must be two numbers from 0 to 1."
+        result.append(read)
+    return result
+
+
+def read_point(point: Any) -> tuple[float, float] | None:
+    """One point as (x, y) fractions of the photo, or None when it is not two numbers from 0 to 1."""
+    if not isinstance(point, list) or len(point) != 2 or not all(is_number(value) for value in point):
+        return None
+    x, y = as_fraction(point[0]), as_fraction(point[1])
+    return None if x is None or y is None else (x, y)
+
+
 # ---- the web server ------------------------------------------------------------
 
 
@@ -432,6 +481,11 @@ def create_app(pipeline: Any, assistant: Any, camera_file: Path | None = None) -
         if not isinstance(inspection_id, str) or not isinstance(question, str):
             return jsonify(error='Send the id and the question as JSON, like '
                                  '{"id": "kq3...", "question": "How heavy is it?"}.'), 400
+        strokes = None                                # no "strokes": a question about the whole photo
+        if "strokes" in body:
+            strokes = read_strokes(body["strokes"])
+            if isinstance(strokes, str):
+                return jsonify(error=strokes), 400
         question = question.strip()
         problem = question_problem(question)
         if problem is not None:
@@ -443,11 +497,14 @@ def create_app(pipeline: Any, assistant: Any, camera_file: Path | None = None) -
                 return jsonify(error=CLICK_AGAIN), 404
             if inspection.kind == "person" and inspection.person_name is None:
                 return jsonify(error=UNKNOWN_PERSON), 400
+            if inspection.kind == "person" and strokes is not None:
+                return jsonify(error=NO_MARKING_FOR_PEOPLE), 400
             if len(inspection.pairs) >= MAX_FOLLOW_UPS:
                 return jsonify(error=TOO_MANY_FOLLOW_UPS), 400
-            reply, code = answer_follow_up(assistant, inspection, question)
+            reply, code = answer_follow_up(assistant, inspection, question, strokes)
             if "error" not in reply:                  # a failed question is not kept
-                inspections.add_pair(inspection_id, question, reply["text"])
+                kept = MARKED_PREFIX + question if strokes is not None else question
+                inspections.add_pair(inspection_id, kept, reply["text"])
         return jsonify(reply), code
 
     @app.post("/api/camera")
@@ -519,12 +576,14 @@ def look_up(assistant: Any, inspection: Inspection) -> tuple[dict[str, Any], int
                          "Please click it again."}, 500
 
 
-def answer_follow_up(assistant: Any, inspection: Inspection, question: str) -> tuple[dict[str, Any], int]:
+def answer_follow_up(assistant: Any, inspection: Inspection, question: str,
+                     strokes: list[list[tuple[float, float]]] | None = None) -> tuple[dict[str, Any], int]:
     """Ask one more question about a clicked thing: (the JSON answer, the HTTP status).
 
     An object or an area: the assistant gets the stored photo, label, description
-    and earlier questions. A recognised person: only text goes to the chat, with
-    a sentence naming them; their picture is never sent anywhere.
+    and earlier questions, and with brush strokes also a copy of the photo with
+    the marked part outlined. A recognised person: only text goes to the chat,
+    with a sentence naming them; their picture is never sent anywhere.
     """
     if inspection.kind == "person":
         named = f"This question is about {inspection.person_name}, who the camera recognises. {question}"
@@ -537,10 +596,10 @@ def answer_follow_up(assistant: Any, inspection: Inspection, question: str) -> t
             log.info("Answering a follow-up question about a recognised person")
             answer = assistant.ask(named)
         else:
-            log.info("Answering a follow-up question about %s",
-                     f"a {inspection.label}" if inspection.label else "a clicked area")
-            answer = assistant.follow_up(inspection.photo, inspection.label or None, inspection.info,
-                                         inspection.pairs, question)
+            log.info("Answering a follow-up question about %s%s",
+                     f"a {inspection.label}" if inspection.label else "a clicked area",
+                     " (a marked part)" if strokes is not None else "")
+            answer = ask_about_object(assistant, inspection, question, strokes)
     except ValueError as error:                   # the assistant's own check of the question or picture
         return {"error": str(error)}, 400
     except AssistantError as error:               # no key, no internet, busy, refusal ...
@@ -550,6 +609,19 @@ def answer_follow_up(assistant: Any, inspection: Inspection, question: str) -> t
         return {"error": f"Something went wrong while answering ({type(error).__name__}). "
                          "Please ask again."}, 500
     return answer_json(answer), 200
+
+
+def ask_about_object(assistant: Any, inspection: Inspection, question: str,
+                     strokes: list[list[tuple[float, float]]] | None) -> Any:
+    """The assistant's answer about an object or an area, with the marked copy when there are strokes.
+
+    The marking is drawn here on the server's own photo; the browser sent only the points.
+    """
+    photo, label = inspection.photo, inspection.label or None
+    if strokes is None:
+        return assistant.follow_up(photo, label, inspection.info, inspection.pairs, question)
+    marked = mark_photo(photo, strokes)
+    return assistant.follow_up(photo, label, inspection.info, inspection.pairs, question, marked=marked)
 
 
 def mjpeg_stream(pipeline: Any, clock: Callable[[], float] = time.monotonic,

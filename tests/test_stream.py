@@ -128,6 +128,86 @@ def test_fitted_size_examples():
     assert fitted_size(320, 240, 640, 480) == (320, 240)
 
 
+# ---- set_box(): a new box while the video runs --------------------------------
+
+
+def frame_shape(source):
+    frame, _ = source.read()
+    return None if frame is None else frame.shape[:2]
+
+
+def test_set_box_takes_effect_from_the_next_frame():
+    source = FrameSource(SETTINGS, opener=lambda: FakeCapture(frames=10_000_000, size=(108, 192)))
+    with source:
+        assert wait_until(lambda: frame_shape(source) == (36, 64))        # the config box: 64 x 48
+        source.set_box(128, 128)
+        assert wait_until(lambda: frame_shape(source) == (72, 128))
+        source.set_box(1920, 1080)                                       # larger than the picture ...
+        assert wait_until(lambda: frame_shape(source) == (108, 192))     # ... which is never enlarged
+        source.set_box(64, 48)                                           # and back
+        assert wait_until(lambda: frame_shape(source) == (36, 64))
+
+
+def test_set_box_from_another_thread_never_mixes_two_boxes():
+    # The picture is 192 x 108. The box 96 x 1000 makes it 96 x 54, the box 1000 x 27
+    # makes it 48 x 28. A frame fitted with the width of the second box and the
+    # height of the first (1000 x 1000) would stay 192 x 108, so it would show.
+    boxes = [(96, 1000), (1000, 27)]
+    assert fitted_size(192, 108, 1000, 1000) == (192, 108)
+    source = FrameSource(SETTINGS, opener=lambda: FakeCapture(frames=10_000_000, size=(108, 192)))
+    seen = set()
+    with source:
+        assert source.wait_for_frame(2.0)
+        for turn in range(2000):
+            source.set_box(*boxes[turn % 2])
+            seen.add(frame_shape(source))
+    assert seen <= {(54, 96), (28, 48), (36, 64)}         # (36, 64): the config box, before the first set_box
+    assert (54, 96) in seen and (28, 48) in seen
+
+
+def test_reopen_opens_the_stream_again_without_calling_it_lost():
+    """After a phone changes its picture size the old capture keeps the old frame size."""
+    captures = []
+
+    def opener():
+        # The first capture gives small frames for ever; the one opened after reopen() gives large ones.
+        size = (36, 64) if not captures else (72, 128)
+        captures.append(FakeCapture(frames=10_000_000, size=size))
+        return captures[-1]
+
+    source = FrameSource({**SETTINGS, "width": 640, "height": 480}, opener=opener)
+    with source:
+        assert wait_until(lambda: frame_shape(source) == (36, 64))
+        source.reopen()
+        assert wait_until(lambda: frame_shape(source) == (72, 128))
+        assert source.connected                     # never shown as a lost stream
+        assert captures[0].released and len(captures) == 2
+
+
+def test_set_box_refuses_sides_that_are_not_positive_whole_numbers():
+    source = FrameSource(SETTINGS, opener=lambda: FakeCapture(0))
+    for bad in [(0, 48), (64, -1), (64.0, 48), (True, 48), ("64", 48)]:
+        with pytest.raises(ValueError):
+            source.set_box(*bad)
+
+
+def test_set_box_leaves_the_configured_size_for_the_webcam_alone(monkeypatch):
+    calls = []
+
+    class FakeWebcam:
+        def __init__(self, *args):
+            pass
+
+        def set(self, prop, value):
+            calls.append((prop, value))
+
+    monkeypatch.setattr(stream.cv2, "VideoCapture", FakeWebcam)
+    source = FrameSource(SETTINGS)
+    source.set_box(1920, 1080)
+    source._opener()
+    assert calls == [(cv2.CAP_PROP_FRAME_WIDTH, 64), (cv2.CAP_PROP_FRAME_HEIGHT, 48)]
+
+
 def test_reconnects_after_the_stream_drops():
     captures = [FakeCapture(frames=2), FakeCapture(frames=3)]
     opened = []

@@ -1527,6 +1527,96 @@ def test_info_text_shape() -> None:
                                          "- Weight: about 1.5 kg\n- Battery: 8 hours")
 
 
+# ---- M10: a marked picture in a follow-up -------------------------------------------
+
+
+MARKED = assistant.JPEG_MARKER + b"\xe0 the same picture with a magenta outline"
+
+
+def marked_blocks(question: str = "What is this part?") -> list[dict[str, Any]]:
+    """The marked picture and its text, as the last user turn carries them."""
+    return assistant.user_turn(assistant.MARKED_QUESTION.format(question=question), MARKED)["content"]
+
+
+def roles(turns: list[dict[str, Any]]) -> list[str]:
+    return [t["role"] for t in turns]
+
+
+def ask_marked(settings: dict, info: ObjectInfo | None, earlier: Any = ()) -> list[dict[str, Any]]:
+    fake = FakeClient()
+    Assistant(settings, client=fake).follow_up(PICTURE, "laptop", info, earlier,
+                                               "  What is this part?  ", marked=MARKED)
+    return fake.calls[0][1]
+
+
+def test_marked_question_text() -> None:
+    assert marked_blocks("Why?")[1]["text"] == (
+        "The visitor brushed over part of the picture. In this second copy that part is "
+        "outlined in magenta. The question is about the outlined part: Why?")
+    assert base64.standard_b64decode(marked_blocks()[0]["source"]["data"]) == MARKED
+
+
+def test_marked_without_a_description_is_one_user_turn(settings: dict) -> None:
+    turns = ask_marked(settings, info=None)
+    assert turns == [{"role": "user", "content": [
+        picture_block(), {"type": "text", "text": LAPTOP_LINE}, *marked_blocks()]}]
+
+
+def test_marked_without_a_description_but_with_a_pair(settings: dict) -> None:
+    turns = ask_marked(settings, info=None, earlier=PAIRS[:1])
+    assert turns == [
+        {"role": "user", "content": [picture_block(), {"type": "text", "text": LAPTOP_LINE},
+                                     {"type": "text", "text": "How heavy is it?"}]},
+        {"role": "assistant", "content": "About 1.5 kg."},
+        {"role": "user", "content": marked_blocks()},
+    ]
+
+
+def test_marked_with_a_description(settings: dict) -> None:
+    turns = ask_marked(settings, info=INFO)
+    assert turns == [
+        assistant.user_turn(LAPTOP_LINE, PICTURE),
+        {"role": "assistant", "content": assistant.info_text(INFO)},
+        {"role": "user", "content": marked_blocks()},
+    ]
+
+
+def test_marked_with_a_description_and_pairs_keeps_the_pairs_plain(settings: dict) -> None:
+    turns = ask_marked(settings, info=INFO, earlier=PAIRS)
+    assert roles(turns) == ["user", "assistant", "user", "assistant", "user", "assistant", "user"]
+    assert [t["content"] for t in turns[2:6]] == [
+        "How heavy is it?", "About 1.5 kg.", "Is it new?", "It looks a few years old."]
+    assert turns[-1] == {"role": "user", "content": marked_blocks()}
+    pictures = [b for t in turns if isinstance(t["content"], list)
+                for b in t["content"] if b["type"] == "image"]
+    assert len(pictures) == 2                     # the plain cut-out first, the marked copy last
+
+
+@pytest.mark.parametrize("info", [None, INFO])
+@pytest.mark.parametrize("pairs", [0, 1, 2])
+def test_marked_turns_always_alternate(settings: dict, info: ObjectInfo | None, pairs: int) -> None:
+    turns = ask_marked(settings, info=info, earlier=PAIRS[:pairs])
+    assert all(a["role"] != b["role"] for a, b in zip(turns, turns[1:]))
+    assert turns[0]["role"] == "user" and turns[-1]["role"] == "user"
+
+
+@pytest.mark.parametrize("marked", ["text", b"\x89PNG not a jpeg", b"",
+                                    assistant.JPEG_MARKER + b"x" * assistant.MAX_IMAGE_BYTES])
+def test_a_bad_marked_picture_is_refused_before_sending(settings: dict, marked: Any) -> None:
+    fake = FakeClient()
+    with pytest.raises(ValueError):
+        Assistant(settings, client=fake).follow_up(PICTURE, "laptop", INFO, [], "Why?", marked=marked)
+    assert fake.calls == []
+
+
+def test_marked_none_builds_the_same_turns_as_before(settings: dict) -> None:
+    fake = FakeClient()
+    bot = Assistant(settings, client=fake)
+    bot.follow_up(PICTURE, "laptop", INFO, PAIRS, "Why?")
+    bot.follow_up(PICTURE, "laptop", INFO, PAIRS, "Why?", marked=None)
+    assert fake.calls[0][1] == fake.calls[1][1]
+
+
 def test_info_text_puts_a_summary_on_one_line() -> None:
     info = ObjectInfo(name="Cup", summary="A cup.\nIt holds tea.", specs=())
     assert parse_object_info(assistant.info_text(info), None)[1] == "A cup. It holds tea."

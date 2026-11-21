@@ -483,6 +483,9 @@ How to answer:
 - Answer the visitor's question about the thing in the middle of the picture in two \
 or three sentences of plain text. Do not use the NAME, ABOUT and SPECS shape.
 - Use the picture and the description. The object detector's label is a hint, not the truth.
+- When a second copy of the picture with a magenta outline is given, answer about what \
+is inside the outline, and say what that part is before anything else. The outline \
+itself is not part of the scene.
 - When the answer needs facts you do not have, search the web if the web search tool \
 is available to you.
 - Never invent facts. If you do not know, say so.
@@ -492,6 +495,8 @@ is available to you.
 """
 
 MAX_FOLLOW_UPS = 10      # earlier question-answer pairs one follow-up may carry
+MARKED_QUESTION = ("The visitor brushed over part of the picture. In this second copy that "
+                   "part is outlined in magenta. The question is about the outlined part: {question}")
 
 
 def check_question(question: Any) -> str:
@@ -520,26 +525,39 @@ def check_earlier(earlier: Sequence[tuple[str, str]]) -> list[tuple[str, str]]:
 
 
 def follow_up_turns(picture: bytes, label_sentence: str, info: ObjectInfo | None,
-                    earlier: list[tuple[str, str]], question: str) -> list[Turn]:
-    """The whole conversation for one follow-up, as plain text turns after the picture."""
+                    earlier: list[tuple[str, str]], question: str,
+                    marked: bytes | None = None) -> list[Turn]:
+    """The whole conversation for one follow-up, as plain text turns after the picture.
+
+    With a marked copy, only the new question carries it, before its text.
+    """
     turns = [user_turn(label_sentence, picture)]
     if info is not None:
         turns.append({"role": "assistant", "content": info_text(info)})
     for asked, answered in earlier:
-        add_user_text(turns, asked)
+        add_user_turn(turns, asked)
         turns.append({"role": "assistant", "content": answered})
-    add_user_text(turns, question)
+    if marked is None:
+        add_user_turn(turns, question)
+    else:
+        add_user_turn(turns, MARKED_QUESTION.format(question=question), marked)
     return turns
 
 
-def add_user_text(turns: list[Turn], text: str) -> None:
-    """Add a user turn. Right after the picture turn (no description), the text
-    joins that turn instead: the API reference warns that two user turns in a
-    row may be refused."""
-    if turns[-1]["role"] == "user":
+def add_user_turn(turns: list[Turn], text: str, picture: bytes | None = None) -> None:
+    """Add a user turn: the text alone, or the picture and then the text.
+
+    Right after the picture turn (no description), it joins that turn instead,
+    so user and assistant turns always alternate: the API reference warns that
+    two user turns in a row may be refused.
+    """
+    new = user_turn(text, picture)
+    if turns[-1]["role"] != "user":
+        turns.append(new)
+    elif picture is None:
         turns[-1]["content"].append({"type": "text", "text": text})   # the picture turn's list
     else:
-        turns.append({"role": "user", "content": text})
+        turns[-1]["content"].extend(new["content"])
 
 
 # ---- the assistant -----------------------------------------------------------
@@ -630,16 +648,19 @@ class Assistant:
                           used_web=reply.used_web, sources=unique(reply.sources))
 
     def follow_up(self, image: bytes, label: str | None, info: ObjectInfo | None,
-                  earlier: Sequence[tuple[str, str]], question: str) -> Answer:
+                  earlier: Sequence[tuple[str, str]], question: str,
+                  marked: bytes | None = None) -> Answer:
         """Answer one more question about a clicked thing.
 
         The whole short conversation is sent again on every call, as plain text:
         the picture, the description (`info`, None when there is none), the
-        earlier (question, answer) pairs and the new question. Nothing is kept,
-        and the chat history is neither sent nor changed.
+        earlier (question, answer) pairs and the new question. `marked` is the
+        same picture with the visitor's magenta outline; it goes with the new
+        question. Nothing is kept, and the chat history is neither sent nor changed.
         """
+        marked_copy = None if marked is None else check_image(marked)
         turns = follow_up_turns(check_image(image), label_text(label), info,
-                                check_earlier(earlier), check_question(question))
+                                check_earlier(earlier), check_question(question), marked_copy)
         reply = self._look_up(FOLLOW_UP_PROMPT, turns)
         return Answer(text=reply.text, used_web=reply.used_web, sources=unique(reply.sources))
 

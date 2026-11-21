@@ -1,6 +1,11 @@
 """Draws detection boxes, captions and a status line onto camera frames.
 
 Everything here draws in place on the frame it is given and returns nothing.
+
+The sizes below (line thickness, text size, padding) are for a frame 640
+pixels wide. A wider frame gets everything larger in the same proportion, so
+a caption is as easy to read at 1920 wide as at 640: drawing_scale() decides
+how much larger. A frame 640 wide or narrower is drawn exactly at these sizes.
 """
 
 from __future__ import annotations
@@ -14,10 +19,25 @@ from car_vision.faces import Person
 from car_vision.state import Detection, RecognizedFace
 
 FONT = cv2.FONT_HERSHEY_SIMPLEX
+BASE_WIDTH = 640                # the frame width the sizes below are made for
 CAPTION_SCALE = 0.5
 CAPTION_THICKNESS = 1
 CAPTION_PADDING = 3
 BOX_THICKNESS = 2
+STATUS_POSITION = (10, 24)      # where the status line starts (left, baseline)
+STATUS_SCALE = 0.6
+STATUS_OUTLINE = 4              # thickness of the black edge around the status text
+STATUS_THICKNESS = 1
+
+
+def drawing_scale(frame_width: int) -> float:
+    """How much larger to draw on a frame this wide: 1.0 at 640 or narrower, 3.0 at 1920."""
+    return max(1.0, frame_width / BASE_WIDTH)
+
+
+def scaled(pixels: int, scale: float) -> int:
+    """A size in pixels made `scale` times larger, as a whole number (never below 1)."""
+    return max(1, round(pixels * scale))
 
 
 def color_for(label: str) -> tuple[int, int, int]:
@@ -45,10 +65,11 @@ def caption_for(detection: Detection) -> str:
 
 def draw_detections(frame: np.ndarray, detections: Iterable[Detection]) -> None:
     """Draw a rectangle and a caption for each detection."""
+    thickness = scaled(BOX_THICKNESS, drawing_scale(frame.shape[1]))
     for detection in detections:
         x1, y1, x2, y2 = detection.box
         color = color_for(detection.label)
-        cv2.rectangle(frame, (x1, y1), (x2, y2), color, BOX_THICKNESS)
+        cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness)
         draw_caption(frame, caption_for(detection), x1, y1, color)
 
 
@@ -59,9 +80,13 @@ def draw_caption(frame: np.ndarray, text: str, x: int, y: int, color: tuple[int,
     goes just inside the box instead.
     """
     height, width = frame.shape[:2]
-    (text_width, text_height), baseline = cv2.getTextSize(text, FONT, CAPTION_SCALE, CAPTION_THICKNESS)
-    band_width = text_width + 2 * CAPTION_PADDING
-    band_height = text_height + baseline + 2 * CAPTION_PADDING
+    scale = drawing_scale(width)
+    font_scale = CAPTION_SCALE * scale
+    thickness = scaled(CAPTION_THICKNESS, scale)
+    padding = scaled(CAPTION_PADDING, scale)
+    (text_width, text_height), baseline = cv2.getTextSize(text, FONT, font_scale, thickness)
+    band_width = text_width + 2 * padding
+    band_height = text_height + baseline + 2 * padding
 
     top = y - band_height
     if top < 0:
@@ -70,9 +95,9 @@ def draw_caption(frame: np.ndarray, text: str, x: int, y: int, color: tuple[int,
     left = max(0, min(x, width - band_width))
 
     cv2.rectangle(frame, (left, top), (left + band_width, top + band_height), color, cv2.FILLED)
-    text_origin = (left + CAPTION_PADDING, top + CAPTION_PADDING + text_height)
-    cv2.putText(frame, text, text_origin, FONT, CAPTION_SCALE, text_color_on(color),
-                CAPTION_THICKNESS, cv2.LINE_AA)
+    text_origin = (left + padding, top + padding + text_height)
+    cv2.putText(frame, text, text_origin, FONT, font_scale, text_color_on(color),
+                thickness, cv2.LINE_AA)
 
 
 def text_color_on(color: tuple[int, int, int]) -> tuple[int, int, int]:
@@ -85,10 +110,15 @@ def text_color_on(color: tuple[int, int, int]) -> tuple[int, int, int]:
 def draw_status(frame: np.ndarray, text: str) -> None:
     """Write one line of status in the top-left corner, readable on any background.
 
-    Looks the same as car_vision.stream.draw_status.
+    At 640 wide it looks the same as car_vision.stream.draw_status.
     """
-    cv2.putText(frame, text, (10, 24), FONT, 0.6, (0, 0, 0), 4, cv2.LINE_AA)
-    cv2.putText(frame, text, (10, 24), FONT, 0.6, (255, 255, 255), 1, cv2.LINE_AA)
+    scale = drawing_scale(frame.shape[1])
+    origin = (scaled(STATUS_POSITION[0], scale), scaled(STATUS_POSITION[1], scale))
+    font_scale = STATUS_SCALE * scale
+    cv2.putText(frame, text, origin, FONT, font_scale, (0, 0, 0),
+                scaled(STATUS_OUTLINE, scale), cv2.LINE_AA)
+    cv2.putText(frame, text, origin, FONT, font_scale, (255, 255, 255),
+                scaled(STATUS_THICKNESS, scale), cv2.LINE_AA)
 
 
 # ---- faces and info cards ----------------------------------------------------
@@ -99,6 +129,7 @@ CARD_WIDTH = 220
 CARD_GAP = 8                            # space between the face box and the card
 CARD_PADDING = 8
 CARD_LINE_GAP = 6
+CARD_BORDER = 1
 CARD_MAX_LINES = 3
 CARD_MAX_CHARS = 60                     # no card row is longer than this, even before measuring
 CARD_BACKGROUND = (40, 40, 40)
@@ -115,10 +146,11 @@ def draw_faces(frame: np.ndarray, faces: Iterable[RecognizedFace], show_scores: 
     With show_scores the similarity is written after the name, e.g. 'Sara Ahmed 0.63',
     so the match threshold can be tuned by watching the numbers.
     """
+    thickness = scaled(BOX_THICKNESS, drawing_scale(frame.shape[1]))
     for face in faces:
         x1, y1, x2, y2 = face.box
         color = KNOWN_FACE_COLOR if face.is_known else UNKNOWN_FACE_COLOR
-        cv2.rectangle(frame, (x1, y1), (x2, y2), color, BOX_THICKNESS)
+        cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness)
         text = face.name if drawable(face.name) else (face.person_id or "?")
         if show_scores:
             text += f" {face.similarity:.2f}"
@@ -132,25 +164,31 @@ def draw_info_card(frame: np.ndarray, face: RecognizedFace, person: Person) -> N
     room, and is always kept fully inside the frame.
     """
     height, width = frame.shape[:2]
-    card_width = min(CARD_WIDTH, width)
-    text_width = card_width - 2 * CARD_PADDING
-    rows = _card_rows(person, text_width)
-    while len(rows) > 1 and _card_height(rows) > height:
+    scale = drawing_scale(width)
+    padding = scaled(CARD_PADDING, scale)
+    line_gap = scaled(CARD_LINE_GAP, scale)
+    card_width = min(scaled(CARD_WIDTH, scale), width)
+    text_width = card_width - 2 * padding
+    rows = _card_rows(person, text_width, scale)
+    while len(rows) > 1 and _card_height(rows, scale) > height:
         rows.pop()                                     # a tiny frame: keep what fits
-    card_height = min(_card_height(rows), height)
+    card_height = min(_card_height(rows, scale), height)
 
-    left, top = _card_position(face.box, card_width, card_height, width, height)
-    cv2.rectangle(frame, (left, top), (left + card_width - 1, top + card_height - 1),
+    left, top = _card_position(face.box, card_width, card_height, width, height, scale)
+    right, bottom = left + card_width - 1, top + card_height - 1
+    # The border is a green card with the dark card inside it, so a thick border
+    # never spills over the card's edges (OpenCV centres thick lines on the corners).
+    border = scaled(CARD_BORDER, scale)
+    cv2.rectangle(frame, (left, top), (right, bottom), KNOWN_FACE_COLOR, cv2.FILLED)
+    cv2.rectangle(frame, (left + border, top + border), (right - border, bottom - border),
                   CARD_BACKGROUND, cv2.FILLED)
-    cv2.rectangle(frame, (left, top), (left + card_width - 1, top + card_height - 1),
-                  KNOWN_FACE_COLOR, 1)
 
-    y = top + CARD_PADDING
-    for text, scale, thickness, color in rows:
-        text_height, baseline = _row_size(text, scale, thickness)
+    y = top + padding
+    for text, font_scale, thickness, color in rows:
+        text_height, baseline = _row_size(text, font_scale, thickness)
         y += text_height
-        cv2.putText(frame, text, (left + CARD_PADDING, y), FONT, scale, color, thickness, cv2.LINE_AA)
-        y += baseline + CARD_LINE_GAP
+        cv2.putText(frame, text, (left + padding, y), FONT, font_scale, color, thickness, cv2.LINE_AA)
+        y += baseline + line_gap
 
 
 def drawable(text: str) -> bool:
@@ -158,27 +196,33 @@ def drawable(text: str) -> bool:
     return text.isascii()
 
 
-def _card_rows(person: Person, text_width: int) -> list[tuple[str, float, int, tuple[int, int, int]]]:
-    """The text rows of a card, each cut to fit: (text, scale, thickness, colour).
+def _card_rows(person: Person, text_width: int,
+               scale: float = 1.0) -> list[tuple[str, float, int, tuple[int, int, int]]]:
+    """The text rows of a card, each cut to fit: (text, font scale, thickness, colour).
 
     A name that cannot be drawn is replaced by the person id (the folder name);
     other rows that cannot be drawn are left off. The web page shows them all.
+    `scale` is drawing_scale() of the frame.
     """
+    name_scale, name_thickness = CARD_NAME_SCALE * scale, scaled(CARD_NAME_THICKNESS, scale)
+    text_scale, text_thickness = CARD_TEXT_SCALE * scale, scaled(CARD_TEXT_THICKNESS, scale)
     name = person.name if drawable(person.name) else person.person_id
-    rows = [(_fit_text(name, text_width, CARD_NAME_SCALE, CARD_NAME_THICKNESS),
-             CARD_NAME_SCALE, CARD_NAME_THICKNESS, KNOWN_FACE_COLOR)]
+    rows = [(_fit_text(name, text_width, name_scale, name_thickness),
+             name_scale, name_thickness, KNOWN_FACE_COLOR)]
     texts = ([person.role] if person.role else []) + list(person.lines[:CARD_MAX_LINES])
     for text in filter(drawable, texts):
-        rows.append((_fit_text(text, text_width, CARD_TEXT_SCALE, CARD_TEXT_THICKNESS),
-                     CARD_TEXT_SCALE, CARD_TEXT_THICKNESS, (255, 255, 255)))
+        rows.append((_fit_text(text, text_width, text_scale, text_thickness),
+                     text_scale, text_thickness, (255, 255, 255)))
     return rows
 
 
-def _card_height(rows: list[tuple[str, float, int, tuple[int, int, int]]]) -> int:
-    total = 2 * CARD_PADDING - CARD_LINE_GAP
-    for text, scale, thickness, _color in rows:
-        text_height, baseline = _row_size(text, scale, thickness)
-        total += text_height + baseline + CARD_LINE_GAP
+def _card_height(rows: list[tuple[str, float, int, tuple[int, int, int]]], scale: float = 1.0) -> int:
+    """The height in pixels of a card with these rows."""
+    line_gap = scaled(CARD_LINE_GAP, scale)
+    total = 2 * scaled(CARD_PADDING, scale) - line_gap
+    for text, font_scale, thickness, _color in rows:
+        text_height, baseline = _row_size(text, font_scale, thickness)
+        total += text_height + baseline + line_gap
     return total
 
 
@@ -189,12 +233,13 @@ def _row_size(text: str, scale: float, thickness: int) -> tuple[int, int]:
 
 
 def _card_position(face_box: tuple[int, int, int, int], card_width: int, card_height: int,
-                   frame_width: int, frame_height: int) -> tuple[int, int]:
+                   frame_width: int, frame_height: int, scale: float = 1.0) -> tuple[int, int]:
     """Top-left corner of the card: right of the face, else left of it, always inside the frame."""
     x1, y1, x2, _y2 = face_box
-    left = x2 + CARD_GAP
+    gap = scaled(CARD_GAP, scale)
+    left = x2 + gap
     if left + card_width > frame_width:
-        left = x1 - CARD_GAP - card_width               # no room on the right
+        left = x1 - gap - card_width                    # no room on the right
     left = max(0, min(left, frame_width - card_width))
     top = max(0, min(y1, frame_height - card_height))
     return left, top

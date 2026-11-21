@@ -492,11 +492,14 @@
       backdrop-filter: none;
     }
   }
-  /* ---- full screen: the whole live view (#watch) fills the screen ----
+  /* ---- full view: the whole live view (#watch) fills the window, or the screen ----
      The same elements as on the page, laid out again: a black stage with the video as large
      as it fits, the pills in one row over its bottom edge, and the details panel in a column
-     of its own at the right, so no blurred surface lies over the moving picture. The class
-     is-full is set by the script when the browser enters full screen. */
+     of its own at the right, so no blurred surface lies over the moving picture. The script
+     sets is-full at once when full view is asked for; position: fixed then covers the window
+     (no ancestor of #watch has a transform, filter, contain or will-change, which would trap
+     it). When the browser also grants real full screen, the same layout fills the screen. */
+  html.full-view, html.full-view body { overflow: hidden; }   /* the page behind stops scrolling */
   .stage.is-full {
     position: fixed; inset: 0; z-index: 100;
     gap: 0;
@@ -556,7 +559,26 @@
     object-fit: contain;
     background: rgba(0, 0, 0, 0.85);
     border-radius: 20px;
-    margin-bottom: 1.1rem;
+  }
+  /* The brush: a canvas laid exactly over the picture inside the photo (the script places it,
+     because the picture may have black bars). It is redrawn only on pointer events and when
+     the photo changes size; nothing about it moves by itself. */
+  .photo-box { position: relative; margin-bottom: 1.1rem; }
+  .brush-canvas { position: absolute; left: 0; top: 0; opacity: 0.45; pointer-events: none; }
+  .photo-box.is-brushing, .photo-box.is-brushing .photo {
+    touch-action: none;                  /* a finger paints instead of scrolling the panel */
+    user-select: none; -webkit-user-select: none; -webkit-user-drag: none;
+    cursor: crosshair;
+  }
+  .brush-tools { display: flex; flex-wrap: wrap; gap: 0.5rem; margin: -0.4rem 0 1.1rem; }
+  .brush-tools svg { width: 1.05em; height: 1.05em; flex: none; }
+  .brush-button[aria-pressed="true"] { background: var(--accent); color: var(--accent-text); }
+  .follow-form .part-button { flex: none; order: 1; }   /* after Send, so the field keeps Send beside it */
+  .tag {
+    display: inline-block; margin-top: 0.35rem;
+    padding: 0.05rem 0.55rem; border-radius: 999px;
+    background: rgba(255, 255, 255, 0.22);
+    font-size: 0.75rem; font-weight: 600; letter-spacing: 0.02em;
   }
   .details-title { font-size: clamp(1.7rem, 2.2vw, 2.3rem); font-weight: 700; letter-spacing: -0.025em; line-height: 1.1; overflow-wrap: anywhere; }
   .details-meta { margin-top: 0.45rem; color: var(--grey); font-size: 0.85rem; font-variant-numeric: tabular-nums; }
@@ -651,6 +673,8 @@
     outline: 3px solid var(--accent); outline-offset: 1px;
   }
   .follow-form input:disabled { opacity: 0.55; }
+  .follow-form { flex-wrap: wrap; }
+  .follow-form input { flex: 1 1 9rem; }   /* in a narrow panel the quick button goes to a line of its own */
 
   /* ---- footer ---- */
   .footer {
@@ -735,7 +759,7 @@
       </select>
       <span class="picture-now" id="pictureNow"></span>
     </div>
-    <p class="camera-help" id="pictureHelp">Smaller pictures arrive sooner.<span id="pictureShown"></span></p>
+    <p class="camera-help" id="pictureHelp"><span id="pictureHint">Smaller pictures arrive sooner.</span><span id="pictureShown"></span></p>
   </div>
   <hr>
   <label class="switch">
@@ -770,7 +794,7 @@
         <div class="frame" id="frame">
           <img id="video" src="/video" tabindex="-1" alt="Live camera view from the car, with labelled objects and faces">
           <div class="waiting" id="waiting">Waiting for the camera&hellip;</div>
-          <button class="frame-button" id="fullButton" type="button" aria-label="Full screen" title="Full screen (F)" hidden>
+          <button class="frame-button" id="fullButton" type="button" aria-label="Full screen" title="Full screen (F)">
             <svg class="expand" viewBox="0 0 24 24" aria-hidden="true">
               <path d="M4 9V4h5M15 4h5v5M20 15v5h-5M9 20H4v-5" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
             </svg>
@@ -806,7 +830,7 @@
           <h3>In view</h3>
           <ul class="things" id="things"></ul>
           <p class="quiet" id="nothing">Nothing detected right now</p>
-          <p class="privacy" id="privacy">A click on an object or on an empty spot sends a small cut-out of the picture to the assistant's API. A click on a person sends nothing. Follow-up questions about an object send the same cut-out again.</p>
+          <p class="privacy" id="privacy">A click on an object or on an empty spot sends a small cut-out of the picture to the assistant's API. A click on a person sends nothing. Follow-up questions about an object send the same cut-out again. A marked part is sent as the same cut-out with your outline drawn on it.</p>
         </div>
       </div>
 
@@ -819,7 +843,23 @@
           </button>
         </div>
         <div id="detailsBody" aria-live="polite">
-          <img class="photo" id="detailPhoto" alt="The part of the picture that was clicked" hidden>
+          <div class="photo-box" id="photoBox">
+            <img class="photo" id="detailPhoto" alt="The part of the picture that was clicked" draggable="false" hidden>
+            <canvas class="brush-canvas" id="brushCanvas" aria-hidden="true" hidden></canvas>
+          </div>
+          <!-- The brush: only for an object or an area, never for a person. -->
+          <div class="brush-tools" id="brushTools" hidden>
+            <button class="pill small secondary brush-button" id="brushButton" type="button" aria-pressed="false"
+                    title="Brush over a part of the photo, then ask about it">
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M14.5 4.5l5 5-7.8 7.8-5-5z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/>
+                <path d="M6.7 12.3c-2.2.2-3.4 1.6-3.6 3.6-.2 1.6-.7 2.6-1.6 3.4 2.8.5 6.4.2 8-1.4 1.1-1.1 1.4-2.4 1.2-3.4"
+                      fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+              </svg>
+              Mark a part
+            </button>
+            <button class="pill small secondary" id="brushClear" type="button" hidden>Clear</button>
+          </div>
           <div class="details-title" id="detailTitle"></div>
           <div class="details-meta" id="detailMeta"></div>
           <div class="details-role" id="detailRole" hidden></div>
@@ -831,6 +871,7 @@
           <form class="follow-form" id="followForm" autocomplete="off">
             <label class="visually-hidden" for="followQuestion">Ask about this</label>
             <input id="followQuestion" type="text" maxlength="{{ max_question_chars }}" placeholder="Ask about this">
+            <button class="pill secondary small part-button" id="followPart" type="button" hidden>What is this part?</button>
             <button class="pill primary small" id="followSend" type="submit">Send</button>
           </form>
         </div>
@@ -861,7 +902,7 @@
 </main>
 
 <footer class="footer">
-  <p>A click on an object or on an empty spot sends a small cut-out of the picture to the assistant's API. A click on a person sends nothing. Follow-up questions about an object send the same cut-out again.</p>
+  <p>A click on an object or on an empty spot sends a small cut-out of the picture to the assistant's API. A click on a person sends nothing. Follow-up questions about an object send the same cut-out again. A marked part is sent as the same cut-out with your outline drawn on it.</p>
   <p>Runs on this laptop. Nothing is sent to the car.</p>
 </footer>
 
@@ -1457,6 +1498,7 @@ function openDetails(key, from) {
 
 function closeDetails() {
   lookup += 1;                   // a late answer must not open the panel again
+  resetBrush();                  // the marking is forgotten with the panel
   details.hidden = true;
   stage.classList.remove("has-details");
   for (const item of thingItems.values()) item.firstChild.classList.remove("is-open");
@@ -1501,6 +1543,7 @@ function showWaiting() {
   detailMeta.textContent = "";
   setRole("");
   detailContent.replaceChildren();
+  resetBrush();                  // a marking belongs to the thing shown; this is a new one
   resetFollowUp();
 }
 
@@ -1581,6 +1624,7 @@ async function inspect(body, key, from) {
     return;
   }
   showTarget(data);
+  allowBrush(data.describable === true && data.kind !== "person" && !data.person);   // never for a person
   if (data.person && typeof data.person === "object") {
     showFollowUp(data.id);              // a recognised person: questions go to the chat, as text only
   } else if (data.info && typeof data.info === "object") {
@@ -1605,6 +1649,201 @@ async function describe(id, mine) {
   if (response.ok && data && typeof data.name === "string" && typeof data.error !== "string") showInfo(data);
   else showProblem(errorText(data, response, "Please click it again."));
   showFollowUp(id);                      // once the description has arrived, or failed
+}
+
+// ---- the brush: marking a part of the photo --------------------------------
+//
+// With the brush on, dragging over the photo paints on a canvas that lies exactly over the
+// picture. The marking is kept as strokes of points, each point as fractions of the picture
+// (0 to 1 from its top-left corner), never as pixels: whenever the photo changes size the
+// canvas is placed again and every stroke is drawn again from these points. Only the points
+// are sent with a question; the server draws them on its own copy of the photo.
+// The canvas is drawn only on pointer events and on a resize, never in a loop.
+
+const MAX_STROKES = 12;        // the server accepts at most this many strokes ...
+const MAX_STROKE_POINTS = 400; // ... of at most this many points
+const BRUSH_SHARE = 0.06;      // the brush is 6 % of the photo's shorter side wide
+const MIN_STEP_SHARE = 0.005;  // a new point only after the pointer moved 0.5 % of the photo's width
+const PART_QUESTION = "What is this part?";
+
+const photoBox = byId("photoBox"), brushCanvas = byId("brushCanvas"), brushTools = byId("brushTools");
+const brushButton = byId("brushButton"), brushClear = byId("brushClear"), followPart = byId("followPart");
+
+let brushStrokes = [];         // the marking: each stroke is a list of [x, y] fractions of the picture
+let brushOn = false;
+let painting = null;           // { pointerId, points } while a pointer paints a stroke
+
+// The rectangle of the picture inside the photo element (it may have black bars), in CSS
+// pixels from the photo box's corner. Offsets, not screen positions, so a sliding panel or
+// a scrolled panel does not matter. Null while there is no picture to draw on.
+function pictureInPhoto() {
+  const width = detailPhoto.naturalWidth, height = detailPhoto.naturalHeight;
+  const boxWidth = detailPhoto.clientWidth, boxHeight = detailPhoto.clientHeight;
+  if (detailPhoto.hidden || !width || !height || !boxWidth || !boxHeight) return null;
+  const scale = Math.min(boxWidth / width, boxHeight / height);
+  const shownWidth = width * scale, shownHeight = height * scale;
+  return {
+    left: detailPhoto.offsetLeft + (boxWidth - shownWidth) / 2,
+    top: detailPhoto.offsetTop + (boxHeight - shownHeight) / 2,
+    width: shownWidth,
+    height: shownHeight,
+  };
+}
+
+// Put the canvas over the picture, sized for a sharp line on this screen, and draw the marking.
+function placeBrushCanvas() {
+  const picture = pictureInPhoto();
+  if (!picture) return;
+  const scale = window.devicePixelRatio || 1;
+  brushCanvas.style.left = picture.left + "px";
+  brushCanvas.style.top = picture.top + "px";
+  brushCanvas.style.width = picture.width + "px";
+  brushCanvas.style.height = picture.height + "px";
+  brushCanvas.width = Math.max(1, Math.round(picture.width * scale));
+  brushCanvas.height = Math.max(1, Math.round(picture.height * scale));
+  redrawBrush();
+}
+
+// A pen in the accent colour; the canvas itself is translucent (CSS opacity), so strokes
+// that cross do not get darker.
+function brushPen() {
+  const pen = brushCanvas.getContext("2d");
+  const accent = getComputedStyle(document.documentElement).getPropertyValue("--accent").trim();
+  pen.strokeStyle = pen.fillStyle = accent || "#0066cc";
+  pen.lineWidth = BRUSH_SHARE * Math.min(brushCanvas.width, brushCanvas.height);
+  pen.lineCap = "round";
+  pen.lineJoin = "round";
+  return pen;
+}
+
+const onCanvas = (point) => [point[0] * brushCanvas.width, point[1] * brushCanvas.height];
+
+function drawDot(pen, point) {
+  const [x, y] = onCanvas(point);
+  pen.beginPath();
+  pen.arc(x, y, pen.lineWidth / 2, 0, 2 * Math.PI);
+  pen.fill();
+}
+
+function drawLine(pen, points) {
+  pen.beginPath();
+  pen.moveTo(...onCanvas(points[0]));
+  for (const point of points.slice(1)) pen.lineTo(...onCanvas(point));
+  pen.stroke();
+}
+
+function drawStroke(pen, points) {
+  if (points.length === 1) drawDot(pen, points[0]);
+  else drawLine(pen, points);
+}
+
+function redrawBrush() {
+  if (brushCanvas.hidden) return;
+  const pen = brushPen();
+  pen.clearRect(0, 0, brushCanvas.width, brushCanvas.height);
+  for (const points of brushStrokes) drawStroke(pen, points);
+}
+
+// Everything that depends on whether a part is marked: Clear, the quick question, the field's hint.
+function showMarking() {
+  const marked = brushStrokes.length > 0;
+  brushClear.hidden = !marked;
+  followPart.hidden = !marked;
+  followQuestion.placeholder = marked ? "Ask about the marked part" : "Ask about this";
+  const wasHidden = brushCanvas.hidden;
+  brushCanvas.hidden = !(marked || brushOn);
+  if (wasHidden && !brushCanvas.hidden) placeBrushCanvas();
+}
+
+function setBrush(on) {
+  brushOn = on;
+  painting = null;
+  brushButton.setAttribute("aria-pressed", on ? "true" : "false");
+  photoBox.classList.toggle("is-brushing", on);
+  showMarking();
+}
+
+// The brush tools appear for an object or an area, never for a person.
+function allowBrush(allowed) {
+  brushTools.hidden = !allowed;
+}
+
+function clearMarking() {
+  brushStrokes = [];
+  painting = null;
+  showMarking();
+  redrawBrush();
+}
+
+function resetBrush() {
+  brushTools.hidden = true;
+  setBrush(false);
+  clearMarking();
+}
+
+// The pointer as a point on the picture, pulled to its edge when it is outside, and whether it
+// was inside. Rounded, so a question carries short numbers.
+function brushPoint(event) {
+  const box = brushCanvas.getBoundingClientRect();
+  const x = (event.clientX - box.left) / box.width, y = (event.clientY - box.top) / box.height;
+  const inside = x >= 0 && x <= 1 && y >= 0 && y <= 1;
+  const round = (value) => Math.round(Math.min(Math.max(value, 0), 1) * 10000) / 10000;
+  return { point: [round(x), round(y)], inside };
+}
+
+function startStroke(event) {
+  if (!brushOn || event.button !== 0 || brushStrokes.length >= MAX_STROKES || brushCanvas.hidden) return;
+  const { point, inside } = brushPoint(event);
+  if (!inside) return;
+  event.preventDefault();                       // no text selection, no dragged picture
+  photoBox.setPointerCapture(event.pointerId);  // a drag that leaves the photo still ends here
+  painting = { pointerId: event.pointerId, points: [point] };
+  brushStrokes.push(painting.points);
+  drawDot(brushPen(), point);
+  showMarking();
+}
+
+function continueStroke(event) {
+  if (!painting || event.pointerId !== painting.pointerId) return;
+  const points = painting.points;
+  if (points.length >= MAX_STROKE_POINTS) return;   // at the limit the brush just stops adding
+  const { point } = brushPoint(event);
+  const last = points[points.length - 1];
+  const box = brushCanvas.getBoundingClientRect();
+  const moved = Math.hypot((point[0] - last[0]) * box.width, (point[1] - last[1]) * box.height);
+  if (moved < MIN_STEP_SHARE * box.width) return;
+  points.push(point);
+  drawLine(brushPen(), [last, point]);
+}
+
+function endStroke(event) {
+  if (painting && event.pointerId === painting.pointerId) painting = null;
+}
+
+photoBox.addEventListener("pointerdown", startStroke);
+photoBox.addEventListener("pointermove", continueStroke);
+photoBox.addEventListener("pointerup", endStroke);
+photoBox.addEventListener("pointercancel", endStroke);
+photoBox.addEventListener("lostpointercapture", endStroke);
+photoBox.addEventListener("dragstart", (event) => {
+  if (brushOn) event.preventDefault();
+});
+brushButton.addEventListener("click", () => setBrush(!brushOn));
+brushClear.addEventListener("click", () => {
+  clearMarking();
+  brushButton.focus({ preventScroll: true });   // Clear hides itself; focus goes to the brush button
+});
+
+// The canvas follows the picture when the photo changes size: the panel resizing, the full
+// view, a new photo arriving.
+detailPhoto.addEventListener("load", placeBrushCanvas);
+if ("ResizeObserver" in window) new ResizeObserver(placeBrushCanvas).observe(detailPhoto);
+window.addEventListener("resize", placeBrushCanvas);
+
+// The strokes as the server wants them, or null when nothing is marked.
+function markedStrokes() {
+  if (brushStrokes.length === 0 || brushTools.hidden) return null;
+  return brushStrokes.map((points) => ({ points: points.slice() }));
 }
 
 // ---- asking more about the clicked thing ----------------------------------
@@ -1634,6 +1873,7 @@ function showFollowUp(id) {
 function setFollowBusy(isBusy) {
   followQuestion.disabled = isBusy;
   followSend.disabled = isBusy;
+  followPart.disabled = isBusy;
 }
 
 function scrollPanel() {
@@ -1683,18 +1923,28 @@ function showFollowReply(reply) {
   return false;
 }
 
-followForm.addEventListener("submit", async (event) => {
+followForm.addEventListener("submit", (event) => {
   event.preventDefault();
-  const question = followQuestion.value.trim();
+  askFollowUp(followQuestion.value.trim(), true);
+});
+followPart.addEventListener("click", () => askFollowUp(PART_QUESTION, false));
+
+// Send one question about the clicked thing, with the marked part when there is one.
+// `typed` says the question came from the field, which is then emptied.
+async function askFollowUp(question, typed) {
   if (!question || followId === null || followQuestion.disabled) return;
   const id = followId, mine = lookup;
-  followQuestion.value = "";
-  addFollowMessage("question", question);
+  const body = { id, question };
+  const strokes = markedStrokes();
+  if (strokes) body.strokes = strokes;          // only points: the server draws them on its own photo
+  if (typed) followQuestion.value = "";
+  const item = addFollowMessage("question", question);
+  if (strokes) item.append(make("span", "tag", "marked part"));
   const waiting = addFollowWaiting();
   setFollowBusy(true);
   let reply = null;
   try {
-    reply = await postJson("/api/follow_up", { id, question });
+    reply = await postJson("/api/follow_up", body);
   } catch (error) {
     reply = null;
   }
@@ -1708,7 +1958,7 @@ followForm.addEventListener("submit", async (event) => {
   } else {
     followQuestion.focus({ preventScroll: true });
   }
-});
+}
 
 // ---- light and dark --------------------------------------------------------
 
@@ -1745,6 +1995,7 @@ function applyTheme(theme, fade) {
     themeFadeTimer = setTimeout(() => root.classList.remove("theme-fade"), THEME_FADE_MS);
   }
   root.dataset.theme = theme;
+  redrawBrush();                       // the marking is drawn in the accent colour of this look
   const label = theme === "dark" ? "Switch to the light look" : "Switch to the dark look";
   themeButton.setAttribute("aria-label", label);
   themeButton.title = label;
@@ -1845,7 +2096,7 @@ function drawConnecting(status) {
 // Changing the select posts the choice at once; the server asks the phone in the background.
 
 const pictureRow = byId("pictureRow"), pictureChoice = byId("pictureChoice");
-const pictureNow = byId("pictureNow"), pictureShown = byId("pictureShown");
+const pictureNow = byId("pictureNow"), pictureShown = byId("pictureShown"), pictureHint = byId("pictureHint");
 const autoOption = pictureChoice.options[0], keepOption = pictureChoice.options[1];
 let picturePosts = 0;          // choices sent and not answered yet; the select is left alone meanwhile
 
@@ -1877,13 +2128,21 @@ function drawPicture(status) {
   const choiceChanged = changed("pictureChoice", picture.choice);
   if (optionsChanged || (choiceChanged && picturePosts === 0)) pictureChoice.value = picture.choice;
   setText(pictureNow, picture.current ? "The phone sends " + sizeLabel(picture.current) : "");
-  // The size the page really shows is the size of the video's pictures.
+  drawPictureHelp();
+}
+
+// The help under the select: what the choice in the select costs, and the size the page
+// really shows, which is the size of the video's pictures.
+function drawPictureHelp() {
+  const chosenSize = pictureChoice.value !== "auto" && pictureChoice.value !== "keep";
+  setText(pictureHint, chosenSize ? "Sharper, but a little later and slower." : "Smaller pictures arrive sooner.");
   const shown = video.naturalWidth > 0 && video.naturalHeight > 0
-    ? " The page shows " + video.naturalWidth + " × " + video.naturalHeight + " either way." : "";
+    ? " The page shows " + video.naturalWidth + " × " + video.naturalHeight + "." : "";
   setText(pictureShown, shown);
 }
 
 pictureChoice.addEventListener("change", async () => {
+  drawPictureHelp();
   picturePosts += 1;
   try {
     const { response, data } = await postJson("/api/camera/picture", { choice: pictureChoice.value });
@@ -1931,42 +2190,67 @@ function setDelayTest(on) {
 }
 delaySwitch.addEventListener("change", () => setDelayTest(delaySwitch.checked));
 
-// ---- full screen ------------------------------------------------------------------
+// ---- full view ------------------------------------------------------------------
 //
-// The whole live view (#watch) goes full screen. The video, the banners, the pills and the
-// details panel stay the very same elements, so clicks and the panel work there as on the page.
+// The whole live view (#watch) fills the browser window at once (the class is-full), and the
+// page behind stops scrolling. Then, where the browser has the Fullscreen API, the page also
+// asks for real full screen. Granted: the same layout fills the screen. Refused, ignored (some
+// browser panes never answer) or missing: the view keeps filling the window. So the button
+// always does something. The video, the banners, the pills and the details panel stay the very
+// same elements, so clicks and the panel work there as on the page.
 
-const ESCAPE_GRACE_MS = 500;   // an Escape this soon after leaving full screen was the browser's own
-const canGoFull = document.fullscreenEnabled === true && typeof stage.requestFullscreen === "function";
-let leftFullAt = -Infinity;
-fullButton.hidden = !canGoFull;
+const ESCAPE_GRACE_MS = 500;   // an Escape this soon after leaving real full screen was the browser's own
+const canAskScreen = document.fullscreenEnabled === true && typeof stage.requestFullscreen === "function";
+let fullView = false;          // true while the live view fills the window (or the screen)
+let leftScreenAt = -Infinity;
 
-const isFull = () => document.fullscreenElement === stage;
+const isScreenFull = () => document.fullscreenElement === stage;
 
-function toggleFullScreen() {
-  if (fullButton.hidden) return;
-  if (isFull()) {
-    document.exitFullscreen().catch(() => {});
-    return;
-  }
+function enterFullView() {
+  fullView = true;
   closeCameraBox(false);               // the box is outside the live view
-  stage.requestFullscreen().catch(() => {
-    fullButton.hidden = true;           // refused: no button that does nothing
-  });
+  stage.classList.add("is-full");
+  document.documentElement.classList.add("full-view");
+  labelFullButton();
+  fitDetails();                        // in full view the panel has a column of its own
+  if (canAskScreen && !isScreenFull()) {
+    stage.requestFullscreen().catch(() => {});   // refused: the window-filling view stays
+  }
 }
 
-document.addEventListener("fullscreenchange", () => {
-  const full = isFull();
-  stage.classList.toggle("is-full", full);
-  if (!full) leftFullAt = performance.now();
-  fitDetails();                          // in full screen the panel has a column of its own
-  const label = full ? "Leave full screen" : "Full screen";
+function leaveFullView() {
+  fullView = false;
+  stage.classList.remove("is-full");
+  document.documentElement.classList.remove("full-view");
+  labelFullButton();
+  fitDetails();
+  if (isScreenFull()) document.exitFullscreen().catch(() => {});
+}
+
+function toggleFullView() {
+  if (fullView) leaveFullView();
+  else enterFullView();
+}
+
+function labelFullButton() {
+  const label = fullView ? "Leave full screen" : "Full screen";
   fullButton.setAttribute("aria-label", label);
   fullButton.title = label + " (F)";
-});
-fullButton.addEventListener("click", toggleFullScreen);
+}
 
-// ---- keys: Escape closes the topmost thing, F switches full screen ------------------
+// The browser's own way out of real full screen (its Escape) leaves the full view too.
+// Real full screen granted after the visitor had already left (a slow answer) is given back.
+document.addEventListener("fullscreenchange", () => {
+  if (isScreenFull() && !fullView) {
+    document.exitFullscreen().catch(() => {});
+  } else if (!document.fullscreenElement && fullView) {
+    leftScreenAt = performance.now();
+    leaveFullView();
+  }
+});
+fullButton.addEventListener("click", toggleFullView);
+
+// ---- keys: Escape closes the topmost thing, F switches the full view -----------------
 
 function isTyping(target) {
   return target instanceof HTMLElement &&
@@ -1978,8 +2262,13 @@ function closeTopmost() {
     closeCameraBox(true);
     return;
   }
-  // In full screen, Escape belongs to the browser: it leaves full screen, and the panel stays open.
-  if (isFull() || performance.now() - leftFullAt < ESCAPE_GRACE_MS) return;
+  // Then the full view; the details panel stays open.
+  if (fullView) {
+    leaveFullView();
+    return;
+  }
+  // In real full screen the browser's own Escape already left it (and the full view with it).
+  if (performance.now() - leftScreenAt < ESCAPE_GRACE_MS) return;
   if (!details.hidden) closeDetails();
 }
 
@@ -1991,7 +2280,7 @@ document.addEventListener("keydown", (event) => {
   const plainF = (event.key === "f" || event.key === "F") && !event.ctrlKey && !event.metaKey && !event.altKey;
   if (plainF && !event.repeat && !isTyping(event.target)) {
     event.preventDefault();
-    toggleFullScreen();
+    toggleFullView();
   }
 });
 

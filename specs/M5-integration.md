@@ -85,7 +85,7 @@ def main(argv: list[str] | None = None) -> int: ...
 | `POST /api/ask` | Body `{"question": "..."}`. Returns `{"text", "used_web", "sources"}`. An `AssistantError` returns status 200 with `{"error": "<its message>"}`; an empty or over-long (more than 2000 characters) question returns 400. |
 | `POST /api/reset` | Forgets the conversation. |
 
-`main` loads the config, sets up logging to the console and to `app.log_file` (create the folder), builds the `Pipeline` and the `Assistant` (sharing the pipeline's `WorldState`), starts the pipeline, prints the address of the page, and serves on `app.host` and `app.port` with threading on and the reloader and debug mode off. Arguments: `--source` overrides `stream.source`; `--open` opens the page in the default browser. Ctrl+C stops the pipeline cleanly. The server binds to `app.host` only; do not bind to all interfaces.
+`main` loads the config, sets up logging to the console and to `app.log_file` (create the folder), builds the `Pipeline` and the `Assistant` (sharing the pipeline's `WorldState`), starts the pipeline, prints the address of the page, and serves on `app.host` and `app.port` with threading on and the reloader and debug mode off. Arguments: `--source` overrides `stream.source`; `--file PATH` plays that clip (it implies `--source file` and overrides `stream.file_path` for this run); `--open` opens the page in the default browser. Ctrl+C stops the pipeline cleanly. The server binds to `app.host` only; do not bind to all interfaces.
 
 If the assistant cannot be built (missing notes file, for example), the page still works and `/api/ask` returns that error.
 
@@ -93,7 +93,7 @@ If the assistant cannot be built (missing notes file, for example), the page sti
 
 One screen, readable from the back of a room, working at 1280 x 720 and larger, in light text on a dark background.
 
-- Left: the live video, as large as the space allows, keeping its 4:3 shape.
+- Left: the live video, as large as the space allows, keeping the frame's own shape (the phone sends a wide 16:9 picture, the laptop webcam 4:3).
 - Over the video, at the top: the warning as a red banner while it is active, and greetings as a calmer banner.
 - Right column, top: an info card for each recognised person (name, role, lines). When nobody is recognised, a quiet line saying so.
 - Right column, bottom: the chat. A scrolling list of questions and answers, a text box and a Send button; Enter sends. While waiting, the button is disabled and a "thinking" line shows. A web answer is marked `From the web` and lists its sources as links that open in a new tab. Errors show in the chat in a distinct colour.

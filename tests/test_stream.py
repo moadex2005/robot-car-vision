@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 
 from car_vision.config import ConfigError
-from car_vision.stream import FpsCounter, FrameSource
+from car_vision.stream import FpsCounter, FrameSource, fitted_size
 
 SETTINGS = {
     "source": "webcam",
@@ -99,6 +99,30 @@ def test_resizes_to_configured_size():
         assert source.wait_for_frame(2.0)
         frame, _ = source.read()
     assert frame.shape == (48, 64, 3)
+
+
+def test_wide_frame_keeps_its_shape():
+    # A 16:9 phone picture must not be squashed into the 4:3 setting.
+    source = FrameSource(SETTINGS, opener=lambda: FakeCapture(frames=1, size=(108, 192)))
+    with source:
+        assert source.wait_for_frame(2.0)
+        frame, _ = source.read()
+    assert frame.shape == (36, 64, 3)
+
+
+def test_small_frame_is_not_enlarged():
+    source = FrameSource(SETTINGS, opener=lambda: FakeCapture(frames=1, size=(24, 32)))
+    with source:
+        assert source.wait_for_frame(2.0)
+        frame, _ = source.read()
+    assert frame.shape == (24, 32, 3)
+
+
+def test_fitted_size_examples():
+    assert fitted_size(1920, 1080, 640, 480) == (640, 360)
+    assert fitted_size(640, 480, 640, 480) == (640, 480)
+    assert fitted_size(1280, 960, 640, 480) == (640, 480)
+    assert fitted_size(320, 240, 640, 480) == (320, 240)
 
 
 def test_reconnects_after_the_stream_drops():

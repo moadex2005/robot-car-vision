@@ -74,6 +74,17 @@ class FpsCounter:
             self._stamps.popleft()
 
 
+def fitted_size(width: int, height: int, max_width: int, max_height: int) -> tuple[int, int]:
+    """The largest size with the same shape that fits inside max_width x max_height.
+
+    Never enlarges, and keeps both sides even because video writers need that.
+    """
+    scale = min(max_width / width, max_height / height, 1.0)
+    fitted_width = max(2, int(round(width * scale / 2)) * 2)
+    fitted_height = max(2, int(round(height * scale / 2)) * 2)
+    return fitted_width, fitted_height
+
+
 class FrameSource:
     """Keeps the newest camera frame ready, and reconnects when the stream drops."""
 
@@ -221,9 +232,15 @@ class FrameSource:
         return capture
 
     def _fit(self, frame: np.ndarray) -> np.ndarray:
-        if frame.shape[1] == self.width and frame.shape[0] == self.height:
+        """Shrink the frame to fit inside width x height without changing its shape.
+
+        A wide 1920 x 1080 phone picture becomes 640 x 360, not a squashed 640 x 480:
+        squashed faces are harder to recognise.
+        """
+        size = fitted_size(frame.shape[1], frame.shape[0], self.width, self.height)
+        if size == (frame.shape[1], frame.shape[0]):
             return frame
-        return cv2.resize(frame, (self.width, self.height), interpolation=cv2.INTER_AREA)
+        return cv2.resize(frame, size, interpolation=cv2.INTER_AREA)
 
     # ---- real cameras ----------------------------------------------------
 
@@ -306,14 +323,16 @@ def main(argv: list[str] | None = None) -> int:
 
         writer = None
         if args.record:
+            first_frame, _ = source.read()
             record_path = resolve_path(args.record)
             record_path.parent.mkdir(parents=True, exist_ok=True)
+            frame_size = (first_frame.shape[1], first_frame.shape[0])
             writer = cv2.VideoWriter(str(record_path), cv2.VideoWriter_fourcc(*"mp4v"),
-                                     RECORD_FPS, (source.width, source.height))
+                                     RECORD_FPS, frame_size)
             if not writer.isOpened():
                 print(f"Could not create the recording file: {record_path}")
                 return 1
-            print(f"Recording to {record_path}")
+            print(f"Recording {frame_size[0]} x {frame_size[1]} video to {record_path}")
 
         started = time.monotonic()
         last_print = started

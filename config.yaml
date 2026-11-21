@@ -3,11 +3,11 @@
 
 stream:
   source: webcam            # phone, webcam or file
-  phone_url: "http://192.168.43.1:8080/video"   # the address IP Webcam shows, plus /video
+  phone_url: "http://192.168.165.249:8080/video"   # the address IP Webcam shows, plus /video
   webcam_index: 0           # 0 is the laptop's built-in camera
   file_path: data/samples/car_clip.mp4          # a clip recorded from the car
-  width: 640
-  height: 480
+  width: 640                # frames are shrunk to fit inside this size, keeping their shape
+  height: 480               # (a wide 1920 x 1080 phone picture becomes 640 x 360)
   reconnect_seconds: 2.0    # wait this long before trying a dropped stream again
   loop_file: true           # play the clip again when it ends
 
@@ -33,7 +33,7 @@ recognizer:
 
 assistant:
   provider: anthropic
-  model: claude-opus-5-5
+  model: claude-sonnet-5-5
   effort: low               # low, medium or high; low answers fastest
   max_tokens: 16000
   notes_file: data/knowledge.md

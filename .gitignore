@@ -9,6 +9,7 @@ __pycache__/
 
 # People's faces and anything computed from them stay on this laptop
 data/people/*/
+data/people.json
 data/embeddings.npz
 
 # Downloaded model weights and recordings are large and can be fetched again

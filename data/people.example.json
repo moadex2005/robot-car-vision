@@ -1,0 +1,12 @@
+{
+  "nora": {
+    "name": "Nora Fielding",
+    "role": "Team lead",
+    "lines": ["Built the car chassis", "Fourth-year student"]
+  },
+  "theo": {
+    "name": "Theo Marsh",
+    "role": "Vision and software",
+    "lines": ["Mounted the phone camera", "Wrote the face recognition", "Third-year student"]
+  }
+}

@@ -15,6 +15,11 @@ frame (nothing drawn on it) with that frame's detections and faces. When a
 visitor clicks the video, target() finds what is under the click in that view
 and cuts a small photo of it out of the clean frame.
 
+use_phone() switches the live source to another phone while the loop runs
+(the camera box on the page). Each switch starts a new "generation": the
+loop notices it, forgets everything about the old picture, and drops any
+result it was still working out for the old camera.
+
 Every part can be handed in from outside, so the tests run the loop with
 fakes and need no camera, model or graphics card.
 """
@@ -35,6 +40,7 @@ from car_vision import draw
 from car_vision.config import ConfigError, require, section
 from car_vision.detector import Detector
 from car_vision.faces import FaceMemory, Person
+from car_vision.phone import without_login
 from car_vision.reactions import Reaction, ReactionEngine
 from car_vision.recognizer import Recognizer, load_known_faces
 from car_vision.state import Box, Detection, RecognizedFace, WorldSnapshot, WorldState
@@ -54,6 +60,7 @@ PHOTO_MIN_PIXELS = 160         # ... and at least this wide and high, where the 
 CLIP_FINISHED = "Clip finished"   # drawn and shown when a clip has played to its end
 AREA_SHARE = 0.5               # a click on no box takes half the frame wide and half the frame high
 FACE_LABEL = "face"            # the label of a target that is a face box with no person box around it
+DARK_LEVEL = 24                # the plain dark picture shown while a new camera connects
 
 
 @dataclass(frozen=True)
@@ -87,11 +94,15 @@ class View:
         return width, height
 
 
+SourceFactory = Callable[[dict], Any]     # stream settings in, a FrameSource (or a fake) out
+
+
 class Pipeline:
     """Runs the camera, the models and the reactions in one background thread."""
 
     def __init__(self, config: dict, source=None, detector=None, recognizer=None,
-                 reactions=None, state: WorldState | None = None) -> None:
+                 reactions=None, state: WorldState | None = None,
+                 source_factory: SourceFactory | None = None) -> None:
         recognizer_settings = section(config, "recognizer")
         self.every_n_frames: int = require(recognizer_settings, "every_n_frames", int)
         if self.every_n_frames < 1:
@@ -101,8 +112,12 @@ class Pipeline:
             raise ConfigError(f"app.jpeg_quality must be from 1 to 100, got {self.jpeg_quality}")
 
         self._notes: list[str] = []
+        self._stream_settings = dict(section(config, "stream"))
+        phone_url = self._stream_settings.get("phone_url")
+        self._phone_url: str | None = phone_url if isinstance(phone_url, str) else None
+        self._make_source: SourceFactory = source_factory if source_factory is not None else FrameSource
         # Cheap parts first, so a wrong setting or a missing clip shows before the slow model loads.
-        self._source = source if source is not None else FrameSource(section(config, "stream"))
+        self._source = source if source is not None else self._make_source(self._stream_settings)
         self._reactions = reactions if reactions is not None else ReactionEngine(section(config, "reactions"))
         self._state = state if state is not None else WorldState()
         # A detector that cannot load is a real failure: its error is not caught here.
@@ -113,12 +128,17 @@ class Pipeline:
 
         self._memory = FaceMemory()
         self._fps = FpsCounter()
-        self._lock = threading.Lock()          # guards the four values the web server reads
+        self._lock = threading.Lock()          # guards the values below that both threads use
         self._jpeg: bytes | None = None
         self._view: View | None = None
         self._on_screen: list[Reaction] = []
         self._error: str | None = None
+        self._generation = 0                   # goes up by one on every use_phone()
+        self._switched_at = 0.0                # sightings from before this moment are old
+        self._started = False                  # start() was called
+        self._loop_running = False             # the loop thread runs (it ends after too many failures)
 
+        self._switch_lock = threading.Lock()   # one use_phone() at a time
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         # Only the loop thread uses these.
@@ -135,23 +155,58 @@ class Pipeline:
         return self._state
 
     def start(self) -> "Pipeline":
-        if self._thread is not None:
-            return self
-        self._stop.clear()
-        self._source.start()
-        self._thread = threading.Thread(target=self._run, name="pipeline", daemon=True)
-        self._thread.start()
+        with self._switch_lock:
+            with self._lock:
+                if self._started:
+                    return self
+                self._started = True
+                self._loop_running = True
+                source = self._source
+            self._stop.clear()
+            source.start()
+            self._start_loop()
         return self
 
     def stop(self) -> None:
         """End the loop (within two seconds), then let go of the camera."""
         self._stop.set()
-        if self._thread is not None:
-            self._thread.join(timeout=STOP_WAIT_SECONDS)
-            if self._thread.is_alive():
+        with self._switch_lock:                 # a switch under way finishes first
+            with self._lock:
+                self._started = False
+                source = self._source
+            thread, self._thread = self._thread, None
+        if thread is not None:
+            thread.join(timeout=STOP_WAIT_SECONDS)
+            if thread.is_alive():
                 log.warning("The video loop did not stop within %.0f seconds", STOP_WAIT_SECONDS)
-            self._thread = None
-        self._source.stop()
+        source.stop()
+
+    def use_phone(self, url: str) -> None:
+        """Switch the live source to the phone at this address, now.
+
+        Called from a web-server thread while the loop runs. Returns at once:
+        the old camera is let go in a thread of its own, because stopping it
+        can take seconds while it waits on a phone that is gone. Two switches
+        at the same time are done one after the other; the last one wins.
+        """
+        settings = {**self._stream_settings, "source": "phone", "phone_url": url}
+        with self._switch_lock:
+            new_source = self._make_source(settings)
+            with self._lock:
+                old_source = self._source
+                self._source = new_source
+                self._phone_url = url
+                self._forget_old_picture()
+                live = self._started and not self._stop.is_set()
+                restart = live and not self._loop_running   # the loop had stopped after too many failures
+                if restart:
+                    self._loop_running = True
+            if live:
+                new_source.start()
+            if restart:
+                self._start_loop()
+        log.info("Switched the camera to the phone at %s", url)
+        let_go_in_background(old_source)
 
     def latest_jpeg(self) -> bytes | None:
         """The newest annotated frame as JPEG bytes; None until the first frame.
@@ -168,12 +223,18 @@ class Pipeline:
         with self._lock:
             on_screen = list(self._on_screen)
             error = self._error
-        # While the stream is down nothing new is seen, so old sightings are left out.
-        fresh = snapshot.detections_at > 0 and time.monotonic() - snapshot.detections_at <= STALE_SECONDS
+            source = self._source
+            phone_url = self._phone_url
+            switched_at = self._switched_at        # 0.0 until the first switch
+        # While the stream is down nothing new is seen, so old sightings are left out,
+        # and so is everything seen by the camera used before the last switch.
+        seen_at = snapshot.detections_at
+        fresh = seen_at > switched_at and time.monotonic() - seen_at <= STALE_SECONDS
         return {
-            "source": self._source.source,
-            "connected": bool(self._source.connected) and error is None,   # a stopped loop is not live
-            "ended": bool(self._source.ended),        # a clip played to its end (loop_file: false)
+            "source": source.source,
+            "connected": bool(source.connected) and error is None,   # a stopped loop is not live
+            "ended": bool(source.ended),              # a clip played to its end (loop_file: false)
+            "phone_url": without_login(phone_url) if phone_url else None,   # in use or remembered; no password
             "fps": round(self._fps.value(), 1),
             "device": self._detector.device,
             "recognition": self._recognizer is not None,
@@ -226,26 +287,67 @@ class Pipeline:
 
     # ---- the loop thread -----------------------------------------------------
 
+    def _start_loop(self) -> None:
+        self._thread = threading.Thread(target=self._run, name="pipeline", daemon=True)
+        self._thread.start()
+
+    def _forget_old_picture(self) -> None:
+        """What use_phone() clears, under the lock: a click must never hit the old camera's
+        picture, and the assistant must not be told about people that camera saw."""
+        self._generation += 1
+        self._switched_at = time.monotonic()
+        self._view = None
+        self._error = None
+        self._on_screen = []
+        frame_size = self._state.snapshot().frame_size
+        self._state.update_detections([], frame_size, self._switched_at)
+        self._state.update_faces([], self._switched_at)
+
     def _run(self) -> None:
+        generation = None                       # the camera this loop is working with
         last_sequence = 0
         while not self._stop.is_set():
-            frame, sequence = self._source.read()
+            with self._lock:                    # the source and its generation, read together
+                source, current = self._source, self._generation
+            if current != generation:
+                switched = generation is not None
+                generation, last_sequence = current, 0
+                self._start_afresh(source, switched)
+            frame, sequence = source.read()
             if frame is None or sequence == last_sequence:
-                if not self._source.connected:
-                    self._show_stream_lost()
+                if not source.connected:
+                    self._show_stream_lost(source)
                 self._stop.wait(IDLE_WAIT_SECONDS)
                 continue
             last_sequence = sequence
             try:
-                self._process(frame)
+                self._process(frame, generation)
             except Exception as error:      # one bad frame must not end the demo
-                if self._too_many_failures(error):
+                if self._too_many_failures(error, generation):
                     return
             else:
                 self._failures = 0
 
-    def _process(self, frame: np.ndarray) -> None:
-        """See, decide and show for one frame. Nothing is written until the models are done."""
+    def _start_afresh(self, source: Any, switched: bool) -> None:
+        """A new camera: forget the faces, failures, frame count, FPS and lost line of the old one.
+
+        Only the loop thread uses these, so the loop clears them itself. After a
+        switch the old picture is replaced at once by a plain dark one of the same
+        size with "Connecting to the phone ...", so nothing of the old camera stays
+        on screen.
+        """
+        self._frames = 0
+        self._failures = 0
+        self._memory = FaceMemory()
+        self._fps = FpsCounter()
+        self._lost_line = None
+        if switched and self._last_drawn is not None:
+            self._last_drawn = np.full_like(self._last_drawn, DARK_LEVEL)
+            self._show_stream_lost(source)          # no frame yet, so: "Connecting to the phone ..."
+
+    def _process(self, frame: np.ndarray, generation: int) -> None:
+        """See, decide and show for one frame. Nothing is written until the models are done,
+        and nothing at all when the camera was switched while the models worked."""
         now = time.monotonic()
         index = self._frames
         self._frames += 1
@@ -256,18 +358,19 @@ class Pipeline:
             self._memory.remember(found, detections, now)
         faces = self._memory.current(detections, now)
 
-        height, width = frame.shape[:2]
-        self._state.update_detections(detections, (width, height), now)
-        self._state.update_faces(faces, now)
-        on_screen = self._reactions.update(self._state.snapshot(), now)
-
         # The boxes are drawn on a copy: the camera's own frame goes into the view untouched.
         drawn = frame.copy()
         draw.draw_detections(drawn, detections)
         draw.draw_faces(drawn, faces)
         jpeg = self._encode(drawn)
         view = View(frame, tuple(detections), tuple(faces))
-        with self._lock:                        # picture, view and reactions change together
+        height, width = frame.shape[:2]
+        with self._lock:                        # state, picture, view and reactions change together
+            if self._generation != generation:
+                return                          # this frame came from the camera used before the switch
+            self._state.update_detections(detections, (width, height), now)
+            self._state.update_faces(faces, now)
+            on_screen = self._reactions.update(self._state.snapshot(), now)
             self._jpeg = jpeg
             self._view = view
             self._on_screen = list(on_screen)
@@ -275,7 +378,7 @@ class Pipeline:
         self._lost_line = None
         self._fps.tick(now)
 
-    def _too_many_failures(self, error: Exception) -> bool:
+    def _too_many_failures(self, error: Exception, generation: int) -> bool:
         """Log a skipped frame. True when too many failed in a row and the loop must stop."""
         self._failures += 1
         if self._failures == 1:
@@ -287,32 +390,44 @@ class Pipeline:
             return False
         message = (f"The video loop stopped after {MAX_FAILURES_IN_A_ROW} frames in a row failed "
                    f"({type(error).__name__}: {first_line(error)})")
-        log.error("%s", message)
-        with self._lock:
+        jpeg = self._picture_with_line(f"Stopped: {MAX_FAILURES_IN_A_ROW} frames in a row failed")
+        with self._lock:                        # decided under the lock, so use_phone() can restart the loop
+            if self._generation != generation:
+                return False                    # another camera was chosen meanwhile: carry on with it
             self._error = message
-        self._show_line_on_last_frame(f"Stopped: {MAX_FAILURES_IN_A_ROW} frames in a row failed")
+            if jpeg is not None:
+                self._jpeg = jpeg
+            self._loop_running = False
+        log.error("%s", message)
         return True
 
-    def _show_stream_lost(self) -> None:
+    def _show_stream_lost(self, source: Any) -> None:
         """Keep serving the last picture, with a line on it saying why nothing new comes.
 
         Each line is drawn once; it is drawn again only when the reason changes,
         e.g. from reconnecting to "Clip finished" when a clip has played to its end.
         """
-        text = CLIP_FINISHED if self._source.ended else f"{self._source.source} stream lost - reconnecting"
+        if source.ended:
+            text = CLIP_FINISHED
+        elif self._frames == 0:                 # no picture from this camera yet (just switched)
+            text = f"Connecting to the {source.source} ..."
+        else:
+            text = f"{source.source} stream lost - reconnecting"
         if self._lost_line == text:
             return
         self._lost_line = text
-        self._show_line_on_last_frame(text)
+        jpeg = self._picture_with_line(text)
+        if jpeg is not None:
+            with self._lock:
+                self._jpeg = jpeg
 
-    def _show_line_on_last_frame(self, text: str) -> None:
+    def _picture_with_line(self, text: str) -> bytes | None:
+        """The last drawn picture with one line of text on it, as JPEG; None before the first picture."""
         if self._last_drawn is None:
-            return                              # no picture yet: nothing to write on
+            return None
         frame = self._last_drawn.copy()
         draw.draw_status(frame, text)
-        jpeg = self._encode(frame)
-        with self._lock:
-            self._jpeg = jpeg
+        return self._encode(frame)
 
     def _encode(self, frame: np.ndarray) -> bytes:
         ok, buffer = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), self.jpeg_quality])
@@ -344,6 +459,21 @@ class Pipeline:
         """The person a known face belongs to; just the name when they have no about.md."""
         card = self._recognizer.person(face.person_id) if self._recognizer is not None else None
         return card if card is not None else Person(face.person_id, face.name)
+
+
+def let_go_in_background(source: Any) -> None:
+    """Stop a camera that is no longer used, in a thread of its own.
+
+    FrameSource.stop() waits for its reader thread, which may be stuck waiting
+    on a phone that is gone; nobody else has to wait for that.
+    """
+    def let_go() -> None:
+        try:
+            source.stop()
+        except Exception:                       # a camera driver that fails to close must not matter
+            log.exception("Letting go of the old camera failed")
+
+    threading.Thread(target=let_go, name="old-camera", daemon=True).start()
 
 
 CardOf = Callable[[RecognizedFace], Person]     # the person a known face belongs to

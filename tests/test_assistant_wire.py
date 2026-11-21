@@ -153,6 +153,34 @@ def test_wire_describe_sends_one_user_turn_with_the_picture(settings: dict[str, 
     assert info.name == "Laptop" and info.specs == (("Weight", "about 1.5 kg"),)
 
 
+def test_wire_follow_up_sends_the_whole_short_conversation(settings: dict[str, Any]) -> None:
+    picture = bytes([0xFF, 0xD8, 0xFF, 0xE0]) + b"fake jpeg body"
+    info = assistant.ObjectInfo(name="Laptop", summary="A portable computer.",
+                                specs=(("Weight", "about 1.5 kg"),))
+    wire = Wire([reply_json([{"type": "text", "text": "Hi."}]),
+                 reply_json([{"type": "text", "text": "Aluminium."}])])
+    bot = bot_on(settings, wire)
+    bot.ask("one")                                   # chat history that must not go along
+    answer = bot.follow_up(picture, "laptop", info, [("How heavy?", "About 1.5 kg.")],
+                           "What is it made of?")
+    body = wire.bodies[1]
+    assert body["messages"] == [
+        {"role": "user", "content": [
+            {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg",
+                                         "data": base64.standard_b64encode(picture).decode("ascii")}},
+            {"type": "text", "text": 'The object detector labelled this "laptop".'}]},
+        {"role": "assistant",
+         "content": "NAME: Laptop\nABOUT: A portable computer.\nSPECS:\n- Weight: about 1.5 kg"},
+        {"role": "user", "content": "How heavy?"},
+        {"role": "assistant", "content": "About 1.5 kg."},
+        {"role": "user", "content": "What is it made of?"},
+    ]
+    assert body["system"] == [{"type": "text", "text": assistant.FOLLOW_UP_PROMPT,
+                               "cache_control": {"type": "ephemeral"}}]
+    assert body["tools"] == [{"type": "web_search_20260209", "name": "web_search", "max_uses": 3}]
+    assert answer.text == "Aluminium." and answer.used_web is False
+
+
 def test_bom_from_a_piped_powershell_line_is_stripped_under_cp1252() -> None:
     assert assistant.clean(b"\xef\xbb\xbf/quit".decode("cp1252")) == "/quit"
 

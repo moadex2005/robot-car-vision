@@ -40,7 +40,7 @@ CONFIG = {
 }
 
 STATUS_KEYS = {"source", "connected", "fps", "device", "recognition", "notes",
-               "people", "objects", "reactions"}
+               "people", "objects", "reactions", "phone_url"}
 
 PERSON = Detection("person", 0.9, (100, 60, 260, 300), 1)
 CHAIRS = [Detection("chair", 0.8, (400, 200, 500, 340), 2), Detection("chair", 0.7, (520, 200, 600, 340), 3)]
@@ -216,6 +216,7 @@ def test_status_has_every_key_and_is_json_serialisable(make):
     assert STATUS_KEYS <= set(status)
     assert json.loads(json.dumps(status)) == status
     assert status["source"] == "file"
+    assert status["phone_url"] == "http://192.168.0.2:8080/video"      # from the settings
     assert status["connected"] is True
     assert status["device"] == "cpu"
     assert status["recognition"] is True
@@ -601,6 +602,232 @@ def test_status_leaves_out_old_sightings_while_the_stream_is_down(make, monkeypa
     assert wait_until(lambda: not pipeline.status()["objects"])
     status = pipeline.status()
     assert status["people"] == [] and status["reactions"] == []
+
+
+# ---- use_phone(): switching to another phone while the loop runs ----------------------------
+
+PHONE = "http://192.168.1.7:8080/video"
+
+
+def phone_source(frames=3, size=(320, 240), value=200, connected=True):
+    """A fake phone with its own picture size and colour, so its frames can be told apart."""
+    width, height = size
+    source = FakeSource(frames=frames, picture=np.full((height, width, 3), value, np.uint8))
+    source.source = "phone"
+    source.connected = connected
+    return source
+
+
+class SourceFactory:
+    """Stands in for FrameSource: hands out prepared fakes in order and keeps the settings."""
+
+    def __init__(self, *sources):
+        self.sources = list(sources)
+        self.settings = []
+
+    def __call__(self, settings):
+        self.settings.append(settings)
+        return self.sources.pop(0)
+
+
+def test_use_phone_uses_the_new_source_and_stops_the_old_one(make):
+    old, new = FakeSource(frames=3), phone_source()
+    factory = SourceFactory(new)
+    pipeline = make(source=old, source_factory=factory).start()
+    assert wait_until(lambda: pipeline.latest_jpeg() is not None)
+    pipeline.use_phone(PHONE)
+    assert factory.settings == [{**CONFIG["stream"], "source": "phone", "phone_url": PHONE}]
+    assert new.started
+    assert wait_until(lambda: old.stopped)
+    # Frames from the new source reach the state and the view.
+    assert wait_until(lambda: pipeline.state.snapshot().frame_size == (320, 240))
+    assert wait_until(lambda: pipeline.target(track_id=2) is not None)
+    assert np.abs(photo_of(pipeline.target(track_id=2)).astype(int) - 200).max() <= 3
+    status = pipeline.status()
+    assert (status["source"], status["phone_url"], status["connected"]) == ("phone", PHONE, True)
+    assert not new.stopped
+
+
+def test_use_phone_clears_the_view_and_the_old_sightings_at_once(make):
+    new = phone_source(frames=0, connected=False)          # a phone that sends nothing yet
+    pipeline = started(make, source=FakeSource(frames=3), source_factory=SourceFactory(new))
+    assert pipeline.target(track_id=2) is not None
+    assert wait_until(lambda: pipeline.status()["objects"])
+    pipeline.use_phone(PHONE)
+    assert pipeline.target(track_id=2) is None              # a click cannot hit the old camera's picture
+    assert pipeline.target(x=0.5, y=0.5) is None
+    status = pipeline.status()
+    assert status["objects"] == status["people"] == status["reactions"] == []
+    assert status["connected"] is False and status["error"] is None
+    assert wait_until(lambda: pipeline._lost_line == "Connecting to the phone ...")
+
+
+def test_use_phone_clears_what_the_assistant_is_told_at_once(make):
+    new = phone_source(frames=0, connected=False)
+    pipeline = started(make, source=FakeSource(frames=3), source_factory=SourceFactory(new))
+    assert wait_until(lambda: pipeline.state.current_people() == ["Sara Ahmed"])
+    pipeline.use_phone(PHONE)
+    snapshot = pipeline.state.snapshot()
+    assert snapshot.detections == () and snapshot.faces == ()
+    assert pipeline.state.current_people() == []          # no "I see Sara" about a camera that is gone
+    assert snapshot.frame_size == (640, 360)              # the size is left as it was
+
+
+def test_while_switching_the_picture_is_plain_dark_with_the_connecting_line(make):
+    new = phone_source(frames=0, connected=False)
+    pipeline = started(make, source=FakeSource(frames=3), source_factory=SourceFactory(new))
+    old_jpeg = pipeline.latest_jpeg()
+    old = decoded(old_jpeg)
+    pipeline.use_phone(PHONE)
+
+    def dark_below_the_line():
+        picture = decoded(pipeline.latest_jpeg())
+        return np.abs(picture[60:] - pipeline_module.DARK_LEVEL).max() <= 4   # no boxes, nothing of the old camera
+
+    assert wait_until(dark_below_the_line)
+    assert pipeline._lost_line == "Connecting to the phone ..."
+    picture = decoded(pipeline.latest_jpeg())
+    assert picture.shape == old.shape                     # the same size as before
+    assert np.abs(picture[:40] - pipeline_module.DARK_LEVEL).max() > 100    # the line is written on it
+    time.sleep(0.05)
+    assert dark_below_the_line()                          # and the old picture does not come back
+
+
+def test_status_never_shows_a_login_from_the_settings(make):
+    config = {**CONFIG, "stream": {**CONFIG["stream"], "phone_url": "http://me:secret@192.168.0.2:8080/video"}}
+    pipeline = make(config=config)
+    assert pipeline.status()["phone_url"] == "http://192.168.0.2:8080/video"
+
+
+class GateDetector(FakeDetector):
+    """Holds its second frame until the test lets it go."""
+
+    def __init__(self):
+        super().__init__()
+        self.holding = threading.Event()
+        self.go_on = threading.Event()
+
+    def detect(self, frame):
+        if self.calls == 1:
+            self.holding.set()
+            assert self.go_on.wait(5)
+        return super().detect(frame)
+
+
+def test_a_frame_of_the_old_camera_still_being_worked_on_is_dropped(make):
+    detector = GateDetector()
+    new = phone_source(frames=0, connected=False)
+    pipeline = make(source=FakeSource(frames=2), detector=detector, source_factory=SourceFactory(new)).start()
+    assert detector.holding.wait(3)                         # frame 2 of the old camera is in the models
+    pipeline.use_phone(PHONE)
+    detector.go_on.set()
+    assert wait_until(lambda: detector.calls == 2)
+    time.sleep(0.05)
+    assert pipeline.target(track_id=2) is None
+    assert pipeline.status()["objects"] == []
+
+
+def test_the_loop_starts_again_after_ten_failures(make):
+    detector = FakeDetector(fail_on=set(range(1, 11)))      # the first ten frames fail, then all is well
+    pipeline = make(source=FakeSource(frames=50), detector=detector,
+                    source_factory=SourceFactory(phone_source(frames=3))).start()
+    assert wait_until(lambda: pipeline.status()["error"] is not None)
+    time.sleep(0.05)
+    assert detector.calls == 10
+    pipeline.use_phone(PHONE)
+    assert pipeline.status()["error"] is None
+    assert wait_until(lambda: pipeline.target(track_id=2) is not None)
+    assert pipeline.status()["connected"] is True
+    assert pipeline.state.snapshot().frame_size == (320, 240)
+
+
+def test_the_loop_goes_on_with_a_phone_after_a_clip_finished(make):
+    clip = FakeSource(frames=2)
+    pipeline = started(make, source=clip, source_factory=SourceFactory(phone_source(frames=3)))
+    clip.connected, clip.ended = False, True
+    assert wait_until(lambda: pipeline._lost_line == pipeline_module.CLIP_FINISHED)
+    pipeline.use_phone(PHONE)
+    assert wait_until(lambda: pipeline.state.snapshot().frame_size == (320, 240))
+    assert pipeline.status()["ended"] is False
+
+
+class SlowToStopSource(FakeSource):
+    """stop() hangs like a FrameSource whose reader waits on a phone that is gone."""
+
+    def __init__(self):
+        super().__init__(frames=3)
+        self.stopping = threading.Event()
+        self.may_stop = threading.Event()
+
+    def stop(self):
+        self.stopping.set()
+        self.may_stop.wait(5)
+        super().stop()
+
+
+def test_use_phone_does_not_wait_for_the_old_camera_to_stop(make):
+    old = SlowToStopSource()
+    pipeline = started(make, source=old, source_factory=SourceFactory(phone_source()))
+    try:
+        began = time.monotonic()
+        pipeline.use_phone(PHONE)
+        assert time.monotonic() - began < 0.5
+        assert old.stopping.wait(2)                         # the old one is stopping ...
+        began = time.monotonic()
+        pipeline.status()                                   # ... and the lock is free meanwhile
+        pipeline.latest_jpeg()
+        pipeline.target(x=0.5, y=0.5)
+        assert time.monotonic() - began < 0.5
+        assert wait_until(lambda: pipeline.state.snapshot().frame_size == (320, 240))   # the new one runs
+        assert not old.stopped
+    finally:
+        old.may_stop.set()
+    assert wait_until(lambda: old.stopped)
+
+
+def test_switches_at_the_same_time_are_safe_and_the_last_one_wins(make):
+    phones = [phone_source(frames=3) for _ in range(6)]
+    factory = SourceFactory(*phones)
+    old = FakeSource(frames=1000)
+    pipeline = started(make, source=old, source_factory=factory)
+    addresses = [f"http://192.168.1.{n}:8080/video" for n in range(10, 16)]
+    threads = [threading.Thread(target=pipeline.use_phone, args=(address,)) for address in addresses]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+    last = phones[-1]                                       # the factory is called one switch at a time
+    assert pipeline.status()["phone_url"] == factory.settings[-1]["phone_url"]
+    assert wait_until(lambda: old.stopped and all(phone.stopped for phone in phones[:-1]))
+    assert last.started and not last.stopped
+    assert wait_until(lambda: pipeline.state.snapshot().frame_size == (320, 240))
+
+
+def test_use_phone_before_start_starts_nothing_until_start(make):
+    old, new = FakeSource(), phone_source()
+    pipeline = make(source=old, source_factory=SourceFactory(new))
+    pipeline.use_phone(PHONE)
+    assert not new.started and not old.started
+    pipeline.start()
+    assert new.started and not old.started
+    assert wait_until(lambda: pipeline.state.snapshot().frame_size == (320, 240))
+
+
+def test_use_phone_after_stop_starts_nothing(make):
+    new = phone_source()
+    pipeline = started(make, source=FakeSource(frames=3), source_factory=SourceFactory(new))
+    pipeline.stop()
+    pipeline.use_phone(PHONE)
+    assert not new.started
+    assert pipeline.status()["phone_url"] == PHONE
+
+
+def test_without_a_factory_the_phone_source_is_a_frame_source(make, monkeypatch):
+    built = []
+    monkeypatch.setattr(pipeline_module, "FrameSource", lambda settings: built.append(settings) or phone_source())
+    pipeline = make(source=FakeSource(frames=1))
+    pipeline.use_phone(PHONE)
+    assert built == [{**CONFIG["stream"], "source": "phone", "phone_url": PHONE}]
 
 
 # ---- start-up ---------------------------------------------------------------------------

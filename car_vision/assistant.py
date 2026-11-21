@@ -461,6 +461,87 @@ def fallback_name(label: str | None) -> str:
     return words[:1].upper() + words[1:] if words else UNKNOWN_OBJECT
 
 
+def info_text(info: ObjectInfo) -> str:
+    """A description written back in the NAME / ABOUT / SPECS shape that
+    parse_object_info reads. Line breaks in the summary become spaces."""
+    lines = [f"NAME: {info.name}", f"ABOUT: {' '.join(info.summary.split())}", "SPECS:"]
+    lines += [f"- {name}: {value}" for name, value in info.specs]
+    return "\n".join(lines)
+
+
+# ---- asking more about one object --------------------------------------------
+
+
+FOLLOW_UP_PROMPT = """\
+You answer a visitor's questions about one thing at a live demo of a student robot \
+car project. A phone on the car streams its camera to a laptop, which detects \
+objects. The visitor clicked something in the video. The first message holds a small \
+cut-out of the camera picture around it and what the object detector thought it was. \
+When the thing was already described, that description follows as your earlier answer.
+
+How to answer:
+- Answer the visitor's question about the thing in the middle of the picture in two \
+or three sentences of plain text. Do not use the NAME, ABOUT and SPECS shape.
+- Use the picture and the description. The object detector's label is a hint, not the truth.
+- When the answer needs facts you do not have, search the web if the web search tool \
+is available to you.
+- Never invent facts. If you do not know, say so.
+- If the thing in the middle is a person, say nothing about who they are or how they look.
+- Say nothing about any people elsewhere in the picture.
+- Answer in English.
+"""
+
+MAX_FOLLOW_UPS = 10      # earlier question-answer pairs one follow-up may carry
+
+
+def check_question(question: Any) -> str:
+    """The typed question, cleaned, or ValueError when it is empty or too long."""
+    if not isinstance(question, str):
+        raise ValueError("The question must be text.")
+    text = clean(question)
+    if not text:
+        raise ValueError("The question is empty.")
+    if len(text) > MAX_QUESTION_CHARS:
+        raise ValueError(f"The question is too long ({len(text)} characters). "
+                         f"Please keep it under {MAX_QUESTION_CHARS} characters.")
+    return text
+
+
+def check_earlier(earlier: Sequence[tuple[str, str]]) -> list[tuple[str, str]]:
+    """The earlier (question, answer) pairs, or ValueError when there are too
+    many or one is not a pair of non-empty texts."""
+    pairs = list(earlier)
+    if len(pairs) > MAX_FOLLOW_UPS:
+        raise ValueError(f"At most {MAX_FOLLOW_UPS} earlier questions can go along, got {len(pairs)}.")
+    for pair in pairs:
+        if not isinstance(pair, (tuple, list)) or len(pair) != 2 or not all(isinstance(text, str) and text.strip() for text in pair):
+            raise ValueError("Each earlier question and answer must be a pair of texts.")
+    return [(question, answer) for question, answer in pairs]
+
+
+def follow_up_turns(picture: bytes, label_sentence: str, info: ObjectInfo | None,
+                    earlier: list[tuple[str, str]], question: str) -> list[Turn]:
+    """The whole conversation for one follow-up, as plain text turns after the picture."""
+    turns = [user_turn(label_sentence, picture)]
+    if info is not None:
+        turns.append({"role": "assistant", "content": info_text(info)})
+    for asked, answered in earlier:
+        add_user_text(turns, asked)
+        turns.append({"role": "assistant", "content": answered})
+    add_user_text(turns, question)
+    return turns
+
+
+def add_user_text(turns: list[Turn], text: str) -> None:
+    """Add a user turn. Right after the picture turn (no description), the text
+    joins that turn instead: the API reference warns that two user turns in a
+    row may be refused."""
+    if turns[-1]["role"] == "user":
+        turns[-1]["content"].append({"type": "text", "text": text})   # the picture turn's list
+    else:
+        turns.append({"role": "user", "content": text})
+
+
 # ---- the assistant -----------------------------------------------------------
 
 
@@ -470,8 +551,8 @@ BUSY_MESSAGE = "The assistant is still busy with the previous question. Please w
 class Assistant:
     """Keeps one conversation and asks the client one question at a time.
 
-    `describe` runs beside the chat with its own lock, so a slow look-up does
-    not hold up a question.
+    `describe` and `follow_up` run beside the chat with their own lock, so a
+    slow look-up does not hold up a question.
     """
 
     def __init__(
@@ -503,18 +584,13 @@ class Assistant:
         self._state = state
         self._client: LLMClient = client if client is not None else AnthropicClient(settings)
         self._lock = threading.Lock()              # the chat
-        self._describe_lock = threading.Lock()     # describe, so it never waits for the chat
+        self._describe_lock = threading.Lock()     # describe and follow_up: never wait for the chat
         self._history: list[Turn] = []
         self._exchanges = 0      # question-answer pairs in the current conversation
 
     def ask(self, question: str) -> Answer:
         """Answer one question. Waits a while if another question is still being answered."""
-        text = clean(question)
-        if not text:
-            raise ValueError("The question is empty.")
-        if len(text) > MAX_QUESTION_CHARS:
-            raise ValueError(f"The question is too long ({len(text)} characters). "
-                             f"Please keep it under {MAX_QUESTION_CHARS} characters.")
+        text = check_question(question)
         self._acquire()
         try:
             # The history is only ever added to. Once it holds history_turns
@@ -547,17 +623,34 @@ class Assistant:
 
         One call with no memory: the chat history is neither sent nor changed.
         """
-        picture = check_image(image)
-        text = label_text(label)
-        if not self._describe_lock.acquire(timeout=DESCRIBE_WAIT_SECONDS):
-            raise AssistantError(DESCRIBE_BUSY_MESSAGE)
-        try:
-            reply = self._client.complete(DESCRIBE_PROMPT, [user_turn(text, picture)], self.web_search)
-        finally:
-            self._describe_lock.release()
+        turns = [user_turn(label_text(label), check_image(image))]
+        reply = self._look_up(DESCRIBE_PROMPT, turns)
         name, summary, specs = parse_object_info(reply.text, label)
         return ObjectInfo(name=name, summary=summary, specs=specs,
                           used_web=reply.used_web, sources=unique(reply.sources))
+
+    def follow_up(self, image: bytes, label: str | None, info: ObjectInfo | None,
+                  earlier: Sequence[tuple[str, str]], question: str) -> Answer:
+        """Answer one more question about a clicked thing.
+
+        The whole short conversation is sent again on every call, as plain text:
+        the picture, the description (`info`, None when there is none), the
+        earlier (question, answer) pairs and the new question. Nothing is kept,
+        and the chat history is neither sent nor changed.
+        """
+        turns = follow_up_turns(check_image(image), label_text(label), info,
+                                check_earlier(earlier), check_question(question))
+        reply = self._look_up(FOLLOW_UP_PROMPT, turns)
+        return Answer(text=reply.text, used_web=reply.used_web, sources=unique(reply.sources))
+
+    def _look_up(self, system: str, turns: list[Turn]) -> LLMReply:
+        """One call for describe or follow_up, under their shared lock."""
+        if not self._describe_lock.acquire(timeout=DESCRIBE_WAIT_SECONDS):
+            raise AssistantError(DESCRIBE_BUSY_MESSAGE)
+        try:
+            return self._client.complete(system, turns, self.web_search)
+        finally:
+            self._describe_lock.release()
 
     def _acquire(self) -> None:
         if not self._lock.acquire(timeout=LOCK_WAIT_SECONDS):

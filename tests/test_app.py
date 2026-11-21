@@ -7,21 +7,24 @@ port is opened.
 
 import ast
 import base64
+import json
 import logging
 import re
 import socket
 import threading
 import time
 from dataclasses import dataclass
+from html.parser import HTMLParser
 from pathlib import Path
 
 import cv2
 import numpy as np
 import pytest
 from car_vision import app as app_module
+from car_vision import phone as phone_module
 from car_vision.app import (AnswerCache, Inspection, InspectionStore, UnavailableAssistant, create_app,
                             jpeg_part, main, mjpeg_stream)
-from car_vision.assistant import Answer, AssistantError
+from car_vision.assistant import Answer, AssistantError, ObjectInfo
 from car_vision.config import ConfigError
 from car_vision.faces import Person
 from car_vision.pipeline import Target
@@ -79,9 +82,13 @@ class FakePipeline:
         self.jpeg = jpeg
         self.target_result = target
         self.clicks = []
+        self.phones = []                    # every address use_phone() was given
         self.started = False
         self.stopped = False
         FakePipeline.instances.append(self)
+
+    def use_phone(self, url):
+        self.phones.append(url)
 
     def target(self, x=None, y=None, track_id=None, label=None):
         self.clicks.append({"x": x, "y": y, "track_id": track_id, "label": label})
@@ -104,15 +111,25 @@ class FakePipeline:
 
 
 class FakeAssistant:
-    def __init__(self, answer=WEB_ANSWER, error=None, reset_error=None, info=LAPTOP_INFO, describe_error=None):
+    def __init__(self, answer=WEB_ANSWER, error=None, reset_error=None, info=LAPTOP_INFO, describe_error=None,
+                 follow_up_errors=()):
         self.answer = answer
         self.error = error
         self.reset_error = reset_error
         self.info = info
         self.describe_error = describe_error
+        self.follow_up_errors = list(follow_up_errors)   # raised one per call, None for a good answer
         self.questions = []
         self.looked_up = []                 # (image, label) of every describe call
+        self.follow_ups = []                # (image, label, info, earlier, question) of every follow_up call
         self.resets = 0
+
+    def follow_up(self, image, label, info, earlier, question):
+        self.follow_ups.append((image, label, info, earlier, question))
+        error = self.follow_up_errors.pop(0) if self.follow_up_errors else None
+        if error is not None:
+            raise error
+        return Answer(f"Answer {len(self.follow_ups)}", used_web=True, sources=("https://example.org/w",))
 
     def describe(self, image, label=None):
         self.looked_up.append((image, label))
@@ -252,7 +269,8 @@ def test_page_works_and_ask_explains_when_the_assistant_could_not_be_built():
 def test_only_the_listed_methods_are_accepted_and_the_answer_is_json():
     client = client_for()
     for method, path in (("get", "/api/ask"), ("post", "/api/status"), ("get", "/api/inspect"),
-                         ("get", "/api/describe"), ("get", "/api/reset")):
+                         ("get", "/api/describe"), ("get", "/api/reset"), ("get", "/api/follow_up"),
+                         ("get", "/api/camera")):
         response = getattr(client, method)(path)
         assert response.status_code == 405
         assert response.is_json and isinstance(response.get_json()["error"], str)
@@ -564,6 +582,284 @@ def test_the_server_logs_no_photo_and_no_person_details(caplog):
         assert private not in text
 
 
+# ---- /api/follow_up ----------------------------------------------------------------------
+
+STORED_LAPTOP_INFO = ObjectInfo("Laptop", "A portable computer.", (("Screen", "15.6 in"), ("Weight", "about 2 kg")),
+                                used_web=True, sources=("https://example.org/laptop",))
+
+
+def ask_more(client, inspection_id, question="How heavy is it?"):
+    return client.post("/api/follow_up", json={"id": inspection_id, "question": question})
+
+
+def test_follow_up_about_an_object_sends_the_stored_photo_label_and_description():
+    assistant = FakeAssistant()
+    client = client_for(assistant)
+    inspection, _described = inspect_then_describe(client)
+    response = ask_more(client, inspection["id"], "  How heavy is it?  ")
+    assert response.status_code == 200
+    assert response.get_json() == {"text": "Answer 1", "used_web": True, "sources": ["https://example.org/w"]}
+    assert assistant.follow_ups == [(PHOTO, "laptop", STORED_LAPTOP_INFO, (), "How heavy is it?")]
+
+
+def test_follow_up_sends_the_earlier_questions_and_answers():
+    assistant = FakeAssistant()
+    client = client_for(assistant)
+    inspection, _described = inspect_then_describe(client)
+    ask_more(client, inspection["id"], "How heavy is it?")
+    ask_more(client, inspection["id"], "And the battery?")
+    assert assistant.follow_ups[1] == (PHOTO, "laptop", STORED_LAPTOP_INFO,
+                                       (("How heavy is it?", "Answer 1"),), "And the battery?")
+
+
+def test_follow_up_uses_the_description_from_the_cache():
+    assistant = FakeAssistant()
+    client = client_for(assistant)
+    inspect_then_describe(client)
+    second = client.post("/api/inspect", json={"track_id": 7, "label": "laptop"}).get_json()
+    assert second["info"] is not None                       # shown at once, no /api/describe call
+    ask_more(client, second["id"])
+    assert assistant.follow_ups[0][2] == STORED_LAPTOP_INFO
+    assert len(assistant.looked_up) == 1
+
+
+def test_follow_up_after_describe_answered_from_the_cache_has_the_description():
+    assistant = FakeAssistant()
+    client = client_for(assistant)
+    inspect_then_describe(client)
+    _second, described = inspect_then_describe(client)       # /api/describe answers from the cache
+    assert described.get_json()["name"] == "Laptop"
+    ask_more(client, _second["id"])
+    assert assistant.follow_ups[0][2] == STORED_LAPTOP_INFO
+
+
+def test_follow_up_after_a_failed_description_sends_no_description():
+    assistant = FakeAssistant(describe_error=AssistantError("No internet."))
+    client = client_for(assistant)
+    inspection, _described = inspect_then_describe(client)
+    assert ask_more(client, inspection["id"]).status_code == 200
+    assert assistant.follow_ups[0][2] is None
+
+
+def test_follow_up_about_an_area_sends_no_label():
+    assistant = FakeAssistant(info=FakeInfo("Plant", "A green plant."))
+    client = client_for(assistant, FakePipeline(target=AREA))
+    inspection, _described = inspect_then_describe(client)
+    ask_more(client, inspection["id"])
+    image, label, info, earlier, _question = assistant.follow_ups[0]
+    assert (image, label, info.name, earlier) == (PHOTO, None, "Plant", ())
+
+
+def test_follow_up_about_a_recognised_person_goes_to_ask_with_a_naming_sentence():
+    assistant = FakeAssistant()
+    client = client_for(assistant, FakePipeline(target=SARA_TARGET))
+    inspection = client.post("/api/inspect", json={"x": 0.2, "y": 0.3}).get_json()
+    response = ask_more(client, inspection["id"], "What did she build?")
+    assert response.status_code == 200
+    assert response.get_json()["text"] == "Rover follows a black line."
+    assert assistant.questions == ["This question is about Sara Ahmed, who the camera recognises. "
+                                   "What did she build?"]
+    assert assistant.follow_ups == [] and assistant.looked_up == []        # no picture of her anywhere
+
+
+def test_follow_up_about_a_recognised_person_keeps_the_conversation_for_the_limit():
+    assistant = FakeAssistant()
+    client = client_for(assistant, FakePipeline(target=SARA_TARGET))
+    inspection = client.post("/api/inspect", json={"x": 0.2, "y": 0.3}).get_json()
+    for n in range(10):
+        assert ask_more(client, inspection["id"], f"Question {n}").status_code == 200
+    assert ask_more(client, inspection["id"]).status_code == 400
+    assert len(assistant.questions) == 10
+
+
+def test_a_person_question_is_checked_with_the_naming_sentence_added():
+    assistant = FakeAssistant()
+    client = client_for(assistant, FakePipeline(target=SARA_TARGET))
+    inspection = client.post("/api/inspect", json={"x": 0.2, "y": 0.3}).get_json()
+    sentence = "This question is about Sara Ahmed, who the camera recognises. "
+    limit = 2000 - len(sentence)
+    too_long = ask_more(client, inspection["id"], "a" * (limit + 1))
+    assert too_long.status_code == 400
+    assert too_long.get_json() == {"error": f"The question is too long ({limit + 1} characters). "
+                                            f"Questions about a person can have at most {limit} characters."}
+    assert assistant.questions == []                        # refused before the assistant saw it
+    assert ask_more(client, inspection["id"], "a" * limit).status_code == 200
+    assert len(assistant.questions[0]) == 2000
+
+
+def test_an_unrecognised_person_has_no_follow_up():
+    assistant = FakeAssistant()
+    client = client_for(assistant, FakePipeline(target=STRANGER))
+    inspection = client.post("/api/inspect", json={"x": 0.2, "y": 0.3}).get_json()
+    response = ask_more(client, inspection["id"])
+    assert response.status_code == 400
+    assert response.get_json() == {"error": app_module.UNKNOWN_PERSON}
+    assert assistant.questions == [] and assistant.follow_ups == []
+
+
+@pytest.mark.parametrize("question, message", [("", "empty"), ("   ", "empty"), ("a" * 2001, "too long")])
+def test_follow_up_with_an_empty_or_over_long_question_is_400(question, message):
+    assistant = FakeAssistant()
+    client = client_for(assistant)
+    inspection, _described = inspect_then_describe(client)
+    response = ask_more(client, inspection["id"], question)
+    assert response.status_code == 400
+    assert message in response.get_json()["error"]
+    assert assistant.follow_ups == []
+    assert ask_more(client, inspection["id"], "a" * 2000).status_code == 200
+
+
+def test_follow_up_with_an_unknown_id_is_404():
+    assistant = FakeAssistant()
+    response = ask_more(client_for(assistant), "not-a-real-id")
+    assert response.status_code == 404
+    assert "click" in response.get_json()["error"]
+    assert assistant.follow_ups == []
+
+
+@pytest.mark.parametrize("body, content_type", [
+    ("id=x&question=y", "application/x-www-form-urlencoded"),
+    ("not json", "application/json"),
+    ('["x", "y"]', "application/json"),
+    ('{"question": "How heavy?"}', "application/json"),
+    ('{"id": "x"}', "application/json"),
+    ('{"id": 5, "question": "How heavy?"}', "application/json"),
+    ('{"id": "x", "question": 42}', "application/json"),
+])
+def test_follow_up_with_a_bad_body_is_400(body, content_type):
+    assistant = FakeAssistant()
+    response = client_for(assistant).post("/api/follow_up", data=body, content_type=content_type)
+    assert response.status_code == 400
+    assert isinstance(response.get_json()["error"], str)
+    assert assistant.follow_ups == []
+
+
+def test_follow_up_allows_ten_questions_then_400():
+    assistant = FakeAssistant()
+    client = client_for(assistant)
+    inspection, _described = inspect_then_describe(client)
+    for n in range(10):
+        assert ask_more(client, inspection["id"], f"Question {n}").status_code == 200
+    response = ask_more(client, inspection["id"], "One more?")
+    assert response.status_code == 400
+    assert response.get_json() == {"error": app_module.TOO_MANY_FOLLOW_UPS}
+    assert len(assistant.follow_ups) == 10
+    assert len(assistant.follow_ups[-1][3]) == 9                # the tenth carried the nine before it
+
+
+@pytest.mark.parametrize("error, status", [(AssistantError("The assistant is still busy."), 200),
+                                           (ValueError("The question is too long."), 400),
+                                           (KeyError("secret detail"), 500)])
+def test_a_failed_follow_up_is_not_added_to_the_conversation(error, status):
+    assistant = FakeAssistant(follow_up_errors=[None, error, None])
+    client = client_for(assistant)
+    inspection, _described = inspect_then_describe(client)
+    ask_more(client, inspection["id"], "First?")
+    failed = ask_more(client, inspection["id"], "Second?")
+    assert failed.status_code == status
+    assert isinstance(failed.get_json()["error"], str) and "secret detail" not in failed.get_json()["error"]
+    ask_more(client, inspection["id"], "Third?")
+    assert assistant.follow_ups[2][3] == (("First?", "Answer 1"),)   # "Second?" is not in it
+
+
+def test_follow_up_explains_when_the_assistant_could_not_be_built():
+    client = client_for(UnavailableAssistant("The assistant is not available: no notes file"))
+    inspection, _described = inspect_then_describe(client)
+    response = ask_more(client, inspection["id"])
+    assert response.status_code == 200
+    assert "no notes file" in response.get_json()["error"]
+
+
+def test_follow_up_logs_no_person_details(caplog):
+    caplog.set_level(logging.DEBUG)
+    client = client_for(FakeAssistant(), FakePipeline(target=SARA_TARGET))
+    inspection = client.post("/api/inspect", json={"x": 0.2, "y": 0.3}).get_json()
+    ask_more(client, inspection["id"], "What did she build?")
+    assert "Sara" not in caplog.text and "Team lead" not in caplog.text
+
+
+def test_inspection_store_keeps_the_description_and_the_pairs():
+    store = InspectionStore()
+    inspection_id = store.add(Inspection("object", "laptop", 7, PHOTO))
+    store.set_info(inspection_id, STORED_LAPTOP_INFO)
+    store.add_pair(inspection_id, "How heavy?", "About 2 kg.")
+    kept = store.get(inspection_id)
+    assert (kept.info, kept.pairs) == (STORED_LAPTOP_INFO, (("How heavy?", "About 2 kg."),))
+    store.set_info("made-up", STORED_LAPTOP_INFO)               # an expired id changes nothing
+    store.add_pair("made-up", "a", "b")
+    assert store.get("made-up") is None
+
+
+# ---- /api/camera -------------------------------------------------------------------------
+
+
+def camera_client(tmp_path, pipeline=None):
+    pipeline = pipeline or FakePipeline()
+    app = create_app(pipeline, FakeAssistant(), camera_file=tmp_path / "data" / "camera.json")
+    app.testing = True
+    return app.test_client(), pipeline, tmp_path / "data" / "camera.json"
+
+
+def test_camera_switches_to_the_phone_and_remembers_the_address(tmp_path):
+    client, pipeline, camera_file = camera_client(tmp_path)
+    response = client.post("/api/camera", json={"address": "  192.168.1.7:8080 "})
+    assert response.status_code == 200
+    assert response.get_json() == {"ok": True, "url": "http://192.168.1.7:8080/video"}
+    assert pipeline.phones == ["http://192.168.1.7:8080/video"]
+    assert json.loads(camera_file.read_text(encoding="utf-8")) == {"phone_url": "http://192.168.1.7:8080/video"}
+
+
+@pytest.mark.parametrize("address, message", [
+    ("", phone_module.EMPTY),
+    ("phone.local", phone_module.NOT_IPV4),
+    ("::1", phone_module.NOT_IPV4),
+    ("8.8.8.8", phone_module.NOT_LOCAL),
+    ("192.168.1.7:70000", phone_module.BAD_PORT),
+    ("https://192.168.1.7:8080", phone_module.NO_HTTPS),
+    ("http://me:pw@192.168.1.7:8080", phone_module.NO_LOGIN),
+    ("192.168.1.7:8080/shot.jpg", phone_module.BAD_PATH),
+])
+def test_camera_with_a_bad_address_is_400_with_its_message(tmp_path, address, message):
+    client, pipeline, camera_file = camera_client(tmp_path)
+    response = client.post("/api/camera", json={"address": address})
+    assert response.status_code == 400
+    assert response.get_json() == {"error": message}
+    assert pipeline.phones == [] and not camera_file.exists()
+
+
+@pytest.mark.parametrize("body, content_type", [
+    ("address=192.168.1.7", "application/x-www-form-urlencoded"),
+    ("not json", "application/json"),
+    ('["192.168.1.7"]', "application/json"),
+    ('{"url": "192.168.1.7"}', "application/json"),
+    ('{"address": 192}', "application/json"),
+    ('{"address": null}', "application/json"),
+])
+def test_camera_with_a_body_that_is_not_a_json_address_is_400(tmp_path, body, content_type):
+    client, pipeline, camera_file = camera_client(tmp_path)
+    response = client.post("/api/camera", data=body, content_type=content_type)
+    assert response.status_code == 400
+    assert isinstance(response.get_json()["error"], str)
+    assert pipeline.phones == [] and not camera_file.exists()
+
+
+def test_camera_without_a_file_switches_but_remembers_nothing():
+    pipeline = FakePipeline()
+    response = client_for(pipeline=pipeline).post("/api/camera", json={"address": "10.0.0.5"})
+    assert response.get_json() == {"ok": True, "url": "http://10.0.0.5:8080/video"}
+    assert pipeline.phones == ["http://10.0.0.5:8080/video"]
+
+
+def test_camera_still_switches_when_the_address_cannot_be_written(tmp_path):
+    pipeline = FakePipeline()
+    folder = tmp_path / "camera.json"
+    folder.mkdir()                                           # a folder where the file should go
+    app = create_app(pipeline, FakeAssistant(), camera_file=folder)
+    response = app.test_client().post("/api/camera", json={"address": "192.168.1.7"})
+    assert response.status_code == 200 and response.get_json()["ok"] is True
+    assert pipeline.phones == ["http://192.168.1.7:8080/video"]
+
+
 # ---- the stores behind the two routes --------------------------------------------------
 
 
@@ -747,6 +1043,7 @@ def fake_main(monkeypatch, tmp_path):
         return FakeAssistant()
 
     monkeypatch.setattr(app_module, "load_config", lambda: config)
+    monkeypatch.setattr(app_module, "CAMERA_FILE", str(tmp_path / "camera.json"))   # never the real one
     monkeypatch.setattr(app_module, "already_serving", lambda host, port: False)   # 5000 may really be in use
     monkeypatch.setattr(app_module, "Pipeline", FakePipeline)
     monkeypatch.setattr(app_module, "Assistant", fake_assistant)
@@ -757,7 +1054,8 @@ def fake_main(monkeypatch, tmp_path):
     root = logging.getLogger()
     handlers, level = list(root.handlers), root.level
     werkzeug_level = logging.getLogger("werkzeug").level
-    yield {"calls": calls, "options": options, "log_file": tmp_path / "logs" / "app.log"}
+    yield {"calls": calls, "options": options, "log_file": tmp_path / "logs" / "app.log",
+           "camera_file": tmp_path / "camera.json"}
     for handler in list(root.handlers):
         if handler not in handlers:
             root.removeHandler(handler)
@@ -796,6 +1094,59 @@ def test_file_argument_implies_file_source_and_overrides_the_path(fake_main):
     assert stream["source"] == "file"
     assert stream["file_path"] == "data/samples/people_clip.mp4"
     assert TEST_CONFIG["stream"]["file_path"] == "data/samples/car_clip.mp4"   # settings not changed
+
+
+@pytest.mark.parametrize("argv", [[], ["--source", "file"], ["--source", "phone"], ["--file", "clip.mp4"]])
+def test_a_remembered_phone_address_replaces_the_one_in_the_settings(fake_main, argv):
+    fake_main["camera_file"].write_text('{"phone_url": "http://192.168.1.9:4747/video"}', encoding="utf-8")
+    assert main(argv) == 0
+    stream = FakePipeline.instances[0].config["stream"]
+    assert stream["phone_url"] == "http://192.168.1.9:4747/video"
+    assert "phone_url" not in TEST_CONFIG["stream"]                         # settings not changed
+
+
+def test_without_a_remembered_address_the_settings_are_used(fake_main):
+    assert main([]) == 0
+    assert FakePipeline.instances[0].config["stream"] == TEST_CONFIG["stream"]
+
+
+def test_a_broken_remembered_file_is_ignored(fake_main):
+    fake_main["camera_file"].write_text("{broken", encoding="utf-8")
+    assert main([]) == 0
+    assert "phone_url" not in FakePipeline.instances[0].config["stream"]
+
+
+LOGIN_CONFIG = {"stream": {"source": "webcam", "phone_url": "http://me:secret@192.168.1.9:4747/video"}}
+
+
+@pytest.mark.parametrize("remembered, kept", [
+    ("http://192.168.1.9:4747/video", "http://me:secret@192.168.1.9:4747/video"),   # same phone: keep the login
+    ("http://192.168.1.9:8080/video", "http://192.168.1.9:8080/video"),             # another port: another phone
+    ("http://192.168.1.10:4747/video", "http://192.168.1.10:4747/video"),
+    (None, "http://me:secret@192.168.1.9:4747/video"),
+])
+def test_a_configured_login_is_kept_for_the_same_phone(remembered, kept):
+    config = app_module.with_remembered_phone(LOGIN_CONFIG, remembered)
+    assert config["stream"]["phone_url"] == kept
+    assert LOGIN_CONFIG["stream"]["phone_url"] == "http://me:secret@192.168.1.9:4747/video"   # not changed
+
+
+def test_main_keeps_the_configured_login_when_the_remembered_phone_is_the_same(fake_main, monkeypatch):
+    config = {**TEST_CONFIG, "stream": {**TEST_CONFIG["stream"], **LOGIN_CONFIG["stream"]},
+              "app": {**TEST_CONFIG["app"], "log_file": str(fake_main["log_file"])}}
+    monkeypatch.setattr(app_module, "load_config", lambda: config)
+    fake_main["camera_file"].write_text('{"phone_url": "http://192.168.1.9:4747/video"}', encoding="utf-8")
+    assert main([]) == 0
+    assert FakePipeline.instances[0].config["stream"]["phone_url"] == "http://me:secret@192.168.1.9:4747/video"
+
+
+def test_main_gives_the_page_the_camera_file(fake_main):
+    main([])
+    (app, _kwargs), = fake_main["calls"]["run"]
+    response = app.test_client().post("/api/camera", json={"address": "192.168.1.7:8080"})
+    assert response.status_code == 200
+    assert FakePipeline.instances[0].phones == ["http://192.168.1.7:8080/video"]
+    assert "192.168.1.7:8080" in fake_main["camera_file"].read_text(encoding="utf-8")
 
 
 def test_file_argument_cannot_be_combined_with_another_source():
@@ -960,6 +1311,128 @@ def test_template_measures_the_click_against_the_picture_not_the_element():
     page = TEMPLATE.read_text(encoding="utf-8")
     assert "naturalWidth" in page and "naturalHeight" in page and "getBoundingClientRect" in page
     assert "MAX_SOURCES = 3" in page and '" more"' in page
+
+
+VOID_TAGS = {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "source", "track", "wbr"}
+
+
+class IdTree(HTMLParser):
+    """For every element with an id, the ids of the elements around it."""
+
+    def __init__(self):
+        super().__init__()
+        self.open = []                      # (tag, id) of the elements not closed yet
+        self.around = {}
+
+    def handle_starttag(self, tag, attrs):
+        element_id = dict(attrs).get("id")
+        if element_id:
+            self.around[element_id] = [i for _tag, i in self.open if i]
+        if tag not in VOID_TAGS:
+            self.open.append((tag, element_id))
+
+    def handle_endtag(self, tag):
+        for index in range(len(self.open) - 1, -1, -1):
+            if self.open[index][0] == tag:
+                del self.open[index:]
+                return
+
+
+def ids_around(page):
+    tree = IdTree()
+    tree.feed(page)
+    return tree.around
+
+
+def rendered_page():
+    return client_for().get("/").get_data(as_text=True)
+
+
+def test_template_has_the_theme_button_and_sets_the_look_in_the_head():
+    page = rendered_page()
+    head = page[:page.index("<body")]
+    assert 'id="themeButton"' in page and 'aria-label="Switch to the dark look"' in page
+    script = head[head.index("<script>"):head.index("</script>")]
+    assert head.index("<script>") < head.index("<style>")          # set before anything is drawn
+    assert 'localStorage.getItem("theme")' in script and "try" in script and "catch" in script
+    assert "prefers-color-scheme: dark" in script and "dataset.theme" in script
+    assert ':root[data-theme="dark"]' in head and ':root[data-theme="light"]' in head
+    assert "window.localStorage.setItem(THEME_KEY, theme)" in page   # the choice is kept
+
+
+def test_template_theme_change_fades_only_colours():
+    page = TEMPLATE.read_text(encoding="utf-8")
+    fade = css_rule(page, ".theme-fade, .theme-fade *, .theme-fade *::before, .theme-fade *::after")
+    assert "background-color" in fade and "color" in fade
+    for line in page.splitlines():
+        if "transition" in line:
+            assert "filter" not in line and "blur" not in line, line     # never a blur animation
+
+
+def test_template_has_the_camera_box_and_the_delay_switch():
+    page = rendered_page()
+    assert 'id="cameraButton"' in page and 'aria-controls="cameraBox"' in page
+    assert 'id="cameraBox"' in page and '<label class="field-label" for="cameraAddress">Phone address</label>' in page
+    assert 'id="cameraConnect" type="submit">Connect</button>' in page
+    assert "The address IP Webcam shows on the phone's screen, like 192.168.1.7:8080." in page
+    assert 'id="cameraResult"' in page and '"Connecting ..."' in page and '"Connected"' in page
+    assert "No picture from " in page and "on the same Wi-Fi." in page and "CONNECT_WAIT_MS = 8000" in page
+    assert '"/api/camera"' in page
+    assert '<input type="checkbox" id="delaySwitch" role="switch">' in page and "Delay test" in page
+    assert "backdrop-filter: none" in css_rule(page, ".glass.camera-box")   # it may lie over the video
+
+
+def test_template_runs_the_clock_only_while_the_delay_test_is_on():
+    page = TEMPLATE.read_text(encoding="utf-8")
+    assert 'id="delay" hidden' in page                              # off by default
+    assert page.count("requestAnimationFrame(tickClock)") == 1      # the only loop, started by tickClock
+    assert "cancelAnimationFrame(clockRequest)" in page
+    assert "setInterval" not in page
+    assert "font-variant-numeric: tabular-nums" in css_rule(page, ".delay-clock")
+
+
+def test_template_full_screen_wraps_video_banners_pills_and_panel():
+    page = rendered_page()
+    around = ids_around(page)
+    for inside in ("video", "warning", "greetings", "things", "details", "followQuestion", "fullButton", "delay"):
+        assert "watch" in around[inside], inside
+    assert 'id="fullButton" type="button" aria-label="Full screen"' in page
+    assert "stage.requestFullscreen()" in page and 'stage = byId("watch")' in page
+    assert "dblclick" not in page                                   # a click is already "inspect"
+    assert 'event.key === "f"' in page and "isTyping(event.target)" in page
+
+
+def test_template_full_screen_panel_has_its_own_column_and_no_blur():
+    page = TEMPLATE.read_text(encoding="utf-8")
+    assert "grid-template-columns" in css_rule(page, ".stage.is-full.has-details")
+    panel = css_rule(page, ".stage.is-full .details")
+    assert "backdrop-filter: none" in panel and "var(--glass-solid)" in panel
+    assert "transform: none" in css_rule(page, ".stage.is-full .shot")    # never left half revealed
+    assert 'if (stage.classList.contains("is-full")) return false;' in page   # bars: measure the click
+
+
+def test_template_scrolls_only_the_panel_and_the_chat_list_never_the_page():
+    """Seen live: sending a follow-up question scrolled the whole page and slid the video
+    behind the bar. Focus never scrolls, and only the panel's or the list's own area moves."""
+    page = TEMPLATE.read_text(encoding="utf-8")
+    assert "scrollIntoView" not in page and "scrollTo(" not in page and "scrollBy(" not in page
+    calls = re.findall(r"\.focus\(([^)]*)\)", page)
+    assert calls and all(call.strip() == "{ preventScroll: true }" for call in calls), calls
+    assert "details.scrollTop = details.scrollHeight" in page
+    assert "messages.scrollTop = messages.scrollHeight" in page
+    # The panel beside the video is never taller than the window below its own top, so the
+    # follow-up field is always in view and typing in it never makes the browser scroll the page.
+    assert "function fitDetails()" in page
+    assert page.count("fitDetails();") >= 3                        # on scroll, on opening, on full screen
+
+
+def test_template_has_the_follow_up_chat():
+    page = rendered_page()
+    assert '<label class="visually-hidden" for="followQuestion">Ask about this</label>' in page
+    assert '<input id="followQuestion" type="text" maxlength="2000" placeholder="Ask about this">' in page
+    assert '"/api/follow_up", { id, question }' in page              # only the id and the question
+    assert "MAX_FOLLOW_UPS = 10" in page
+    assert "Follow-up questions about an object send the same cut-out again." in page
 
 
 # ---- which files may use flask --------------------------------------------------------------

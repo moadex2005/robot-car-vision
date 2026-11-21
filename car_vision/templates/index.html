@@ -5,9 +5,28 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="light dark">
 <title>Robot car vision</title>
+<script>
+  // The look is chosen before anything is drawn, so the page never flashes the wrong one:
+  // the visitor's own choice from the sun and moon button, else what the system asks for.
+  (function () {
+    let theme = null;
+    try {
+      theme = window.localStorage.getItem("theme");
+    } catch (error) {
+      theme = null;                      // storage blocked: the page works without it
+    }
+    if (theme !== "light" && theme !== "dark") {
+      theme = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+    }
+    document.documentElement.dataset.theme = theme;
+  })();
+</script>
 <style>
-  /* ---- colours, sizes and curves: light by default, dark when the system asks ---- */
-  :root {
+  /* ---- colours: one set for the light look, one for the dark look ----
+     The script above sets data-theme on <html> before the first paint: the visitor's
+     choice, or until they choose, the system's (prefers-color-scheme). */
+  :root, :root[data-theme="light"] {
+    color-scheme: light;
     --page: #f5f5f7;
     --surface: #ffffff;
     --text: #1d1d1f;
@@ -28,7 +47,33 @@
     --blob-one: rgba(0, 113, 227, 0.22);
     --blob-two: rgba(191, 90, 242, 0.16);
     --blob-three: rgba(48, 209, 88, 0.14);
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --page: #000000;
+    --surface: #1c1c1e;
+    --text: #f5f5f7;
+    --grey: #a1a1a6;
+    --hairline: rgba(255, 255, 255, 0.12);
+    --accent: #2997ff;
+    --accent-text: #000000;
+    --accent-soft: rgba(41, 151, 255, 0.16);
+    --warn: #ff453a;
+    --glass: rgba(30, 30, 32, 0.58);
+    --glass-solid: rgba(30, 30, 32, 0.95);
+    --glass-edge: rgba(255, 255, 255, 0.12);
+    --glass-shine: rgba(255, 255, 255, 0.16);
+    --pill-fill: linear-gradient(180deg, rgba(255, 255, 255, 0.14), rgba(255, 255, 255, 0.05));
+    --pill-shadow: 0 8px 22px rgba(0, 0, 0, 0.45);
+    --shadow: 0 18px 50px rgba(0, 0, 0, 0.5), 0 2px 8px rgba(0, 0, 0, 0.3);
+    --shadow-deep: 0 40px 100px rgba(0, 0, 0, 0.7), 0 10px 30px rgba(0, 0, 0, 0.4);
+    --blob-one: rgba(10, 132, 255, 0.28);
+    --blob-two: rgba(191, 90, 242, 0.2);
+    --blob-three: rgba(48, 209, 88, 0.12);
+  }
 
+  /* ---- type, sizes and curves ---- */
+  :root {
     --font: "Segoe UI Variable Display", "Segoe UI", system-ui, -apple-system, "SF Pro Display",
             "Helvetica Neue", Arial, sans-serif;
     --gutter: clamp(16px, 4vw, 64px);
@@ -39,29 +84,11 @@
     --spring: cubic-bezier(0.34, 1.56, 0.64, 1);
     font-size: clamp(17px, 0.55vw + 10px, 22px);
   }
-  @media (prefers-color-scheme: dark) {
-    :root {
-      --page: #000000;
-      --surface: #1c1c1e;
-      --text: #f5f5f7;
-      --grey: #a1a1a6;
-      --hairline: rgba(255, 255, 255, 0.12);
-      --accent: #2997ff;
-      --accent-text: #000000;
-      --accent-soft: rgba(41, 151, 255, 0.16);
-      --warn: #ff453a;
-      --glass: rgba(30, 30, 32, 0.58);
-      --glass-solid: rgba(30, 30, 32, 0.95);
-      --glass-edge: rgba(255, 255, 255, 0.12);
-      --glass-shine: rgba(255, 255, 255, 0.16);
-      --pill-fill: linear-gradient(180deg, rgba(255, 255, 255, 0.14), rgba(255, 255, 255, 0.05));
-      --pill-shadow: 0 8px 22px rgba(0, 0, 0, 0.45);
-      --shadow: 0 18px 50px rgba(0, 0, 0, 0.5), 0 2px 8px rgba(0, 0, 0, 0.3);
-      --shadow-deep: 0 40px 100px rgba(0, 0, 0, 0.7), 0 10px 30px rgba(0, 0, 0, 0.4);
-      --blob-one: rgba(10, 132, 255, 0.28);
-      --blob-two: rgba(191, 90, 242, 0.2);
-      --blob-three: rgba(48, 209, 88, 0.12);
-    }
+
+  /* Changing the look: the colours cross-fade briefly. Only colours: no blur, no size, no place
+     is animated, so nothing moves and the glass is not redrawn more than this once. */
+  .theme-fade, .theme-fade *, .theme-fade *::before, .theme-fade *::after {
+    transition: background-color 0.35s ease, color 0.35s ease, border-color 0.35s ease !important;
   }
 
   * { box-sizing: border-box; }
@@ -203,6 +230,55 @@
   .pill:disabled { opacity: 0.4; cursor: progress; transform: none; }
   .pill.small { font-size: 0.85rem; padding: 0.4rem 0.95rem; }
 
+  /* ---- the theme button: a sun for the light look, a moon for the dark one ---- */
+  .theme-button svg { width: 1.05rem; height: 1.05rem; }
+  .theme-button .moon { display: none; }
+  :root[data-theme="dark"] .theme-button .sun { display: none; }
+  :root[data-theme="dark"] .theme-button .moon { display: block; }
+  .nav .round { flex: none; }
+
+  /* ---- the camera box under the bar ----
+     Almost solid instead of blurred: it may lie over the moving video. */
+  .glass.camera-box {
+    position: fixed; z-index: 55;
+    top: calc(var(--nav-space) - 4px);
+    right: calc(50% - min(620px, 50% - var(--gutter)));
+    width: min(410px, calc(100vw - 32px));
+    padding: 1.15rem 1.25rem 1.2rem;
+    border-radius: var(--radius);
+    background: var(--glass-solid);
+    -webkit-backdrop-filter: none;
+    backdrop-filter: none;
+    animation: box-in 0.35s var(--ease-out);
+  }
+  @keyframes box-in { from { opacity: 0; transform: translateY(-10px) scale(0.98); } to { opacity: 1; transform: none; } }
+  .field-label { display: block; margin-bottom: 0.45rem; font-size: 0.8rem; font-weight: 600; letter-spacing: 0.14em; text-transform: uppercase; color: var(--grey); }
+  .camera-row { display: flex; gap: 0.5rem; }
+  .camera-help { margin: 0.6rem 0 0; color: var(--grey); font-size: 0.85rem; line-height: 1.4; }
+  .camera-result { margin: 0.45rem 0 0; min-height: 1.4em; font-size: 0.9rem; font-weight: 500; }
+  .camera-result.problem { color: var(--warn); }
+  .camera-box hr { border: 0; border-top: 1px solid var(--hairline); margin: 0.9rem 0; }
+
+  /* A switch: a real checkbox (so keyboard and screen readers work), drawn as a track and knob. */
+  .switch { position: relative; display: inline-flex; align-items: center; gap: 0.7rem; cursor: pointer; font-weight: 500; }
+  .switch input { position: absolute; left: 0; top: 50%; width: 2.6rem; height: 1.5rem; margin: 0; transform: translateY(-50%); opacity: 0; cursor: pointer; }
+  .switch-track {
+    position: relative; flex: none;
+    width: 2.6rem; height: 1.5rem; border-radius: 999px;
+    background: var(--hairline);
+    border: 1px solid var(--hairline);
+    transition: background-color 0.2s;
+  }
+  .switch-track::after {
+    content: ""; position: absolute; top: 2px; left: 2px;
+    width: calc(1.5rem - 6px); height: calc(1.5rem - 6px); border-radius: 50%;
+    background: #fff; box-shadow: 0 1px 3px rgba(0, 0, 0, 0.3);
+    transition: transform 0.3s var(--spring);
+  }
+  .switch input:checked + .switch-track { background: var(--accent); }
+  .switch input:checked + .switch-track::after { transform: translateX(1.1rem); }
+  .switch input:focus-visible + .switch-track { outline: 3px solid var(--accent); outline-offset: 3px; }
+
   /* ---- sections ---- */
   main { padding: 0 var(--gutter); }
   .section { max-width: 1240px; margin: 0 auto; padding: clamp(48px, 8vh, 110px) 0; }
@@ -300,6 +376,39 @@
   }
   @keyframes capsule-in { from { opacity: 0; transform: translateY(-14px) scale(0.92); } to { opacity: 1; transform: none; } }
 
+  /* The full-screen button in the top right corner of the video: small and solid, no blur. */
+  .frame-button {
+    position: absolute; top: clamp(10px, 1.2vw, 18px); right: clamp(10px, 1.2vw, 18px); z-index: 3;
+    width: 2.6rem; height: 2.6rem; padding: 0;
+    display: grid; place-items: center;
+    border-radius: 50%;
+    border: 1px solid rgba(255, 255, 255, 0.3);
+    background: rgba(0, 0, 0, 0.55);
+    color: #fff;
+    cursor: pointer;
+    transition: transform 0.45s var(--spring);
+  }
+  .frame-button:hover { transform: scale(1.08); }
+  .frame-button:active { transform: scale(0.92); transition-duration: 0.12s; }
+  .frame-button svg { width: 1.15rem; height: 1.15rem; }
+  .frame-button .shrink { display: none; }
+  .is-full .frame-button .expand { display: none; }
+  .is-full .frame-button .shrink { display: block; }
+
+  /* The delay test: a big clock under the video. Black and white in both looks, so the
+     phone's camera reads it well. Only its text changes, inside its own fixed-size box. */
+  .delay { margin: 1.1rem 0 0; text-align: center; }
+  .delay-clock {
+    display: inline-block;
+    padding: 0.3em 0.6em;
+    border-radius: var(--radius);
+    background: #000; color: #fff;
+    font-size: clamp(2.6rem, 5.5vw, 5.4rem); font-weight: 650;
+    font-variant-numeric: tabular-nums; letter-spacing: -0.01em; line-height: 1;
+    contain: layout paint;
+  }
+  .delay-help { margin: 0.6rem auto 0; max-width: 36rem; color: var(--grey); font-size: 0.85rem; }
+
   .view-meta {
     display: flex; flex-wrap: wrap; justify-content: center; gap: 0.3rem 1.2rem;
     margin: 1.1rem 0 0; min-height: 1.4em;
@@ -367,6 +476,49 @@
       backdrop-filter: none;
     }
   }
+  /* ---- full screen: the whole live view (#watch) fills the screen ----
+     The same elements as on the page, laid out again: a black stage with the video as large
+     as it fits, the pills in one row over its bottom edge, and the details panel in a column
+     of its own at the right, so no blurred surface lies over the moving picture. The class
+     is-full is set by the script when the browser enters full screen. */
+  .stage.is-full {
+    position: fixed; inset: 0; z-index: 100;
+    gap: 0;
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: minmax(0, 1fr);
+    align-items: stretch;
+    background: #000;
+  }
+  .stage::backdrop { background: #000; }
+  .stage.is-full.has-details { grid-template-columns: minmax(0, 1fr) clamp(320px, 27vw, 470px); }
+  .stage.is-full .shot { position: relative; height: 100%; min-height: 0; opacity: 1; transform: none; }
+  .stage.is-full .frame {
+    width: 100%; height: 100%; aspect-ratio: auto; margin: 0;
+    border-radius: 0; box-shadow: none;
+  }
+  .stage.is-full .frame img:focus-visible { border-radius: 0; }
+  .stage.is-full .view-meta, .stage.is-full .privacy, .stage.is-full .inview h3,
+  .stage.is-full #nothing, .stage.is-full .delay-help { display: none; }
+  .stage.is-full .inview {
+    position: absolute; left: 0; right: 0; bottom: 0; z-index: 2;
+    margin: 0; padding: 0 clamp(10px, 1.4vw, 22px) clamp(10px, 1.4vw, 22px);
+    pointer-events: none;                 /* between the pills, a click still reaches the video */
+  }
+  .stage.is-full .things { flex-wrap: nowrap; justify-content: flex-start; overflow-x: auto; padding: 10px 4px; scrollbar-width: thin; }
+  .stage.is-full .things > li:first-child { margin-left: auto; }   /* centred, and still scrolls when too many */
+  .stage.is-full .things > li:last-child { margin-right: auto; }
+  .stage.is-full .thing { pointer-events: auto; white-space: nowrap; background: var(--glass-solid); }
+  .stage.is-full .delay { position: absolute; top: clamp(10px, 1.2vw, 18px); left: clamp(10px, 1.2vw, 18px); z-index: 2; margin: 0; }
+  .stage.is-full .delay-clock { font-size: clamp(1.6rem, 2.6vw, 3.4rem); }   /* smaller: it lies over the picture */
+  .stage.is-full .details {
+    position: static; width: auto; height: 100%; max-height: none;
+    border-radius: 0; border-width: 0 0 0 1px;
+    box-shadow: none;
+    background: var(--glass-solid);
+    -webkit-backdrop-filter: none;
+    backdrop-filter: none;
+  }
+
   .details-top { display: flex; align-items: center; justify-content: space-between; margin-bottom: 1rem; }
   .details-label { font-size: 0.8rem; font-weight: 600; letter-spacing: 0.14em; text-transform: uppercase; color: var(--grey); }
   .round {
@@ -403,6 +555,14 @@
   .specs { display: grid; grid-template-columns: minmax(0, 0.85fr) minmax(0, 1.15fr); margin: 0.4rem 0 1rem; }
   .specs dt, .specs dd { margin: 0; padding: 0.55rem 0; border-top: 1px solid var(--hairline); overflow-wrap: anywhere; }
   .specs dt { color: var(--grey); padding-right: 1rem; }
+
+  /* The small chat about the clicked thing, under its description, in the panel's own scroll. */
+  .follow { margin-top: 1.2rem; padding-top: 1.1rem; border-top: 1px solid var(--hairline); }
+  .follow-messages { list-style: none; margin: 0 0 0.9rem; padding: 0; display: flex; flex-direction: column; gap: 0.7rem; }
+  .follow-messages:empty { display: none; }
+  .follow .msg { max-width: 92%; font-size: 0.95rem; }
+  .follow-form { display: flex; gap: 0.5rem; }
+  .follow-form .pill { flex: none; }
 
   /* ---- the chat card ---- */
   .chat {
@@ -460,7 +620,7 @@
   .more { color: var(--grey); }
 
   .ask-form { display: flex; gap: 0.7rem; }
-  .ask-form input {
+  .ask-form input, .camera-row input, .follow-form input {
     flex: 1; min-width: 0;
     background: var(--surface);
     color: var(--text);
@@ -469,8 +629,12 @@
     padding: 0.8rem 1.25rem;
     font: inherit; font-size: 1.05rem;
   }
-  .ask-form input::placeholder { color: var(--grey); }
-  .ask-form input:focus-visible { outline: 3px solid var(--accent); outline-offset: 1px; }
+  .camera-row input, .follow-form input { padding: 0.55rem 1rem; font-size: 0.95rem; }
+  .ask-form input::placeholder, .camera-row input::placeholder, .follow-form input::placeholder { color: var(--grey); }
+  .ask-form input:focus-visible, .camera-row input:focus-visible, .follow-form input:focus-visible {
+    outline: 3px solid var(--accent); outline-offset: 1px;
+  }
+  .follow-form input:disabled { opacity: 0.55; }
 
   /* ---- footer ---- */
   .footer {
@@ -482,12 +646,17 @@
   }
   .footer p { margin: 0; max-width: 42rem; }
 
-  /* Narrow windows are not the target, but stay usable. */
-  @media (max-width: 760px) {
+  /* Narrow windows are not the target, but stay usable. Below 1000 px the bar has no room
+     for the section links next to the status, the Camera button and the theme button. */
+  .nav-links a { white-space: nowrap; }
+  @media (max-width: 999.98px) {
     .nav-links { display: none; }
-    .nav { gap: 0.6rem; }
     .brand { margin-right: auto; }
+  }
+  @media (max-width: 760px) {
+    .nav { gap: 0.6rem; }
     .status-item.wide { display: none; }
+    .glass.camera-box { right: 16px; }
   }
 
   @media (prefers-reduced-motion: reduce) {
@@ -514,7 +683,39 @@
     <span class="status-item"><span class="fps" id="fps">&ndash;</span> fps</span>
     <span class="status-item wide" id="device">&ndash;</span>
   </div>
+  <button class="pill small secondary" id="cameraButton" type="button"
+          aria-expanded="false" aria-controls="cameraBox">Camera</button>
+  <button class="round theme-button" id="themeButton" type="button" aria-label="Switch to the dark look" title="Switch to the dark look">
+    <svg class="sun" viewBox="0 0 24 24" aria-hidden="true">
+      <circle cx="12" cy="12" r="4.2" fill="currentColor"/>
+      <path d="M12 2.5v2.6M12 18.9v2.6M2.5 12h2.6M18.9 12h2.6M5.3 5.3l1.8 1.8M16.9 16.9l1.8 1.8M5.3 18.7l1.8-1.8M16.9 7.1l1.8-1.8"
+            stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+    </svg>
+    <svg class="moon" viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M20.5 14.6A8.6 8.6 0 0 1 9.4 3.5a8.6 8.6 0 1 0 11.1 11.1z" fill="currentColor"/>
+    </svg>
+  </button>
 </header>
+
+<!-- The camera box: opened by the Camera button in the bar. -->
+<div class="camera-box glass" id="cameraBox" role="dialog" aria-label="Camera" hidden>
+  <form id="cameraForm" autocomplete="off">
+    <label class="field-label" for="cameraAddress">Phone address</label>
+    <div class="camera-row">
+      <input id="cameraAddress" type="text" inputmode="url" spellcheck="false" maxlength="100"
+             placeholder="192.168.1.7:8080" aria-describedby="cameraHelp">
+      <button class="pill primary small" id="cameraConnect" type="submit">Connect</button>
+    </div>
+    <p class="camera-help" id="cameraHelp">The address IP Webcam shows on the phone's screen, like 192.168.1.7:8080.</p>
+    <p class="camera-result" id="cameraResult" aria-live="polite"></p>
+  </form>
+  <hr>
+  <label class="switch">
+    <input type="checkbox" id="delaySwitch" role="switch">
+    <span class="switch-track" aria-hidden="true"></span>
+    <span>Delay test</span>
+  </label>
+</div>
 
 <main>
   <section class="hero" id="top">
@@ -533,12 +734,22 @@
       <h2>Live view</h2>
       <p>Click anything in the picture, or a name below it, to see what it is.</p>
     </div>
-    <!-- "Watch live" lands on the video itself, so the whole picture fits below the bar. -->
+    <!-- "Watch live" lands on the video itself, so the whole picture fits below the bar.
+         #watch is also what goes full screen: it holds the video, the banners, the In view
+         pills and the details panel, so all of them keep working there. -->
     <div class="stage" id="watch">
       <div class="shot reveal">
         <div class="frame" id="frame">
           <img id="video" src="/video" tabindex="-1" alt="Live camera view from the car, with labelled objects and faces">
           <div class="waiting" id="waiting">Waiting for the camera&hellip;</div>
+          <button class="frame-button" id="fullButton" type="button" aria-label="Full screen" title="Full screen (F)" hidden>
+            <svg class="expand" viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M4 9V4h5M15 4h5v5M20 15v5h-5M9 20H4v-5" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+            </svg>
+            <svg class="shrink" viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M9 4v5H4M20 9h-5V4M15 20v-5h5M4 15h5v5" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+            </svg>
+          </button>
           <div class="banners">
             <div class="capsule warning" id="warning" role="alert" hidden>
               <svg viewBox="0 0 24 24" aria-hidden="true">
@@ -554,6 +765,10 @@
             <div>Program not running<small>Start it again with python -m car_vision.app</small></div>
           </div>
         </div>
+        <div class="delay" id="delay" hidden>
+          <div class="delay-clock" id="delayClock" aria-hidden="true">00:00:00.000</div>
+          <p class="delay-help">Point the phone at this clock: this clock shows now, the clock in the video shows then, and the difference is the delay.</p>
+        </div>
         <div class="view-meta" id="viewMeta">
           <span>Face recognition <span id="faces">&ndash;</span></span>
           <span class="notes" id="notes"></span>
@@ -563,7 +778,7 @@
           <h3>In view</h3>
           <ul class="things" id="things"></ul>
           <p class="quiet" id="nothing">Nothing detected right now</p>
-          <p class="privacy" id="privacy">A click on an object or on an empty spot sends a small cut-out of the picture to the assistant's API. A click on a person sends nothing.</p>
+          <p class="privacy" id="privacy">A click on an object or on an empty spot sends a small cut-out of the picture to the assistant's API. A click on a person sends nothing. Follow-up questions about an object send the same cut-out again.</p>
         </div>
       </div>
 
@@ -581,6 +796,15 @@
           <div class="details-meta" id="detailMeta"></div>
           <div class="details-role" id="detailRole" hidden></div>
           <div class="details-content" id="detailContent"></div>
+        </div>
+        <div class="follow" id="followUp" hidden>
+          <ol class="follow-messages" id="followMessages" aria-live="polite"></ol>
+          <p class="quiet" id="followDone" hidden>That is ten questions about this one. Click it again to ask more.</p>
+          <form class="follow-form" id="followForm" autocomplete="off">
+            <label class="visually-hidden" for="followQuestion">Ask about this</label>
+            <input id="followQuestion" type="text" maxlength="{{ max_question_chars }}" placeholder="Ask about this">
+            <button class="pill primary small" id="followSend" type="submit">Send</button>
+          </form>
         </div>
       </aside>
     </div>
@@ -609,7 +833,7 @@
 </main>
 
 <footer class="footer">
-  <p>A click on an object or on an empty spot sends a small cut-out of the picture to the assistant's API. A click on a person sends nothing.</p>
+  <p>A click on an object or on an empty spot sends a small cut-out of the picture to the assistant's API. A click on a person sends nothing. Follow-up questions about an object send the same cut-out again.</p>
   <p>Runs on this laptop. Nothing is sent to the car.</p>
 </footer>
 
@@ -638,7 +862,13 @@ const detailPhoto = byId("detailPhoto"), detailTitle = byId("detailTitle"), deta
 const detailRole = byId("detailRole"), detailContent = byId("detailContent");
 const messages = byId("messages"), hint = byId("hint"), form = byId("askForm");
 const input = byId("question"), send = byId("send"), clearButton = byId("clear");
-const nav = byId("nav"), heroText = byId("heroText");
+const nav = byId("nav"), heroText = byId("heroText"), themeButton = byId("themeButton");
+const cameraButton = byId("cameraButton"), cameraBox = byId("cameraBox"), cameraForm = byId("cameraForm");
+const cameraAddress = byId("cameraAddress"), cameraConnect = byId("cameraConnect"), cameraResult = byId("cameraResult");
+const delaySwitch = byId("delaySwitch"), delay = byId("delay"), delayClock = byId("delayClock");
+const fullButton = byId("fullButton");
+const followUp = byId("followUp"), followMessages = byId("followMessages"), followDone = byId("followDone");
+const followForm = byId("followForm"), followQuestion = byId("followQuestion"), followSend = byId("followSend");
 
 // ---- small helpers -------------------------------------------------------
 
@@ -684,21 +914,48 @@ function onScroll() {
       heroText.style.transform = "translateY(" + (y * 0.25).toFixed(1) + "px)";
       heroText.style.opacity = Math.max(0, 1 - y / (window.innerHeight * 0.6)).toFixed(3);
     }
+    fitDetails();
   });
 }
+
+// Beside the video (from 1280 px) the details panel sticks under the bar, but before the
+// live view reaches the bar the panel starts lower, and its bottom, where the follow-up
+// field is, would hang below the window. Typing in a field the browser cannot fully see
+// makes it scroll the whole page. So the panel is never taller than the window below its
+// own top: the field is always in view, and only the panel's own area scrolls.
+const DETAILS_MIN_PX = 200;
+let detailsRoom = 0;           // the height last given to the panel; 0 when the CSS decides
+function fitDetails() {
+  let room = 0;
+  if (!details.hidden && getComputedStyle(details).position === "sticky") {
+    room = Math.max(DETAILS_MIN_PX, Math.floor(window.innerHeight - details.getBoundingClientRect().top - 16));
+  }
+  if (room === detailsRoom) return;
+  detailsRoom = room;
+  details.style.maxHeight = room ? "min(calc(100svh - var(--nav-space) - 24px), " + room + "px)" : "";
+}
+window.addEventListener("resize", fitDetails);
 window.addEventListener("scroll", onScroll, { passive: true });
 onScroll();
 
-// While the video scrolls under the bar, the bar is drawn solid instead of blurring the video.
-// The watched band is the strip of the window the bar covers.
+// While the video (or the running delay clock) scrolls under the bar, the bar is drawn solid
+// instead of blurring what changes under it. The watched band is the strip the bar covers.
 let barWatch = null;
+const underBar = new Set();
 function watchBarOverVideo() {
   if (!("IntersectionObserver" in window)) return;
   if (barWatch) barWatch.disconnect();
+  underBar.clear();
   const band = Math.ceil(nav.getBoundingClientRect().bottom) + 8;
-  barWatch = new IntersectionObserver(([entry]) => nav.classList.toggle("over-video", entry.isIntersecting),
-                                      { rootMargin: "0px 0px " + (band - window.innerHeight) + "px 0px" });
+  barWatch = new IntersectionObserver((entries) => {
+    for (const entry of entries) {
+      if (entry.isIntersecting) underBar.add(entry.target);
+      else underBar.delete(entry.target);
+    }
+    nav.classList.toggle("over-video", underBar.size > 0);
+  }, { rootMargin: "0px 0px " + (band - window.innerHeight) + "px 0px" });
   barWatch.observe(frame);
+  barWatch.observe(delay);
 }
 watchBarOverVideo();
 window.addEventListener("resize", watchBarOverVideo);
@@ -764,6 +1021,7 @@ function pointOnPicture(event) {
 let pointerEvent = null;
 
 function pictureFillsFrame() {
+  if (stage.classList.contains("is-full")) return false;   // the screen's shape: there are bars
   const width = video.naturalWidth, height = video.naturalHeight;
   return width > 0 && height > 0 && frame.style.getPropertyValue("--ratio") === (width / height).toFixed(4);
 }
@@ -998,6 +1256,8 @@ async function poll() {
     drawStatusLine(status);
     drawObjects(status);
     drawReactions(status);
+    phoneUrl = asText(status.phone_url);
+    drawConnecting(status);
   } catch (error) {
     setOnline(false);
   } finally {
@@ -1024,12 +1284,17 @@ function addMessage(kind, text) {
   return item;
 }
 
+// The three blinking dots while an answer is on its way.
+function waitingDots() {
+  const dots = make("span", "dots");
+  dots.append(make("i"), make("i"), make("i"));
+  return dots;
+}
+
 function addThinking() {
   hint.hidden = true;
   const item = make("li", "msg thinking", "Thinking");
-  const dots = make("span", "dots");
-  dots.append(make("i"), make("i"), make("i"));
-  item.append(dots);
+  item.append(waitingDots());
   messages.append(item);
   scrollChat();
   return item;
@@ -1066,12 +1331,17 @@ function webSources(urls) {
   return nodes;
 }
 
+// "From the web" and the links to the pages that were used.
+function webLine(sources) {
+  const web = make("div", "web");
+  web.append(make("span", "web-label", "From the web"), ...webSources(asList(sources)));
+  return web;
+}
+
 function addAnswer(answer) {
   const item = addMessage("answer", asText(answer.text));
   if (answer.used_web) {
-    const web = make("div", "web");
-    web.append(make("span", "web-label", "From the web"), ...webSources(asList(answer.sources)));
-    item.append(web);
+    item.append(webLine(answer.sources));
     scrollChat();
   }
 }
@@ -1119,7 +1389,7 @@ form.addEventListener("submit", async (event) => {
   } finally {
     thinking.remove();
     setBusy(false);
-    input.focus();
+    input.focus({ preventScroll: true });   // the chat's own list scrolls, never the page
   }
 });
 
@@ -1137,7 +1407,7 @@ clearButton.addEventListener("click", async () => {
   } catch (error) {
     addMessage("error", "Program not running: the conversation could not be cleared.");
   }
-  input.focus();
+  input.focus({ preventScroll: true });
 });
 
 // ---- the details panel ---------------------------------------------------
@@ -1151,6 +1421,7 @@ function openDetails(key, from) {
   stage.classList.add("has-details");   // from 1280 px wide the video makes room for the sheet
   for (const [thingKey, item] of thingItems) item.firstChild.classList.toggle("is-open", thingKey === key);
   opener = from;
+  fitDetails();
   closeButton.focus({ preventScroll: true });
 }
 
@@ -1164,9 +1435,6 @@ function closeDetails() {
 }
 
 closeButton.addEventListener("click", closeDetails);
-document.addEventListener("keydown", (event) => {
-  if (event.key === "Escape" && !details.hidden) closeDetails();
-});
 
 function setPhoto(address) {
   const usable = typeof address === "string" && address.startsWith(PHOTO_PREFIX);
@@ -1203,6 +1471,7 @@ function showWaiting() {
   detailMeta.textContent = "";
   setRole("");
   detailContent.replaceChildren();
+  resetFollowUp();
 }
 
 function showProblem(text) {
@@ -1211,9 +1480,7 @@ function showProblem(text) {
 
 function showLooking() {
   const line = make("p", "looking", "Looking it up ...");
-  const dots = make("span", "dots");
-  dots.append(make("i"), make("i"), make("i"));
-  line.append(dots);
+  line.append(waitingDots());
   detailContent.replaceChildren(line);
 }
 
@@ -1257,11 +1524,7 @@ function showInfo(info) {
     for (const spec of specs) list.append(make("dt", "", asText(spec.name)), make("dd", "", asText(spec.value)));
     nodes.push(list);
   }
-  if (info.used_web) {
-    const web = make("div", "web");
-    web.append(make("span", "web-label", "From the web"), ...webSources(asList(info.sources)));
-    nodes.push(web);
-  }
+  if (info.used_web) nodes.push(webLine(info.sources));
   detailContent.replaceChildren(...nodes);
 }
 
@@ -1288,8 +1551,14 @@ async function inspect(body, key, from) {
     return;
   }
   showTarget(data);
-  if (data.info && typeof data.info === "object") showInfo(data.info);
-  else if (data.describable === true) describe(data.id, mine);
+  if (data.person && typeof data.person === "object") {
+    showFollowUp(data.id);              // a recognised person: questions go to the chat, as text only
+  } else if (data.info && typeof data.info === "object") {
+    showInfo(data.info);
+    showFollowUp(data.id);
+  } else if (data.describable === true) {
+    describe(data.id, mine);
+  }                                     // an unrecognised person has no chat
 }
 
 async function describe(id, mine) {
@@ -1305,7 +1574,334 @@ async function describe(id, mine) {
   const { response, data } = reply;
   if (response.ok && data && typeof data.name === "string" && typeof data.error !== "string") showInfo(data);
   else showProblem(errorText(data, response, "Please click it again."));
+  showFollowUp(id);                      // once the description has arrived, or failed
 }
+
+// ---- asking more about the clicked thing ----------------------------------
+//
+// The page sends only the inspection id and the question. The photo, the label, the
+// description and the earlier questions are kept by the server with that click.
+
+const MAX_FOLLOW_UPS = 10;     // the server keeps at most this many questions per click
+let followId = null;           // the click the small chat belongs to; null when there is none
+let followCount = 0;           // questions answered in it so far
+
+function resetFollowUp() {
+  followId = null;
+  followCount = 0;
+  followMessages.replaceChildren();
+  followUp.hidden = true;
+  followDone.hidden = true;
+  followForm.hidden = false;
+  setFollowBusy(false);
+}
+
+function showFollowUp(id) {
+  followId = id;
+  followUp.hidden = false;
+}
+
+function setFollowBusy(isBusy) {
+  followQuestion.disabled = isBusy;
+  followSend.disabled = isBusy;
+}
+
+function scrollPanel() {
+  details.scrollTop = details.scrollHeight;
+}
+
+function addFollowMessage(kind, text) {
+  const item = make("li", "msg " + kind);
+  item.append(make("p", "text", text));
+  followMessages.append(item);
+  scrollPanel();
+  return item;
+}
+
+function addFollowAnswer(answer) {
+  const item = addFollowMessage("answer", asText(answer.text));
+  if (answer.used_web) {
+    item.append(webLine(answer.sources));
+    scrollPanel();
+  }
+}
+
+function addFollowWaiting() {
+  const item = make("li", "msg thinking", "Thinking");
+  item.append(waitingDots());
+  followMessages.append(item);
+  scrollPanel();
+  return item;
+}
+
+// Show one reply from /api/follow_up; true when it was an answer.
+function showFollowReply(reply) {
+  if (!reply) {
+    addFollowMessage("error", "Program not running: the question could not be sent.");
+    return false;
+  }
+  const { response, data } = reply;
+  if (data && typeof data.error === "string") {
+    addFollowMessage("error", data.error);
+    return false;
+  }
+  if (response.ok && data && typeof data.text === "string") {
+    addFollowAnswer(data);
+    return true;
+  }
+  addFollowMessage("error", "The program gave no answer (status " + response.status + "). Please ask again.");
+  return false;
+}
+
+followForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const question = followQuestion.value.trim();
+  if (!question || followId === null || followQuestion.disabled) return;
+  const id = followId, mine = lookup;
+  followQuestion.value = "";
+  addFollowMessage("question", question);
+  const waiting = addFollowWaiting();
+  setFollowBusy(true);
+  let reply = null;
+  try {
+    reply = await postJson("/api/follow_up", { id, question });
+  } catch (error) {
+    reply = null;
+  }
+  if (mine !== lookup || id !== followId) return;     // another thing is shown now
+  waiting.remove();
+  setFollowBusy(false);
+  if (showFollowReply(reply)) followCount += 1;
+  if (followCount >= MAX_FOLLOW_UPS) {
+    followForm.hidden = true;
+    followDone.hidden = false;
+  } else {
+    followQuestion.focus({ preventScroll: true });
+  }
+});
+
+// ---- light and dark --------------------------------------------------------
+
+const THEME_KEY = "theme";
+const THEME_FADE_MS = 400;
+const systemDark = window.matchMedia("(prefers-color-scheme: dark)");
+let themeFadeTimer = 0;
+
+// The visitor's own choice, or null when they have not chosen (or storage is blocked).
+function chosenTheme() {
+  try {
+    const theme = window.localStorage.getItem(THEME_KEY);
+    return theme === "light" || theme === "dark" ? theme : null;
+  } catch (error) {
+    return null;
+  }
+}
+
+function saveTheme(theme) {
+  try {
+    window.localStorage.setItem(THEME_KEY, theme);
+  } catch (error) {
+    // Storage blocked: the choice holds until the page is closed.
+  }
+}
+
+const shownTheme = () => (document.documentElement.dataset.theme === "dark" ? "dark" : "light");
+
+function applyTheme(theme, fade) {
+  const root = document.documentElement;
+  if (fade && !reducedMotion.matches) {
+    root.classList.add("theme-fade");
+    clearTimeout(themeFadeTimer);
+    themeFadeTimer = setTimeout(() => root.classList.remove("theme-fade"), THEME_FADE_MS);
+  }
+  root.dataset.theme = theme;
+  const label = theme === "dark" ? "Switch to the light look" : "Switch to the dark look";
+  themeButton.setAttribute("aria-label", label);
+  themeButton.title = label;
+}
+
+themeButton.addEventListener("click", () => {
+  const next = shownTheme() === "dark" ? "light" : "dark";
+  saveTheme(next);
+  applyTheme(next, true);
+});
+// Until the visitor chooses, the page follows the system, also when it changes.
+systemDark.addEventListener("change", () => {
+  if (chosenTheme() === null) applyTheme(systemDark.matches ? "dark" : "light", true);
+});
+applyTheme(shownTheme(), false);
+
+// ---- the camera box: the phone's address --------------------------------------
+
+const CONNECT_WAIT_MS = 8000;  // after this long without a picture, a hint is shown
+let phoneUrl = "";             // the phone address from the status
+let connecting = null;         // { url, since, hinted } while waiting for the phone's first picture
+
+// The full stream address is shown the way the phone shows it: 192.168.1.7:8080, without
+// the http part in front and without /video after it.
+function shortAddress(url) {
+  return asText(url).replace(/^http:\/\//i, "").replace(/\/video$/, "").replace(/\/$/, "");
+}
+
+function openCameraBox() {
+  cameraBox.hidden = false;
+  cameraButton.setAttribute("aria-expanded", "true");
+  if (!cameraAddress.value) cameraAddress.value = shortAddress(phoneUrl);
+  cameraAddress.focus({ preventScroll: true });
+  cameraAddress.select();
+}
+
+function closeCameraBox(giveFocusBack) {
+  if (cameraBox.hidden) return;
+  cameraBox.hidden = true;
+  cameraButton.setAttribute("aria-expanded", "false");
+  if (giveFocusBack) cameraButton.focus({ preventScroll: true });
+}
+
+cameraButton.addEventListener("click", () => {
+  if (cameraBox.hidden) openCameraBox();
+  else closeCameraBox(true);
+});
+// A click anywhere outside the box closes it.
+document.addEventListener("pointerdown", (event) => {
+  if (cameraBox.hidden || cameraBox.contains(event.target) || cameraButton.contains(event.target)) return;
+  closeCameraBox(false);
+});
+
+function showCameraResult(text, isProblem) {
+  setText(cameraResult, text);
+  cameraResult.classList.toggle("problem", isProblem);
+}
+
+cameraForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  if (cameraConnect.disabled) return;
+  cameraConnect.disabled = true;
+  connecting = null;
+  showCameraResult("Connecting ...", false);
+  try {
+    const { response, data } = await postJson("/api/camera", { address: cameraAddress.value });
+    if (response.ok && data && data.ok === true && typeof data.url === "string") {
+      connecting = { url: data.url, since: performance.now(), hinted: false };
+      phoneUrl = data.url;
+      cameraAddress.value = shortAddress(data.url);
+    } else {
+      showCameraResult(errorText(data, response, "Please try again."), true);
+    }
+  } catch (error) {
+    showCameraResult("Program not running: the address could not be sent.", true);
+  } finally {
+    cameraConnect.disabled = false;
+  }
+});
+
+// On every status poll after Connect: "Connected" as soon as the phone's pictures arrive,
+// and a hint once 8 seconds have passed without one.
+function drawConnecting(status) {
+  if (!connecting) return;
+  if (status.source === "phone" && status.connected && status.phone_url === connecting.url) {
+    showCameraResult("Connected", false);
+    connecting = null;
+  } else if (!connecting.hinted && performance.now() - connecting.since > CONNECT_WAIT_MS) {
+    showCameraResult("No picture from " + shortAddress(connecting.url) + " yet. Check that IP Webcam is " +
+                     "started and that the phone and this laptop are on the same Wi-Fi.", false);
+    connecting.hinted = true;            // still watching: "Connected" follows if it comes later
+  }
+}
+
+// ---- the delay test -----------------------------------------------------------
+//
+// Point the phone at the screen: the clock on the page shows now, the clock in the video
+// shows then. The clock runs on animation frames, the only such loop on the page, and only
+// while the switch is on.
+
+let clockRequest = 0;          // the waiting animation-frame request; 0 when the clock is off
+
+const twoDigits = (number) => String(number).padStart(2, "0");
+
+function timeOfDay(now) {
+  return twoDigits(now.getHours()) + ":" + twoDigits(now.getMinutes()) + ":" +
+         twoDigits(now.getSeconds()) + "." + String(now.getMilliseconds()).padStart(3, "0");
+}
+
+function tickClock() {
+  delayClock.textContent = timeOfDay(new Date());
+  clockRequest = requestAnimationFrame(tickClock);
+}
+
+function setDelayTest(on) {
+  delay.hidden = !on;
+  if (on && clockRequest === 0) tickClock();
+  if (!on && clockRequest !== 0) {
+    cancelAnimationFrame(clockRequest);
+    clockRequest = 0;
+  }
+}
+delaySwitch.addEventListener("change", () => setDelayTest(delaySwitch.checked));
+
+// ---- full screen ------------------------------------------------------------------
+//
+// The whole live view (#watch) goes full screen. The video, the banners, the pills and the
+// details panel stay the very same elements, so clicks and the panel work there as on the page.
+
+const ESCAPE_GRACE_MS = 500;   // an Escape this soon after leaving full screen was the browser's own
+const canGoFull = document.fullscreenEnabled === true && typeof stage.requestFullscreen === "function";
+let leftFullAt = -Infinity;
+fullButton.hidden = !canGoFull;
+
+const isFull = () => document.fullscreenElement === stage;
+
+function toggleFullScreen() {
+  if (fullButton.hidden) return;
+  if (isFull()) {
+    document.exitFullscreen().catch(() => {});
+    return;
+  }
+  closeCameraBox(false);               // the box is outside the live view
+  stage.requestFullscreen().catch(() => {
+    fullButton.hidden = true;           // refused: no button that does nothing
+  });
+}
+
+document.addEventListener("fullscreenchange", () => {
+  const full = isFull();
+  stage.classList.toggle("is-full", full);
+  if (!full) leftFullAt = performance.now();
+  fitDetails();                          // in full screen the panel has a column of its own
+  const label = full ? "Leave full screen" : "Full screen";
+  fullButton.setAttribute("aria-label", label);
+  fullButton.title = label + " (F)";
+});
+fullButton.addEventListener("click", toggleFullScreen);
+
+// ---- keys: Escape closes the topmost thing, F switches full screen ------------------
+
+function isTyping(target) {
+  return target instanceof HTMLElement &&
+         (target.isContentEditable || ["INPUT", "TEXTAREA", "SELECT"].includes(target.tagName));
+}
+
+function closeTopmost() {
+  if (!cameraBox.hidden) {
+    closeCameraBox(true);
+    return;
+  }
+  // In full screen, Escape belongs to the browser: it leaves full screen, and the panel stays open.
+  if (isFull() || performance.now() - leftFullAt < ESCAPE_GRACE_MS) return;
+  if (!details.hidden) closeDetails();
+}
+
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape") {
+    closeTopmost();
+    return;
+  }
+  const plainF = (event.key === "f" || event.key === "F") && !event.ctrlKey && !event.metaKey && !event.altKey;
+  if (plainF && !event.repeat && !isTyping(event.target)) {
+    event.preventDefault();
+    toggleFullScreen();
+  }
+});
 
 poll();
 </script>

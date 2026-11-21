@@ -2,7 +2,10 @@
 
 Served by Flask; this is the only module that imports flask. A click on the
 video goes to /api/inspect, which answers at once with a small photo of what
-was clicked; for an object, /api/describe then asks the assistant what it is.
+was clicked; for an object, /api/describe then asks the assistant what it is,
+and /api/follow_up answers more questions about that one thing. The camera
+box on the page sends a phone's address to /api/camera, which switches the
+video to that phone and remembers the address for the next start.
 Start it with
 
     .venv\\Scripts\\python.exe -m car_vision.app
@@ -28,15 +31,16 @@ import webbrowser
 from collections import OrderedDict
 from collections.abc import Callable, Hashable, Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
 from flask import Flask, Response, jsonify, render_template, request
 from werkzeug.exceptions import HTTPException
 
-from car_vision.assistant import Assistant, AssistantError
+from car_vision.assistant import Assistant, AssistantError, ObjectInfo
 from car_vision.config import ConfigError, load_config, require, resolve_path, section
+from car_vision.phone import load_remembered, phone_url, remember, same_phone
 from car_vision.pipeline import Pipeline
 from car_vision.stream import SOURCES
 
@@ -59,6 +63,12 @@ PHOTO_PREFIX = "data:image/jpeg;base64,"
 GONE = "That is no longer in view."
 CLICK_AGAIN = "That click is too old. Please click the object again."
 
+MAX_FOLLOW_UPS = 10              # questions about one clicked thing
+TOO_MANY_FOLLOW_UPS = (f"That is {MAX_FOLLOW_UPS} questions about this one already. "
+                       "Click it again to start a new conversation about it.")
+UNKNOWN_PERSON = "There is nothing to ask about a person the camera does not recognise."
+CAMERA_FILE = "data/camera.json" # the last phone address asked for (git-ignored)
+
 
 class UnavailableAssistant:
     """Stands in when the real assistant could not be built, e.g. the notes file is missing.
@@ -75,6 +85,9 @@ class UnavailableAssistant:
     def describe(self, image: bytes, label: str | None = None) -> Any:
         raise AssistantError(self.reason)
 
+    def follow_up(self, image: bytes, label: str | None, info: Any, earlier: Any, question: str) -> Any:
+        raise AssistantError(self.reason)
+
     def reset(self) -> None:
         pass
 
@@ -84,12 +97,18 @@ class UnavailableAssistant:
 
 @dataclass(frozen=True)
 class Inspection:
-    """One click, kept so /api/describe needs only its id: the browser never sends a picture."""
+    """One click, kept so /api/describe and /api/follow_up need only its id.
+
+    The browser never sends a picture, a label or a description: they all come from here.
+    """
 
     kind: str                    # "object", "person" or "area"
     label: str
     track_id: int | None
     photo: bytes
+    person_name: str | None = None           # the recognised person, for kind "person"
+    info: ObjectInfo | None = None           # the description, once /api/describe has answered
+    pairs: tuple[tuple[str, str], ...] = ()  # the follow-up questions and answers so far
 
 
 class InspectionStore:
@@ -112,6 +131,20 @@ class InspectionStore:
     def get(self, inspection_id: str) -> Inspection | None:
         with self._lock:
             return self._items.get(inspection_id)
+
+    def set_info(self, inspection_id: str, info: ObjectInfo) -> None:
+        """Keep the description this inspection got. Nothing happens when it has expired."""
+        with self._lock:
+            inspection = self._items.get(inspection_id)
+            if inspection is not None:
+                self._items[inspection_id] = replace(inspection, info=info)
+
+    def add_pair(self, inspection_id: str, question: str, answer: str) -> None:
+        """Add one answered follow-up question to this inspection's conversation."""
+        with self._lock:
+            inspection = self._items.get(inspection_id)
+            if inspection is not None:
+                self._items[inspection_id] = replace(inspection, pairs=inspection.pairs + ((question, answer),))
 
 
 class AnswerCache:
@@ -193,6 +226,23 @@ def info_json(info: Any) -> dict[str, Any]:
     }
 
 
+def object_info(answer: dict[str, Any]) -> ObjectInfo:
+    """The JSON from info_json back as an ObjectInfo, for the follow-up questions."""
+    return ObjectInfo(
+        name=answer["name"],
+        summary=answer["summary"],
+        specs=tuple((spec["name"], spec["value"]) for spec in answer["specs"]),
+        used_web=answer["used_web"],
+        sources=tuple(answer["sources"]),
+    )
+
+
+def answer_json(answer: Any) -> dict[str, Any]:
+    """An Answer from the assistant as plain JSON values."""
+    return {"text": str(answer.text), "used_web": bool(answer.used_web),
+            "sources": [str(source) for source in answer.sources]}
+
+
 def person_json(person: Any) -> dict[str, Any] | None:
     """What the panel shows about a recognised person, or None."""
     if person is None:
@@ -252,8 +302,22 @@ def as_fraction(number: int | float) -> float | None:
 # ---- the web server ------------------------------------------------------------
 
 
-def create_app(pipeline: Any, assistant: Any) -> Flask:
-    """The Flask app for one pipeline and one assistant (real ones, or fakes in the tests)."""
+def question_problem(question: str) -> str | None:
+    """Why a typed question (spaces already stripped) cannot be sent, or None when it is fine."""
+    if not question:
+        return "The question is empty."
+    if len(question) > MAX_QUESTION_CHARS:
+        return (f"The question is too long ({len(question)} characters). "
+                f"Please keep it under {MAX_QUESTION_CHARS} characters.")
+    return None
+
+
+def create_app(pipeline: Any, assistant: Any, camera_file: Path | None = None) -> Flask:
+    """The Flask app for one pipeline and one assistant (real ones, or fakes in the tests).
+
+    `camera_file` is where /api/camera remembers the phone's address; with None
+    (as in most tests) the address is used but not remembered.
+    """
     app = Flask(__name__)
     inspections = InspectionStore()
     answers = AnswerCache()
@@ -282,11 +346,9 @@ def create_app(pipeline: Any, assistant: Any) -> Flask:
         if not isinstance(question, str):
             return jsonify(error='Send the question as JSON, like {"question": "Who built the car?"}'), 400
         question = question.strip()
-        if not question:
-            return jsonify(error="The question is empty."), 400
-        if len(question) > MAX_QUESTION_CHARS:
-            return jsonify(error=f"The question is too long ({len(question)} characters). "
-                                 f"Please keep it under {MAX_QUESTION_CHARS} characters."), 400
+        problem = question_problem(question)
+        if problem is not None:
+            return jsonify(error=problem), 400
         try:
             answer = assistant.ask(question)
         except ValueError as error:                   # the assistant's own check of the question
@@ -297,7 +359,7 @@ def create_app(pipeline: Any, assistant: Any) -> Flask:
             log.exception("Answering a question failed")
             return jsonify(error=f"Something went wrong while answering ({type(error).__name__}). "
                                  "Please ask again."), 500
-        return jsonify(text=answer.text, used_web=bool(answer.used_web), sources=list(answer.sources))
+        return jsonify(answer_json(answer))
 
     @app.post("/api/reset")
     def reset() -> Any:
@@ -319,8 +381,12 @@ def create_app(pipeline: Any, assistant: Any) -> Flask:
             return jsonify(error=f"Something went wrong with that click ({type(error).__name__})."), 500
         if target is None:
             return jsonify(error=GONE), 404
-        inspection = Inspection(target.kind, target.label, target.track_id, target.photo)
+        inspection = Inspection(target.kind, target.label, target.track_id, target.photo,
+                                person_name=target.person.name if target.person is not None else None)
         key = cache_key(inspection)
+        cached = answers.get(key) if key is not None else None
+        if cached is not None:                         # the page shows it at once: it is this click's description
+            inspection = replace(inspection, info=object_info(cached))
         return jsonify(
             id=inspections.add(inspection),
             kind=target.kind, label=target.label,
@@ -329,7 +395,7 @@ def create_app(pipeline: Any, assistant: Any) -> Flask:
             photo=photo_address(target.photo),
             person=person_json(target.person),
             describable=target.kind != "person",       # a person's picture is never sent to the API
-            info=answers.get(key) if key is not None else None,
+            info=cached,
         )
 
     @app.post("/api/describe")
@@ -346,15 +412,60 @@ def create_app(pipeline: Any, assistant: Any) -> Flask:
         key = cache_key(inspection)
         if key is None:                               # an area or an untracked box: never cached
             reply, code = look_up(assistant, inspection)
-            return jsonify(reply), code
-        with gate.one_at_a_time(key):                 # a second click on the same object waits here
-            cached = answers.get(key)
-            if cached is not None:
-                return jsonify(cached)
-            reply, code = look_up(assistant, inspection)
-            if "error" not in reply:
-                answers.put(key, reply)
+        else:
+            with gate.one_at_a_time(key):             # a second click on the same object waits here
+                reply, code = answers.get(key), 200
+                if reply is None:
+                    reply, code = look_up(assistant, inspection)
+                    if "error" not in reply:
+                        answers.put(key, reply)
+        if "error" not in reply:                      # kept for the follow-up questions
+            inspections.set_info(inspection_id, object_info(reply))
         return jsonify(reply), code
+
+    @app.post("/api/follow_up")
+    def follow_up() -> Any:
+        body = request.get_json(silent=True)
+        inspection_id = body.get("id") if isinstance(body, dict) else None
+        question = body.get("question") if isinstance(body, dict) else None
+        if not isinstance(inspection_id, str) or not isinstance(question, str):
+            return jsonify(error='Send the id and the question as JSON, like '
+                                 '{"id": "kq3...", "question": "How heavy is it?"}.'), 400
+        question = question.strip()
+        problem = question_problem(question)
+        if problem is not None:
+            return jsonify(error=problem), 400
+        # One question at a time for each clicked thing, so its conversation stays in order.
+        with gate.one_at_a_time(("follow_up", inspection_id)):
+            inspection = inspections.get(inspection_id)
+            if inspection is None:
+                return jsonify(error=CLICK_AGAIN), 404
+            if inspection.kind == "person" and inspection.person_name is None:
+                return jsonify(error=UNKNOWN_PERSON), 400
+            if len(inspection.pairs) >= MAX_FOLLOW_UPS:
+                return jsonify(error=TOO_MANY_FOLLOW_UPS), 400
+            reply, code = answer_follow_up(assistant, inspection, question)
+            if "error" not in reply:                  # a failed question is not kept
+                inspections.add_pair(inspection_id, question, reply["text"])
+        return jsonify(reply), code
+
+    @app.post("/api/camera")
+    def camera() -> Any:
+        body = request.get_json(silent=True)
+        address = body.get("address") if isinstance(body, dict) else None
+        if not isinstance(address, str):
+            return jsonify(error='Send the address as JSON, like {"address": "192.168.1.7:8080"}.'), 400
+        try:
+            url = phone_url(address)
+        except ValueError as error:                   # phone_url's own plain message
+            return jsonify(error=str(error)), 400
+        pipeline.use_phone(url)                       # returns at once; the page watches the status
+        if camera_file is not None:
+            try:
+                remember(camera_file, url)
+            except OSError as error:                  # the switch still happened
+                log.warning("Could not remember the phone address in %s: %s", camera_file, error)
+        return jsonify(ok=True, url=url)
 
     @app.errorhandler(HTTPException)
     def http_error(error: HTTPException) -> Any:
@@ -393,6 +504,39 @@ def look_up(assistant: Any, inspection: Inspection) -> tuple[dict[str, Any], int
         log.exception("Looking up a clicked object failed")
         return {"error": f"Something went wrong while looking it up ({type(error).__name__}). "
                          "Please click it again."}, 500
+
+
+def answer_follow_up(assistant: Any, inspection: Inspection, question: str) -> tuple[dict[str, Any], int]:
+    """Ask one more question about a clicked thing: (the JSON answer, the HTTP status).
+
+    An object or an area: the assistant gets the stored photo, label, description
+    and earlier questions. A recognised person: only text goes to the chat, with
+    a sentence naming them; their picture is never sent anywhere.
+    """
+    if inspection.kind == "person":
+        named = f"This question is about {inspection.person_name}, who the camera recognises. {question}"
+        if len(named) > MAX_QUESTION_CHARS:           # the text actually sent must fit the chat's limit
+            limit = MAX_QUESTION_CHARS - (len(named) - len(question))
+            return {"error": f"The question is too long ({len(question)} characters). "
+                             f"Questions about a person can have at most {limit} characters."}, 400
+    try:
+        if inspection.kind == "person":
+            log.info("Answering a follow-up question about a recognised person")
+            answer = assistant.ask(named)
+        else:
+            log.info("Answering a follow-up question about %s",
+                     f"a {inspection.label}" if inspection.label else "a clicked area")
+            answer = assistant.follow_up(inspection.photo, inspection.label or None, inspection.info,
+                                         inspection.pairs, question)
+    except ValueError as error:                   # the assistant's own check of the question or picture
+        return {"error": str(error)}, 400
+    except AssistantError as error:               # no key, no internet, busy, refusal ...
+        return {"error": str(error)}, 200
+    except Exception as error:
+        log.exception("Answering a follow-up question failed")
+        return {"error": f"Something went wrong while answering ({type(error).__name__}). "
+                         "Please ask again."}, 500
+    return answer_json(answer), 200
 
 
 def mjpeg_stream(pipeline: Any, clock: Callable[[], float] = time.monotonic,
@@ -441,6 +585,23 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     if args.file and args.source not in (None, "file"):
         parser.error(f"--file plays a clip, so it cannot be used with --source {args.source}")
     return args
+
+
+def with_remembered_phone(config: dict[str, Any], remembered: str | None) -> dict[str, Any]:
+    """A copy of the settings with the phone address from the camera box, when one is remembered.
+
+    It replaces stream.phone_url for every source choice: it only matters once the
+    source is the phone, from the start or after a switch. When it is the same phone
+    (host and port) as the one in config.yaml, the configured address is kept, because
+    it may carry the phone's login, which the camera box never accepts. config.yaml
+    is not changed.
+    """
+    if remembered is None:
+        return config
+    configured = section(config, "stream").get("phone_url")
+    if isinstance(configured, str) and same_phone(configured, remembered):
+        return config
+    return {**config, "stream": {**section(config, "stream"), "phone_url": remembered}}
 
 
 def with_overrides(config: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
@@ -514,6 +675,8 @@ def main(argv: list[str] | None = None) -> int:
               "Open that address, or stop the other copy first.")
         return 1
     setup_logging(log_file)
+    camera_file = resolve_path(CAMERA_FILE)
+    config = with_remembered_phone(config, load_remembered(camera_file))   # after logging: it may log a line
 
     try:
         pipeline = Pipeline(config)
@@ -521,7 +684,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Cannot start: {error}")
         return 1
     assistant = build_assistant(config, pipeline)
-    app = create_app(pipeline, assistant)
+    app = create_app(pipeline, assistant, camera_file)
 
     pipeline.start()
     print(f"Demo page: {url}   (Ctrl+C stops the program)")

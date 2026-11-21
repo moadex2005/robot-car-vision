@@ -23,6 +23,7 @@ from anthropic.types.beta import BetaMessage
 
 from car_vision import assistant
 from car_vision.assistant import (
+    Answer,
     AnthropicClient,
     Assistant,
     AssistantError,
@@ -1343,6 +1344,192 @@ def test_parse_an_empty_name_keeps_about_and_specs(label: str | None, name: str)
 def test_parse_no_name_line_but_other_keys_keeps_them() -> None:
     text = "ABOUT: A computer.\nSPECS:\n- Weight: 1.5 kg\n"
     assert parse_object_info(text, "laptop") == ("Laptop", "A computer.", (("Weight", "1.5 kg"),))
+
+
+# ---- M8: follow-up questions -------------------------------------------------------
+
+
+INFO = ObjectInfo(name="Laptop", summary="A portable computer.",
+                  specs=(("Weight", "about 1.5 kg"), ("Battery", "8 hours")))
+LAPTOP_LINE = 'The object detector labelled this "laptop".'
+PAIRS = [("How heavy is it?", "About 1.5 kg."), ("Is it new?", "It looks a few years old.")]
+
+
+def picture_block() -> dict[str, Any]:
+    return assistant.user_turn("x", PICTURE)["content"][0]
+
+
+def followed_up(settings: dict, info: ObjectInfo | None = INFO, earlier: Any = (),
+                question: str = "What is it made of?", label: Any = "laptop",
+                **reply: Any) -> tuple[Answer, FakeClient]:
+    fake = FakeClient([LLMReply(text="Aluminium and plastic.",
+                                new_turns=({"role": "assistant", "content": []},), **reply)])
+    answer = Assistant(settings, client=fake).follow_up(PICTURE, label, info, earlier, question)
+    return answer, fake
+
+
+def test_follow_up_turns_without_a_description(settings: dict) -> None:
+    _, fake = followed_up(settings, info=None, label=None)
+    no_label = assistant.label_text(None)
+    # The question joins the picture turn, so two user turns never follow each other.
+    assert fake.calls[0][1] == [{"role": "user", "content": [
+        picture_block(), {"type": "text", "text": no_label},
+        {"type": "text", "text": "What is it made of?"}]}]
+
+
+def test_follow_up_turns_without_a_description_but_with_pairs(settings: dict) -> None:
+    _, fake = followed_up(settings, info=None, earlier=PAIRS[:1])
+    assert fake.calls[0][1] == [
+        {"role": "user", "content": [picture_block(), {"type": "text", "text": LAPTOP_LINE},
+                                     {"type": "text", "text": "How heavy is it?"}]},
+        {"role": "assistant", "content": "About 1.5 kg."},
+        {"role": "user", "content": "What is it made of?"},
+    ]
+
+
+def test_follow_up_turns_with_a_description_and_no_pairs(settings: dict) -> None:
+    _, fake = followed_up(settings)
+    assert fake.calls[0][1] == [
+        assistant.user_turn(LAPTOP_LINE, PICTURE),          # the same turn describe sends
+        {"role": "assistant", "content": assistant.info_text(INFO)},
+        {"role": "user", "content": "What is it made of?"},
+    ]
+
+
+def test_follow_up_turns_with_a_description_and_two_pairs(settings: dict) -> None:
+    _, fake = followed_up(settings, earlier=PAIRS, question="  Who makes it?  ")
+    assert fake.calls[0][1] == [
+        assistant.user_turn(LAPTOP_LINE, PICTURE),
+        {"role": "assistant", "content": assistant.info_text(INFO)},
+        {"role": "user", "content": "How heavy is it?"},
+        {"role": "assistant", "content": "About 1.5 kg."},
+        {"role": "user", "content": "Is it new?"},
+        {"role": "assistant", "content": "It looks a few years old."},
+        {"role": "user", "content": "Who makes it?"},
+    ]
+
+
+def test_follow_up_turns_match_what_describe_sent(settings: dict) -> None:
+    fake = FakeClient()
+    bot = Assistant(settings, client=fake)
+    bot.describe(PICTURE, "laptop")
+    bot.follow_up(PICTURE, "laptop", INFO, [], "More?")
+    assert fake.calls[1][1][0] == fake.calls[0][1][0]
+
+
+def test_follow_up_system_prompt_is_its_own_and_the_same_every_call(settings: dict) -> None:
+    fake = FakeClient()
+    bot = Assistant(settings, client=fake)
+    bot.follow_up(PICTURE, "laptop", INFO, [], "One?")
+    bot.follow_up(PICTURE, None, None, PAIRS, "Two?")
+    assert fake.calls[0][0] == fake.calls[1][0] == assistant.FOLLOW_UP_PROMPT
+    assert assistant.FOLLOW_UP_PROMPT not in (assistant.DESCRIBE_PROMPT, build_system_prompt(NOTES))
+
+
+def test_follow_up_answer_and_sources(settings: dict) -> None:
+    answer, _ = followed_up(settings, used_web=True,
+                            sources=("https://a.example", "https://a.example", "https://b.example"))
+    assert answer == Answer(text="Aluminium and plastic.", used_web=True,
+                            sources=("https://a.example", "https://b.example"))
+
+
+@pytest.mark.parametrize("web_search", [True, False])
+def test_follow_up_web_search_follows_the_setting(settings: dict, web_search: bool) -> None:
+    settings["web_search"] = web_search
+    _, fake = followed_up(settings)
+    assert fake.calls[0][2] is web_search
+
+
+def test_follow_up_neither_sends_nor_changes_the_chat_history(settings: dict) -> None:
+    fake = FakeClient()
+    bot = Assistant(settings, client=fake)
+    bot.ask("one")
+    bot.follow_up(PICTURE, "laptop", INFO, PAIRS, "What is it made of?")
+    bot.ask("two")
+    assert "one" not in [t["content"] for t in fake.calls[1][1]]
+    assert [t["content"] for t in fake.calls[2][1]] == ["one", ["block-1"], "two"]
+
+
+@pytest.mark.parametrize(("change", "says"), [
+    ({"image": b"\x89PNG not a jpeg"}, "JPEG"),
+    ({"label": "x" * 61}, "too long"),
+    ({"label": 7}, "must be text"),
+    ({"question": "   "}, "empty"),
+    ({"question": "x" * 2001}, "too long"),
+    ({"question": None}, "must be text"),
+    ({"earlier": [("q", "a")] * 11}, "At most 10"),
+    ({"earlier": [("q", "")]}, "pair of texts"),
+    ({"earlier": [("q", "a", "extra")]}, "pair of texts"),
+    ({"earlier": ["qa"]}, "pair of texts"),
+])
+def test_follow_up_refuses_bad_input_before_sending(settings: dict, change: dict, says: str) -> None:
+    call = {"image": PICTURE, "label": "laptop", "info": INFO, "earlier": [], "question": "Why?"}
+    call.update(change)
+    fake = FakeClient()
+    with pytest.raises(ValueError, match=says):
+        Assistant(settings, client=fake).follow_up(**call)
+    assert fake.calls == []
+
+
+def test_follow_up_accepts_ten_earlier_pairs_given_as_lists(settings: dict) -> None:
+    _, fake = followed_up(settings, earlier=[["q", "a"]] * 10)
+    assert len(fake.calls[0][1]) == 2 + 20 + 1
+
+
+@pytest.mark.parametrize(("stop_reason", "says"), [("refusal", "declined"),
+                                                   ("max_tokens", "max_tokens")])
+def test_follow_up_refusal_and_max_tokens_raise(settings: dict, stop_reason: str, says: str) -> None:
+    response = message([text_block("It is")], stop_reason=stop_reason)
+    bot = Assistant(settings, client=client_with(settings, FakeSDK([response])))
+    with pytest.raises(AssistantError, match=says):
+        bot.follow_up(PICTURE, "laptop", INFO, [], "Why?")
+
+
+def test_follow_up_waits_on_the_describe_lock(settings: dict, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(assistant, "DESCRIBE_WAIT_SECONDS", 0.2)
+    release = threading.Event()
+
+    class StuckOnPictures(FakeClient):
+        def complete(self, system: str, turns: list, allow_web: bool) -> LLMReply:
+            if isinstance(turns[0]["content"], list):        # describe or follow_up
+                release.wait(5)
+            return super().complete(system, turns, allow_web)
+
+    bot = Assistant(settings, client=StuckOnPictures())
+    first = threading.Thread(target=bot.describe, args=(PICTURE, "laptop"))
+    first.start()
+    time.sleep(0.05)
+    try:
+        with pytest.raises(AssistantError) as caught:
+            bot.follow_up(PICTURE, "laptop", INFO, [], "Why?")
+        assert str(caught.value) == assistant.DESCRIBE_BUSY_MESSAGE
+        assert bot.ask("Is the chat free?").text
+    finally:
+        release.set()
+        first.join(5)
+    assert bot.follow_up(PICTURE, "laptop", INFO, [], "Why?").text
+
+
+@pytest.mark.parametrize("info", [
+    INFO,
+    ObjectInfo(name="Clock", summary="A wall clock. It ticks.", specs=(("Shows", "12:45 style time"),)),
+    ObjectInfo(name="Unknown object", summary="I cannot tell what this is.", specs=()),
+    ObjectInfo(name="Office chair", summary="",
+               specs=tuple((f"Spec {n}", f"value {n}") for n in range(1, 7))),
+    ObjectInfo(name="Robot", summary="A robot.", specs=(("Name", "Rover"), ("About", "2 kg"))),
+])
+def test_info_text_round_trips_through_the_parser(info: ObjectInfo) -> None:
+    assert parse_object_info(assistant.info_text(info), None) == (info.name, info.summary, info.specs)
+
+
+def test_info_text_shape() -> None:
+    assert assistant.info_text(INFO) == ("NAME: Laptop\nABOUT: A portable computer.\nSPECS:\n"
+                                         "- Weight: about 1.5 kg\n- Battery: 8 hours")
+
+
+def test_info_text_puts_a_summary_on_one_line() -> None:
+    info = ObjectInfo(name="Cup", summary="A cup.\nIt holds tea.", specs=())
+    assert parse_object_info(assistant.info_text(info), None)[1] == "A cup. It holds tea."
 
 
 # ---- the one-module rule and the live test -------------------------------------

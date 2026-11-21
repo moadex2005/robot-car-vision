@@ -11,13 +11,19 @@ A phone on the car streams its camera to this laptop. The laptop labels objects,
 - **Live video** with a box, a label and a track number on every object the detector finds.
 - **In view**: a list of those objects. Click one in the list, or click it in the video.
 - **Details panel**: a small photo of what you clicked, what it is, a short description and its specifications. For a person the camera recognises, it shows what you wrote about them in their `about.md` instead.
+- **Ask about this**: a small chat at the bottom of the details panel, for more questions about the thing you clicked. Each thing keeps its own short conversation (up to 10 questions).
 - **Chat**: type a question; the assistant answers from `data/knowledge.md` and searches the web when the notes do not have the answer.
+- **Full screen**: the button in the corner of the video, or the `F` key. The list and the details panel work there too.
+- **Camera**: the button in the top bar. Type the address IP Webcam shows on the phone (like `192.168.1.7:8080`) and press Connect; the page switches to that phone at once and remembers it for next time. The same box has a **Delay test** switch: it shows a clock with milliseconds, so pointing the phone at the screen shows how far the video is behind.
+- **Light and dark**: the sun and moon button in the top bar. Until you choose, the page follows Windows.
 
 Limits to know before the demo:
 
 - The detector knows 80 everyday kinds of object (person, chair, laptop, bottle and so on). Anything else gets no box. Click it anyway: the assistant's API looks at that part of the picture and searches the web if it has to.
 - The description and specifications come from a language model looking at a small picture. For an ordinary object they are typical values, and they can be wrong.
-- A click on an object sends a small cut-out of the picture to the API, costs one API call and takes a few seconds. A second click on the same tracked object is answered from memory. A click on a person sends nothing.
+- A click on an object sends a small cut-out of the picture to the API, costs one API call and takes a few seconds. A second click on the same tracked object is answered from memory. Each follow-up question sends the same cut-out again and costs one more call. A click on a person sends nothing.
+- Keep one browser tab of the page open, not several: every open tab pulls the video and draws the page, and that slows the detection down.
+- The Camera box accepts only addresses on the local network (`192.168.x.x`, `10.x.x.x`, `172.16` to `172.31`), without a login.
 
 ## Install (Windows 11)
 
@@ -67,7 +73,7 @@ Everything you can change is in `config.yaml`, with a comment beside each value.
 1. Install the **IP Webcam** app on the Android phone.
 2. Put the phone and the laptop on the same network. The simplest way is to turn on the phone's own hotspot and join it from the laptop.
 3. In IP Webcam, set the video resolution to 640 x 480, scroll down and tap **Start server**. The app shows an address such as `http://192.168.43.1:8080`.
-4. Put that address plus `/video` into `stream.phone_url` in `config.yaml`.
+4. Start the demo page and type that address into the **Camera** box. (Or put the address plus `/video` into `stream.phone_url` in `config.yaml`; an address typed on the page is remembered in `data/camera.json` and wins at the next start.)
 5. Test it:
 
    ```powershell

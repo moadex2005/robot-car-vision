@@ -9,6 +9,13 @@ draws them on the server's own copy of the photo). The camera
 box on the page sends a phone's address to /api/camera, which switches the
 video to that phone and remembers the address for the next start, and the
 picture size to ask the phone for to /api/camera/picture.
+
+The People section of the page adds, edits and removes the person folders
+(/api/people, through people.PeopleBook) and takes a person's photos from the
+live camera (/api/people/<id>/photos, then /api/people/photos for the
+progress). The Notes section reads and writes the assistant's notes file
+(/api/notes). /api/scene asks the assistant to describe the whole picture.
+After every such change the assistant reads its notes and briefs again.
 Start it with
 
     .venv\\Scripts\\python.exe -m car_vision.app
@@ -25,7 +32,9 @@ import argparse
 import base64
 import logging
 import math
+import os
 import secrets
+import shutil
 import socket
 import sys
 import threading
@@ -43,7 +52,9 @@ from werkzeug.exceptions import HTTPException
 
 from car_vision.assistant import MAX_IMAGE_BYTES, Assistant, AssistantError, ObjectInfo
 from car_vision.config import ConfigError, load_config, require, resolve_path, section
+from car_vision.faces import PERSON_ID
 from car_vision.marking import NEARLY_ALL, mark_photo, marked_share
+from car_vision.people import MAX_LINE, MAX_LINES, MAX_NAME, MAX_ROLE, MAX_STORY, PeopleBook
 from car_vision.phone import load_remembered, phone_url, remember, same_phone
 from car_vision.pipeline import Pipeline
 from car_vision.stream import SOURCES
@@ -78,6 +89,17 @@ TOO_MANY_FOLLOW_UPS = (f"That is {MAX_FOLLOW_UPS} questions about this one alrea
 UNKNOWN_PERSON = "There is nothing to ask about a person the camera does not recognise."
 CAMERA_FILE = "data/camera.json" # the last phone address asked for (git-ignored)
 
+MAX_NOTES_CHARS = 50_000         # the notes file the page may save
+MAX_ID_CHARS = 100               # a person id in an address is never longer
+PHOTO_COUNT = 5                  # photos taken when the page does not say how many
+NO_PEOPLE = ("Adding people from the page is not available: "
+             "recognizer.photos_dir is not set in config.yaml.")
+NO_NOTES = "Editing the notes from the page is not available: assistant.notes_file is not set in config.yaml."
+NO_SUCH_PERSON = "There is no such person. Reload the page to see who is there."
+NO_PICTURE = "There is no picture from the camera yet. Please try again in a moment."
+PERSON_SHAPE = ('Send the person as JSON, like {"name": "Sara Ahmed", "role": "Team lead", '
+                '"lines": ["Built the chassis"], "story": ""}.')
+
 
 class UnavailableAssistant:
     """Stands in when the real assistant could not be built, e.g. the notes file is missing.
@@ -98,8 +120,14 @@ class UnavailableAssistant:
                   marked: bytes | None = None) -> Any:
         raise AssistantError(self.reason)
 
+    def describe_scene(self, image: bytes) -> Any:
+        raise AssistantError(self.reason)
+
     def reset(self) -> None:
         pass
+
+    def reload(self) -> None:
+        raise AssistantError(f"{self.reason} Restart the program once the problem is fixed.")
 
 
 # ---- what the server remembers about clicks -------------------------------------------
@@ -357,6 +385,137 @@ def read_point(point: Any) -> tuple[float, float] | None:
     return None if x is None or y is None else (x, y)
 
 
+# ---- people, notes and the assistant reading them again ------------------------------------
+
+
+def is_person_id(person_id: str) -> bool:
+    """True for an id that can be a person folder; checked before an id from an address is used."""
+    return len(person_id) <= MAX_ID_CHARS and PERSON_ID.fullmatch(person_id) is not None
+
+
+def entry_json(entry: Any, enrolled: set[str]) -> dict[str, Any]:
+    """One person for the People section: details and a photo count, never a picture."""
+    person = entry.person
+    return {"id": person.person_id, "name": person.name, "role": person.role,
+            "lines": list(person.lines), "story": person.story,
+            "photos": int(entry.photos), "enrolled": person.person_id in enrolled}
+
+
+def person_fields(body: Any) -> dict[str, Any] | str:
+    """The arguments for PeopleBook.save from a request body, or the reason the shape is wrong.
+
+    The kinds and lengths of the fields are checked by PeopleBook.save itself.
+    """
+    if not isinstance(body, dict):
+        return PERSON_SHAPE
+    lines = body.get("lines", [])
+    if not isinstance(lines, list):
+        return "The card lines must be a list of lines of text."
+    return {"name": body.get("name", ""), "role": body.get("role", ""), "lines": lines,
+            "story": body.get("story", "")}
+
+
+def reload_assistant(assistant: Any) -> str | None:
+    """Make the assistant read the notes and the person briefs again; a warning when it could not.
+
+    The change itself has happened by then, so a failure here is a warning, not an error.
+    """
+    try:
+        assistant.reload()
+    except AssistantError as error:
+        log.warning("The assistant could not read its notes again: %s", error)
+        return f"The assistant still answers from the old notes: {error}"
+    except Exception as error:
+        log.exception("The assistant could not read its notes again")
+        return f"The assistant still answers from the old notes ({type(error).__name__})."
+    return None
+
+
+def enrol_again(pipeline: Any) -> str | None:
+    """Enrol the remaining people again after a removal; a warning when it failed."""
+    try:
+        pipeline.reload_people()
+    except RuntimeError:                       # face recognition is off: nobody's face is in use
+        return None
+    except Exception as error:
+        log.exception("Enrolling the people again failed")
+        return (f"The faces could not be enrolled again ({type(error).__name__}); "
+                "the camera may still recognise this person until the program is restarted.")
+    return None
+
+
+def with_warnings(payload: dict[str, Any], *warnings: str | None) -> dict[str, Any]:
+    """The payload with "warning" added when there is one."""
+    found = [warning for warning in warnings if warning]
+    if found:
+        payload["warning"] = " ".join(found)
+    return payload
+
+
+class PhotoWatch:
+    """Remembers that the page started a photo session, so that its end reloads the assistant once.
+
+    Several pages may poll the progress; only the first poll that sees the end gets True.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._waiting = False
+
+    def started(self) -> None:
+        with self._lock:
+            self._waiting = True
+
+    def ended_done(self, state: Any) -> bool:
+        """True exactly once after a started session ended "done"; "failed" just stops the waiting."""
+        with self._lock:
+            if not self._waiting or state not in ("done", "failed"):
+                return False
+            self._waiting = False
+            return state == "done"
+
+
+def notes_problem(text: Any) -> str | None:
+    """Why this text cannot be saved as the notes, or None when it is fine."""
+    if not isinstance(text, str):
+        return 'Send the notes as JSON, like {"text": "# Our robot car ..."}.'
+    if len(text) > MAX_NOTES_CHARS:
+        return f"The notes may be at most {MAX_NOTES_CHARS} characters long; these are {len(text)}."
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:                 # e.g. half of a character pair from a broken paste
+        return "The notes contain a character that cannot be saved. Please remove it and save again."
+    return None
+
+
+def read_notes(path: Path) -> str:
+    """The notes file's text; "" when there is no file yet."""
+    if not path.exists():
+        return ""
+    return path.read_text(encoding="utf-8-sig")
+
+
+def write_notes(path: Path, text: str) -> None:
+    """Write the notes as UTF-8 so the file is never half written, keeping the old file as .bak.
+
+    The new text goes to a temporary file in the same folder first; only when that
+    is complete is the old file copied to <name>.bak and replaced in one step.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.partial")
+    try:
+        with open(temporary, "w", encoding="utf-8", newline="") as file:
+            file.write(text)
+            file.flush()
+            os.fsync(file.fileno())
+        if path.exists():
+            shutil.copy2(path, path.with_name(path.name + ".bak"))
+        os.replace(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
 # ---- the web server ------------------------------------------------------------
 
 
@@ -370,20 +529,27 @@ def question_problem(question: str) -> str | None:
     return None
 
 
-def create_app(pipeline: Any, assistant: Any, camera_file: Path | None = None) -> Flask:
+def create_app(pipeline: Any, assistant: Any, camera_file: Path | None = None,
+               people: PeopleBook | None = None, notes_file: Path | None = None) -> Flask:
     """The Flask app for one pipeline and one assistant (real ones, or fakes in the tests).
 
     `camera_file` is where /api/camera remembers the phone's address; with None
-    (as in most tests) the address is used but not remembered.
+    (as in most tests) the address is used but not remembered. `people` is the
+    book of person folders and `notes_file` the assistant's notes; with None the
+    page hides its People or Notes section and those routes answer with a plain error.
     """
     app = Flask(__name__)
     inspections = InspectionStore()
     answers = AnswerCache()
     gate = LookupGate()
+    photo_watch = PhotoWatch()
 
     @app.get("/")
     def page() -> str:
-        return render_template("index.html", max_question_chars=MAX_QUESTION_CHARS)
+        return render_template("index.html", max_question_chars=MAX_QUESTION_CHARS,
+                               has_people=people is not None, has_notes=notes_file is not None,
+                               max_notes_chars=MAX_NOTES_CHARS, max_name=MAX_NAME, max_role=MAX_ROLE,
+                               max_story=MAX_STORY, max_lines=MAX_LINES, max_line=MAX_LINE)
 
     @app.get("/video")
     def video() -> Response:
@@ -544,6 +710,158 @@ def create_app(pipeline: Any, assistant: Any, camera_file: Path | None = None) -
         except ValueError as error:                  # not a choice, or a size the phone does not offer
             return jsonify(error=str(error)), 400
         return jsonify(ok=True)
+
+    # ---- people: the order of effects is always files, then the vision side, then the assistant
+
+    @app.get("/api/people")
+    def people_list() -> Any:
+        if people is None:
+            return jsonify(error=NO_PEOPLE), 503
+        enrolled = pipeline.enrolled_ids()
+        recognition = bool(pipeline.status().get("recognition"))
+        return jsonify(people=[entry_json(entry, enrolled) for entry in people.all()], recognition=recognition)
+
+    @app.post("/api/people")
+    def person_add() -> Any:
+        if people is None:
+            return jsonify(error=NO_PEOPLE), 503
+        fields = person_fields(request.get_json(silent=True))
+        if isinstance(fields, str):
+            return jsonify(error=fields), 400
+        try:
+            person = people.save(**fields)
+        except ValueError as error:                   # PeopleBook's own plain message
+            return jsonify(error=str(error)), 400
+        log.info("Added the person %s", person.person_id)
+        return jsonify(with_warnings({"ok": True, "id": person.person_id}, reload_assistant(assistant)))
+
+    @app.put("/api/people/<person_id>")
+    def person_change(person_id: str) -> Any:
+        if people is None:
+            return jsonify(error=NO_PEOPLE), 503
+        if not is_person_id(person_id):               # checked before the id is used for anything
+            return jsonify(error=NO_SUCH_PERSON), 404
+        fields = person_fields(request.get_json(silent=True))
+        if isinstance(fields, str):
+            return jsonify(error=fields), 400
+        try:
+            people.save(**fields, person_id=person_id)
+        except KeyError:
+            return jsonify(error=NO_SUCH_PERSON), 404
+        except ValueError as error:
+            return jsonify(error=str(error)), 400
+        log.info("Changed the details of %s", person_id)
+        # Enrolling again makes the camera side read the new name and role too, so the label on
+        # the video and the person's panel change at once, not only after a restart.
+        return jsonify(with_warnings({"ok": True, "id": person_id},
+                                     enrol_again(pipeline), reload_assistant(assistant)))
+
+    @app.delete("/api/people/<person_id>")
+    def person_remove(person_id: str) -> Any:
+        if people is None:
+            return jsonify(error=NO_PEOPLE), 503
+        if not is_person_id(person_id):
+            return jsonify(error=NO_SUCH_PERSON), 404
+        progress = pipeline.photo_progress()          # photos of this person stop before the folder moves
+        if progress and progress.get("person_id") == person_id and progress.get("state") == "taking":
+            pipeline.cancel_photos()
+        try:
+            people.remove(person_id)
+        except KeyError:
+            return jsonify(error=NO_SUCH_PERSON), 404
+        except OSError as error:
+            log.warning("Could not move the folder of %s aside: %s", person_id, error)
+            return jsonify(error="The person's folder could not be moved aside. Is a file in it open "
+                                 "in another program?"), 500
+        log.info("Removed %s (the folder was moved aside)", person_id)
+        return jsonify(with_warnings({"ok": True}, enrol_again(pipeline), reload_assistant(assistant)))
+
+    @app.post("/api/people/<person_id>/photos")
+    def photos_start(person_id: str) -> Any:
+        if people is None:
+            return jsonify(error=NO_PEOPLE), 503
+        if not is_person_id(person_id):
+            return jsonify(error=NO_SUCH_PERSON), 404
+        body = request.get_json(silent=True)
+        count = body.get("count", PHOTO_COUNT) if isinstance(body, dict) else PHOTO_COUNT
+        try:
+            pipeline.start_photos(person_id, count)
+        except KeyError:
+            return jsonify(error=NO_SUCH_PERSON), 404
+        except ValueError as error:                   # recognition off, already running, a bad count
+            return jsonify(error=str(error)), 400
+        photo_watch.started()
+        return jsonify(ok=True)
+
+    @app.get("/api/people/photos")
+    def photos_progress() -> Any:
+        if people is None:
+            return jsonify(error=NO_PEOPLE), 503
+        progress = pipeline.photo_progress()
+        payload: dict[str, Any] = {"progress": progress}
+        if progress is not None and photo_watch.ended_done(progress.get("state")):
+            with_warnings(payload, reload_assistant(assistant))   # once, however many pages poll
+        response = jsonify(payload)
+        response.headers["Cache-Control"] = "no-store"
+        return response
+
+    @app.delete("/api/people/photos")
+    def photos_cancel() -> Any:
+        if people is None:
+            return jsonify(error=NO_PEOPLE), 503
+        pipeline.cancel_photos()
+        return jsonify(ok=True)
+
+    # ---- the notes ------------------------------------------------------------------
+
+    @app.get("/api/notes")
+    def notes_read() -> Any:
+        if notes_file is None:
+            return jsonify(error=NO_NOTES), 503
+        try:
+            text = read_notes(notes_file)
+        except (OSError, UnicodeDecodeError) as error:
+            log.warning("Could not read the notes file %s: %s", notes_file, error)
+            return jsonify(error="The notes file could not be read as UTF-8 text."), 500
+        response = jsonify(text=text)
+        response.headers["Cache-Control"] = "no-store"
+        return response
+
+    @app.put("/api/notes")
+    def notes_write() -> Any:
+        if notes_file is None:
+            return jsonify(error=NO_NOTES), 503
+        body = request.get_json(silent=True)
+        text = body.get("text") if isinstance(body, dict) else None
+        problem = notes_problem(text)
+        if problem is not None:                       # nothing is written
+            return jsonify(error=problem), 400
+        try:
+            write_notes(notes_file, text)
+        except OSError as error:
+            log.warning("Could not write the notes file %s: %s", notes_file, error)
+            return jsonify(error="The notes could not be saved. Is the file open in another program?"), 500
+        log.info("The notes were saved from the page (%d characters)", len(text))
+        return jsonify(with_warnings({"ok": True}, reload_assistant(assistant)))
+
+    # ---- describe the scene --------------------------------------------------------------
+
+    @app.post("/api/scene")
+    def scene() -> Any:
+        photo = pipeline.scene_photo()                # the server's own picture: none comes from the browser
+        if photo is None:
+            return jsonify(error=NO_PICTURE), 503
+        try:
+            answer = assistant.describe_scene(photo)
+        except ValueError as error:
+            return jsonify(error=str(error)), 400
+        except AssistantError as error:               # no key, no internet, busy, refusal ...
+            return jsonify(error=str(error))
+        except Exception as error:
+            log.exception("Describing the scene failed")
+            return jsonify(error=f"Something went wrong while describing the scene ({type(error).__name__}). "
+                                 "Please try again."), 500
+        return jsonify(text=str(answer.text))
 
     @app.errorhandler(HTTPException)
     def http_error(error: HTTPException) -> Any:
@@ -745,6 +1063,26 @@ def build_assistant(config: dict[str, Any], pipeline: Pipeline) -> Any:
         return UnavailableAssistant(f"The assistant is not available: {error}")
 
 
+def build_people_book(config: dict[str, Any]) -> PeopleBook | None:
+    """The book of person folders in recognizer.photos_dir, with removed folders moved to
+    <photos_dir>.removed beside it (data/people.removed); None when the setting is missing."""
+    try:
+        photos_dir = resolve_path(require(section(config, "recognizer"), "photos_dir", str))
+    except ConfigError as error:
+        log.warning("Adding people from the page is off: %s", error)
+        return None
+    return PeopleBook(photos_dir, photos_dir.with_name(photos_dir.name + ".removed"))
+
+
+def notes_path(config: dict[str, Any]) -> Path | None:
+    """The assistant's notes file (assistant.notes_file); None when the setting is missing."""
+    try:
+        return resolve_path(require(section(config, "assistant"), "notes_file", str))
+    except ConfigError as error:
+        log.warning("Editing the notes from the page is off: %s", error)
+        return None
+
+
 def already_serving(host: str, port: int, timeout: float = PORT_CHECK_SECONDS) -> bool:
     """True when something already answers on host:port, e.g. a copy of this program.
 
@@ -793,7 +1131,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Cannot start: {error}")
         return 1
     assistant = build_assistant(config, pipeline)
-    app = create_app(pipeline, assistant, camera_file)
+    app = create_app(pipeline, assistant, camera_file, build_people_book(config), notes_path(config))
 
     pipeline.start()
     print(f"Demo page: {url}   (Ctrl+C stops the program)")

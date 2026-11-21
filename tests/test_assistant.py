@@ -1622,6 +1622,224 @@ def test_info_text_puts_a_summary_on_one_line() -> None:
     assert parse_object_info(assistant.info_text(info), None)[1] == "A cup. It holds tea."
 
 
+# ---- M12: describing the whole scene ------------------------------------------------
+
+
+def scene_reply(text: str = "A desk with a laptop and a cup.") -> LLMReply:
+    return LLMReply(text=text, new_turns=({"role": "assistant", "content": []},))
+
+
+def test_describe_scene_sends_the_picture_and_the_camera_lines(settings: dict) -> None:
+    fake = FakeClient([scene_reply()])
+    state = state_seeing(["laptop", "person", "cup"])
+    answer = Assistant(settings, state=state, client=fake).describe_scene(PICTURE)
+    system, turns, allow_web = fake.calls[0]
+    assert system == assistant.SCENE_PROMPT
+    assert turns == [assistant.user_turn(
+        "In front of the camera right now: Sara.\n"
+        "The object detector sees right now: cup, laptop.\n"
+        "Describe the scene.", PICTURE)]
+    assert allow_web is False
+    assert answer == Answer(text="A desk with a laptop and a cup.")
+
+
+def test_describe_scene_when_nobody_is_recognised(settings: dict) -> None:
+    fake = FakeClient()
+    Assistant(settings, state=WorldState(), client=fake).describe_scene(PICTURE)
+    assert fake.calls[0][1] == [assistant.user_turn(
+        "Nobody recognised is in front of the camera right now.\nDescribe the scene.", PICTURE)]
+
+
+def test_describe_scene_without_a_state_sends_the_request_alone(settings: dict) -> None:
+    fake = FakeClient()
+    Assistant(settings, client=fake).describe_scene(PICTURE)
+    assert fake.calls[0][1] == [assistant.user_turn("Describe the scene.", PICTURE)]
+    assert fake.calls[0][0] == assistant.SCENE_PROMPT
+
+
+@pytest.mark.parametrize("web_search", [True, False])
+def test_describe_scene_never_searches_the_web(settings: dict, web_search: bool) -> None:
+    settings["web_search"] = web_search
+    fake = FakeClient()
+    Assistant(settings, client=fake).describe_scene(PICTURE)
+    assert fake.calls[0][2] is False
+
+
+def test_describe_scene_request_has_no_web_tool(settings: dict) -> None:
+    sdk = FakeSDK([message([THINKING, text_block("A desk with a laptop.")])])
+    bot = Assistant(settings, client=client_with(settings, sdk))
+    assert bot.describe_scene(PICTURE).text == "A desk with a laptop."
+    assert "tools" not in sdk.requests[0]
+
+
+def test_describe_scene_neither_sends_nor_changes_the_chat_history(settings: dict) -> None:
+    fake = FakeClient()
+    bot = Assistant(settings, client=fake)
+    bot.ask("one")
+    bot.describe_scene(PICTURE)
+    bot.ask("two")
+    assert len(fake.calls[1][1]) == 1                    # only its own user turn
+    assert [t["content"] for t in fake.calls[2][1]] == ["one", ["block-1"], "two"]
+
+
+@pytest.mark.parametrize("image", ["text", None, b"", b"\x89PNG not a jpeg",
+                                   assistant.JPEG_MARKER + b"x" * assistant.MAX_IMAGE_BYTES])
+def test_describe_scene_refuses_a_bad_picture_before_sending(settings: dict, image: Any) -> None:
+    fake = FakeClient()
+    with pytest.raises(ValueError):
+        Assistant(settings, client=fake).describe_scene(image)
+    assert fake.calls == []
+
+
+def test_describe_scene_shares_the_describe_lock_and_busy_message(
+        settings: dict, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(assistant, "DESCRIBE_WAIT_SECONDS", 0.2)
+    release = threading.Event()
+
+    class StuckOnPictures(FakeClient):
+        def complete(self, system: str, turns: list, allow_web: bool) -> LLMReply:
+            if isinstance(turns[0]["content"], list):        # a call with a picture
+                release.wait(5)
+            return super().complete(system, turns, allow_web)
+
+    bot = Assistant(settings, client=StuckOnPictures())
+    first = threading.Thread(target=bot.describe, args=(PICTURE, "laptop"))
+    first.start()
+    time.sleep(0.05)
+    try:
+        with pytest.raises(AssistantError) as caught:
+            bot.describe_scene(PICTURE)
+        assert str(caught.value) == assistant.DESCRIBE_BUSY_MESSAGE
+        assert bot.ask("Is the chat free?").text       # the chat does not wait
+    finally:
+        release.set()
+        first.join(5)
+    assert bot.describe_scene(PICTURE).text
+
+
+def test_scene_prompt_is_its_own_and_keeps_people_private(settings: dict, people_dir: Path) -> None:
+    add_person(people_dir, "sara", "# Sara\nBuilt the chassis.\n")
+    fake = FakeClient()
+    Assistant(settings, client=fake).describe_scene(PICTURE)
+    prompt = fake.calls[0][0]
+    assert prompt not in (assistant.DESCRIBE_PROMPT, assistant.FOLLOW_UP_PROMPT)
+    assert NOTES.strip() not in prompt and "chassis" not in prompt
+    assert "Never guess who anyone is." in prompt
+    assert "Say nothing about how anyone looks" in prompt
+    assert "A name may only ever come from the camera line." in prompt
+    assert "no Markdown" in prompt and "at most three short, plain" in prompt
+
+
+def test_describe_scene_logs_nothing(settings: dict, caplog: pytest.LogCaptureFixture) -> None:
+    bot = Assistant(settings, state=state_seeing(["cup"]), client=FakeClient())
+    with caplog.at_level("DEBUG", logger="car_vision.assistant"):
+        bot.describe_scene(PICTURE)
+    assert caplog.records == []
+
+
+# ---- M12: reloading the notes and the briefs ---------------------------------------
+
+
+def test_reload_picks_up_changed_notes_and_a_new_brief(settings: dict, notes_path: Path,
+                                                      people_dir: Path) -> None:
+    fake = FakeClient()
+    bot = Assistant(settings, client=fake)
+    bot.ask("one")
+    notes_path.write_text("# Project\nThe car is now called Comet.\n", encoding="utf-8")
+    add_person(people_dir, "lina", "# Lina\nTests the car.\n")
+    bot.reload()
+    bot.ask("two")
+    system = fake.calls[1][0]
+    assert "Comet" in system and "Rover" not in system
+    assert '<person id="lina" name="Lina">' in system and "Tests the car." in system
+    assert system == assistant.read_system_prompt(notes_path, people_dir)
+
+
+def test_reload_starts_a_fresh_conversation(settings: dict) -> None:
+    settings["history_turns"] = 2
+    fake = FakeClient()
+    bot = Assistant(settings, client=fake)
+    bot.ask("one")
+    bot.reload()
+    bot.ask("two")
+    bot.ask("three")
+    assert fake.calls[1][1] == [{"role": "user", "content": "two"}]
+    # The exchange count starts again too: "three" still follows "two".
+    assert [t["content"] for t in fake.calls[2][1]] == ["two", ["block-2"], "three"]
+
+
+def test_reload_with_unchanged_files_gives_the_start_up_prompt(settings: dict,
+                                                              people_dir: Path) -> None:
+    add_person(people_dir, "sara", "# Sara\n")
+    fake = FakeClient()
+    bot = Assistant(settings, client=fake)
+    bot.ask("one")
+    bot.reload()
+    bot.ask("two")
+    assert fake.calls[0][0] == fake.calls[1][0]
+
+
+def break_notes(notes_path: Path, how: str) -> None:
+    if how == "missing":
+        notes_path.unlink()
+    else:
+        notes_path.write_bytes("Café notes".encode("cp1252"))     # not UTF-8
+
+
+@pytest.mark.parametrize("how", ["missing", "ansi"])
+def test_reload_keeps_the_old_state_when_the_notes_cannot_be_read(
+        settings: dict, notes_path: Path, people_dir: Path, how: str) -> None:
+    fake = FakeClient()
+    bot = Assistant(settings, client=fake)
+    bot.ask("one")
+    break_notes(notes_path, how)
+    add_person(people_dir, "lina", "# Lina\n")
+    with pytest.raises(AssistantError):
+        bot.reload()
+    bot.ask("two")
+    assert fake.calls[1][0] == fake.calls[0][0]            # the old prompt, without Lina
+    assert [t["content"] for t in fake.calls[1][1]] == ["one", ["block-1"], "two"]
+
+
+def test_reload_waits_for_a_question_in_progress(settings: dict, notes_path: Path,
+                                                 monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(assistant, "LOCK_WAIT_SECONDS", 0.2)
+    release = threading.Event()
+
+    class StuckClient(FakeClient):
+        def complete(self, system: str, turns: list, allow_web: bool) -> LLMReply:
+            release.wait(5)
+            return super().complete(system, turns, allow_web)
+
+    fake = StuckClient()
+    bot = Assistant(settings, client=fake)
+    first = threading.Thread(target=bot.ask, args=("one",))
+    first.start()
+    time.sleep(0.05)
+    notes_path.write_text("# Project\nComet.\n", encoding="utf-8")
+    try:
+        with pytest.raises(AssistantError, match="still busy with the previous question"):
+            bot.reload()
+    finally:
+        release.set()
+        first.join(5)
+    bot.ask("two")                            # the busy reload changed nothing
+    assert "Comet" not in fake.calls[1][0]
+    assert [t["content"] for t in fake.calls[1][1]] == ["one", ["block-1"], "two"]
+    bot.reload()                              # free again once the answer is in
+    bot.ask("three")
+    assert "Comet" in fake.calls[2][0]
+
+
+def test_reload_warns_about_placeholders_like_start_up(settings: dict, notes_path: Path,
+                                                       caplog: pytest.LogCaptureFixture) -> None:
+    bot = Assistant(settings, client=FakeClient())
+    notes_path.write_text("# Team\n[REPLACE] names\n", encoding="utf-8")
+    with caplog.at_level("WARNING", logger="car_vision.assistant"):
+        bot.reload()
+    assert len(warnings_in(caplog)) == 1 and "placeholder" in warnings_in(caplog)[0]
+
+
 # ---- the one-module rule and the live test -------------------------------------
 
 

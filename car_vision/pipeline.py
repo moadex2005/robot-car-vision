@@ -32,6 +32,19 @@ offers, the box becomes that size (at most 1920 x 1080), so the detector, the
 recogniser, the photos for the assistant and the video on the page all get
 the sharper picture. A clip or the webcam always keeps the config box.
 
+People can be added from the page without a restart:
+- start_photos() begins a photo session for a person folder. On its face-check
+  frames the loop looks at the faces the recogniser found and saves the clean
+  frame as photo_<n>.jpg when exactly one face is in view, large and sharp
+  enough, a second after the last photo. photo_progress() tells the page how
+  it goes and what the person should do.
+- reload_people() enrols everyone again with the face model that is already
+  loaded and swaps the result into the recogniser. A finished photo session
+  calls it in a thread of its own. The loop and enrolment take turns with the
+  face model one picture at a time (recognizer.SharedFaceModel), so the video
+  waits at most for one photo to be read.
+- scene_photo() gives the newest clean frame for "Describe the scene".
+
 Every part can be handed in from outside, so the tests run the loop with
 fakes and need no camera, model or graphics card.
 """
@@ -39,19 +52,23 @@ fakes and need no camera, model or graphics card.
 from __future__ import annotations
 
 import logging
+import re
 import threading
 import time
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
+from pathlib import Path
 from typing import Any
 
 import cv2
 import numpy as np
 
 from car_vision import draw
-from car_vision.config import ConfigError, require, section
+from car_vision.config import ConfigError, require, resolve_path, section
 from car_vision.detector import Detector
-from car_vision.faces import FaceMemory, Person
+from car_vision.enroll import encode_people, save_enrolment
+from car_vision.faces import FaceMatcher, FaceMemory, Person
+from car_vision.people import person_folder
 from car_vision.phone import (Fetch, Size, area, ask_for_size, best_size, parse_size, read_picture_sizes,
                               size_text, without_login)
 from car_vision.reactions import Reaction, ReactionEngine
@@ -87,6 +104,26 @@ ASK_WINDOW_SECONDS = 60.0      # ... within this long; then the phone is left as
 PAUSE_STEP_SECONDS = 0.02      # a waiting phone thread checks this often whether it must give way
 TOO_MANY_ASKS = ("The phone changed its picture size back {} times within a minute; it is left as it is "
                  "until the next Connect or another choice in the Camera box.")
+
+RECOGNITION_OFF = "Face recognition is off."   # replaced by the start-up note that says why
+FEWEST_PHOTOS, MOST_PHOTOS = 3, 10       # a photo session takes this many photos ...
+PHOTO_TIMEOUT_SECONDS = 60.0             # ... within this long
+PHOTO_GAP_SECONDS = 2.0                  # between two photos: time to read the hint and change pose
+# What the person is asked to do for each photo in turn. The pose is not checked; it is a request.
+PHOTO_POSES = ("Look straight at the camera", "Turn your head a little to the left",
+               "Turn your head a little to the right", "Lift your chin a little",
+               "Lower your chin a little")
+PHOTO_MIN_FACE_WIDTH = 80                # the face must be at least this many pixels wide
+SHARPNESS_WIDTH = 112                    # faces are measured at the size the face model reads them
+SHARPNESS_THRESHOLD = 30.0               # variance of the Laplacian; see photo_hint and its tests
+PHOTO_JPEG_QUALITY = 95                  # photos for enrolment are saved with little compression
+PHOTO_NAME = re.compile(r"photo_(\d+)", re.IGNORECASE)
+HINT_NO_FACE = "Stand in front of the camera"
+HINT_ONE_PERSON = "Only one person in the picture, please"
+HINT_CLOSER = "Come closer"
+HINT_STILL = "Hold still"
+HINT_CANCELLED = "Cancelled"
+HINT_SWITCHED = "Cancelled: another camera was chosen"
 
 
 @dataclass(frozen=True)
@@ -130,6 +167,31 @@ class PhonePicture:
     offered: tuple[Size, ...]
 
 
+@dataclass
+class PhotoSession:
+    """One run of taking photos of a person. Changed only while the pipeline's lock is held."""
+
+    person_id: str
+    folder: Path
+    wanted: int
+    started_at: float
+    generation: int                    # the camera the session began with
+    taken: int = 0
+    last_photo_at: float = float("-inf")
+    state: str = "taking"              # "taking", "enrolling", "done" or "failed"
+    hint: str = HINT_NO_FACE
+    notes: list[str] = field(default_factory=list)
+
+    @property
+    def running(self) -> bool:
+        return self.state in ("taking", "enrolling")
+
+    def progress(self) -> dict[str, Any]:
+        """What the page shows, as plain JSON-ready values."""
+        return {"person_id": self.person_id, "taken": self.taken, "wanted": self.wanted,
+                "state": self.state, "hint": self.hint, "notes": list(self.notes)}
+
+
 SourceFactory = Callable[[dict], Any]     # stream settings in, a FrameSource (or a fake) out
 
 
@@ -147,8 +209,13 @@ class Pipeline:
         self.jpeg_quality: int = require(section(config, "app"), "jpeg_quality", int)
         if not 1 <= self.jpeg_quality <= 100:
             raise ConfigError(f"app.jpeg_quality must be from 1 to 100, got {self.jpeg_quality}")
+        # Where enrolling again reads the photos and saves the face vectors.
+        self._photos_dir = resolve_path(require(recognizer_settings, "photos_dir", str))
+        self._embeddings_path = resolve_path(require(recognizer_settings, "embeddings_file", str))
+        self._match_threshold = float(require(recognizer_settings, "match_threshold", (int, float)))
 
         self._notes: list[str] = []
+        self._recognition_off = RECOGNITION_OFF
         self._stream_settings = dict(section(config, "stream"))
         phone_url = self._stream_settings.get("phone_url")
         self._phone_url: str | None = phone_url if isinstance(phone_url, str) else None
@@ -186,6 +253,10 @@ class Pipeline:
         self._stream_size: Size | None = None  # what the phone sent when its stream was last opened
         self._asked_at: list[float] = []       # when this phone was asked for a size (this connect, this choice)
         self._gave_up_asking = False           # too many asks: leave the phone as it is
+
+        self._photos: PhotoSession | None = None    # the newest photo session, under self._lock
+        self._enrol_lock = threading.Lock()    # one enrolment at a time
+        self._faces_changed = threading.Event()     # set after enrolling: the loop forgets the faces it keeps
 
         self._switch_lock = threading.Lock()   # one use_phone() at a time
         self._phone_locks: dict[str, threading.Lock] = {}   # one talk with each phone at a time
@@ -250,6 +321,7 @@ class Pipeline:
                 self._source = new_source
                 self._phone_url = url
                 self._forget_old_picture()
+                cancelled = self._cancel_photos_locked(HINT_SWITCHED)
                 live = self._started and not self._stop.is_set()
                 restart = live and not self._loop_running   # the loop had stopped after too many failures
                 if restart:
@@ -260,6 +332,8 @@ class Pipeline:
                 self._start_loop()
             self._check_phone_picture()
         log.info("Switched the camera to the phone at %s", url)
+        if cancelled is not None:
+            log.info("Photos of %s cancelled by the camera switch after %d", cancelled.person_id, cancelled.taken)
         let_go_in_background(old_source)
 
     def set_phone_picture(self, choice: str) -> None:
@@ -343,6 +417,85 @@ class Pipeline:
         photo = self._encode(cut_out(view.frame, photo_box(box, view.size)))
         return replace(target, photo=photo, epoch=view.epoch)
 
+    def scene_photo(self, max_side: int = 960) -> bytes | None:
+        """The newest clean frame as JPEG, its longer side at most max_side (never enlarged).
+
+        None before the first frame and while the view is cleared after a camera switch.
+        """
+        if isinstance(max_side, bool) or not isinstance(max_side, int) or max_side < 1:
+            raise ValueError("max_side must be a whole number of pixels, 1 or more")
+        with self._lock:
+            view = self._view                   # the view is never changed, only replaced
+        if view is None:
+            return None
+        return self._encode(shrunk(view.frame, max_side))
+
+    # ---- people: enrolling again and taking photos --------------------------------
+
+    def enrolled_ids(self) -> set[str]:
+        """The ids of everyone the recogniser has saved faces for; empty with recognition off."""
+        return self._recognizer.enrolled_ids() if self._recognizer is not None else set()
+
+    def reload_people(self) -> list[str]:
+        """Enrol every person folder again with the loaded face model, and use the result at once.
+
+        Saves embeddings.npz, swaps the people and their faces into the
+        recogniser, and makes the loop forget the faces it keeps on screen.
+        Returns enrolment's notes (people without photos, skipped photos, ...).
+        Call it off the loop thread: it takes as long as reading every photo,
+        while the video goes on. RuntimeError when face recognition is off.
+        """
+        recognizer = self._recognizer
+        if recognizer is None:
+            raise RuntimeError(self._recognition_off)
+        with self._enrol_lock:
+            enrolment = encode_people(self._photos_dir, lambda: recognizer.face_model)
+            notes = enrolment.notes + save_enrolment(enrolment, self._photos_dir, self._embeddings_path)
+            matcher = FaceMatcher(enrolment.ids, enrolment.vectors, self._match_threshold)
+            recognizer.reload_known(enrolment.people, matcher)
+            self._faces_changed.set()
+            self._update_enrolment_notes(enrolment.people, matcher)
+        log.info("Enrolled again: %d face vectors for %d people",
+                 len(enrolment.ids), len(matcher.person_ids))
+        return notes
+
+    def start_photos(self, person_id: str, count: int = 5) -> None:
+        """Begin taking `count` photos of an existing person from the live camera.
+
+        KeyError for an unknown person. ValueError with a plain message when
+        face recognition is off, another session is running, or count is not 3 to 10.
+        """
+        if self._recognizer is None:
+            raise ValueError(f"{self._recognition_off} Photos cannot be taken without it.")
+        if isinstance(count, bool) or not isinstance(count, int) or not FEWEST_PHOTOS <= count <= MOST_PHOTOS:
+            raise ValueError(f"Take {FEWEST_PHOTOS} to {MOST_PHOTOS} photos.")
+        folder = person_folder(self._photos_dir, person_id)
+        with self._lock:
+            if self._photos is not None and self._photos.running:
+                raise ValueError("Photos are being taken already. Wait until they are done, or cancel them.")
+            self._photos = PhotoSession(person_id, folder, count, time.monotonic(), self._generation)
+        log.info("Taking %d photos of %s", count, person_id)
+
+    def photo_progress(self) -> dict | None:
+        """How the newest photo session goes; None when no session ran yet.
+
+        {"person_id", "taken", "wanted", "state", "hint", "notes"}, see PhotoSession.
+        """
+        self._end_photos_if_late(time.monotonic())
+        with self._lock:
+            return self._photos.progress() if self._photos is not None else None
+
+    def cancel_photos(self) -> None:
+        """End a session that is taking photos as failed, with the hint Cancelled.
+
+        The photos taken so far stay in the folder. Once enrolment has begun it
+        cannot be stopped halfway, so a session that is enrolling goes on.
+        """
+        with self._lock:
+            cancelled = self._cancel_photos_locked(HINT_CANCELLED)
+        if cancelled is not None:
+            log.info("Photos of %s cancelled after %d", cancelled.person_id, cancelled.taken)
+
     # ---- start-up --------------------------------------------------------------
 
     def _build_recognizer(self, settings: dict) -> Recognizer | None:
@@ -356,7 +509,8 @@ class Pipeline:
             recognizer = Recognizer(settings, people=people, matcher=matcher)
         except Exception as error:          # a broken model pack or graphics card setup raises many kinds
             log.exception("Face recognition could not start")
-            self._notes.append(f"Face recognition is off: {first_line(error)}")
+            self._recognition_off = f"Face recognition is off: {first_line(error)}"
+            self._notes.append(self._recognition_off)
             return None
         if not matcher.person_ids:
             self._notes.append(NOBODY_ENROLLED)
@@ -543,6 +697,110 @@ class Pipeline:
         box = shown_box(self._picture_choice, self._picture, self._config_box)
         self._source.set_box(*box)
 
+    # ---- the photo session (the loop takes the photos) ---------------------------------
+    #
+    # The session is one PhotoSession object, changed only under self._lock. The
+    # loop decides and saves a photo outside the lock, then counts it under the
+    # lock if the session is still the same one and still taking photos. The
+    # timeout is checked on every turn of the loop, also while no frames come
+    # (a phone that dropped out), and by photo_progress().
+
+    def _take_photo_if_ready(self, frame: np.ndarray, boxes: Sequence[Box], now: float,
+                             generation: int) -> None:
+        """On a face-check frame: save the clean frame as the next photo when every rule holds."""
+        with self._lock:
+            session = self._photos
+            if session is None or session.state != "taking" or session.generation != generation:
+                return
+            last_photo_at = session.last_photo_at
+        hint = photo_hint(frame, boxes)
+        ready = not hint and now - last_photo_at >= PHOTO_GAP_SECONDS
+        if ready:
+            try:
+                save_photo(session.folder, frame)
+            except (OSError, RuntimeError) as error:
+                self._photos_failed(session, f"Could not save the photo: {first_line(error)}")
+                return
+        with self._lock:
+            if self._photos is not session or session.state != "taking":
+                return                          # cancelled meanwhile; a saved photo stays in the folder
+            if ready:
+                session.taken += 1
+                session.last_photo_at = now
+            taken = session.taken
+            # When nothing is wrong, the hint asks for the pose of the next photo: five
+            # photos of the very same pose teach the recogniser less than five different ones.
+            session.hint = hint or pose_for(taken)
+            enough = taken >= session.wanted
+            if enough:
+                session.state = "enrolling"
+        if ready:
+            log.info("Photo %d of %d of %s saved", taken, session.wanted, session.person_id)
+        if enough:
+            self._enrol_in_background(session)
+
+    def _end_photos_if_late(self, now: float) -> None:
+        """After PHOTO_TIMEOUT_SECONDS: enrol with 3 or more photos, else end the session as failed."""
+        with self._lock:
+            session = self._photos
+            if session is None or session.state != "taking" or now - session.started_at < PHOTO_TIMEOUT_SECONDS:
+                return
+            seconds = round(PHOTO_TIMEOUT_SECONDS)
+            enough = session.taken >= FEWEST_PHOTOS
+            if enough:
+                session.state, session.hint = "enrolling", ""
+                session.notes = [f"Only {session.taken} of {session.wanted} photos were taken "
+                                 f"within {seconds} seconds."]
+            else:
+                session.state = "failed"
+                session.hint = (f"Only {session.taken} clear photo(s) in {seconds} seconds; at least "
+                                f"{FEWEST_PHOTOS} are needed. Try again with more light, facing the camera.")
+        log.info("Photos of %s: time is up with %d of %d", session.person_id, session.taken, session.wanted)
+        if enough:
+            self._enrol_in_background(session)
+
+    def _enrol_in_background(self, session: PhotoSession) -> None:
+        threading.Thread(target=self._enrol_for, args=(session,), name="enrol", daemon=True).start()
+
+    def _enrol_for(self, session: PhotoSession) -> None:
+        """Enrol everyone after a photo session, then end the session as done (or failed)."""
+        try:
+            notes = self.reload_people()
+        except Exception as error:              # a full disk or a broken model must not end the program
+            log.warning("Enrolling after the photos of %s failed (%s)", session.person_id, type(error).__name__)
+            self._photos_failed(session, f"Enrolling failed: {first_line(error)}", state="enrolling")
+            return
+        with self._lock:
+            if session.state == "enrolling":
+                session.state, session.hint = "done", ""
+                session.notes = session.notes + notes
+        log.info("Photos of %s: %d taken and enrolled", session.person_id, session.taken)
+
+    def _photos_failed(self, session: PhotoSession, hint: str, state: str = "taking") -> None:
+        """End the session as failed with this hint, if it is still in `state`."""
+        with self._lock:
+            if session.state == state:
+                session.state, session.hint = "failed", hint
+
+    def _cancel_photos_locked(self, hint: str) -> PhotoSession | None:
+        """End a session that is taking photos as failed. Call with self._lock held.
+        Returns the session when one was cancelled."""
+        session = self._photos
+        if session is None or session.state != "taking":
+            return None
+        session.state, session.hint = "failed", hint
+        return session
+
+    def _update_enrolment_notes(self, people: dict[str, Person], matcher: FaceMatcher) -> None:
+        """Bring the start-up notes about enrolment up to date after enrolling again."""
+        notes = [note for note in self._notes if note not in (NOBODY_ENROLLED, NO_INFO_CARDS)]
+        if not matcher.person_ids:
+            notes.append(NOBODY_ENROLLED)
+        elif not people:
+            notes.append(NO_INFO_CARDS)
+        with self._lock:
+            self._notes = notes
+
     # ---- the loop thread -----------------------------------------------------
 
     def _start_loop(self) -> None:
@@ -572,6 +830,7 @@ class Pipeline:
         generation = None                       # the camera this loop is working with
         last_sequence = 0
         while not self._stop.is_set():
+            self._end_photos_if_late(time.monotonic())   # also while no frames come
             with self._lock:                    # the source and its generation, read together
                 source, current = self._source, self._generation
             if current != generation:
@@ -619,10 +878,15 @@ class Pipeline:
         self._frames += 1
 
         resized = self._note_frame_size(frame)      # before detect(): the detector restarts its tracks too
+        enrolled_again = self._faces_changed.is_set()
+        if enrolled_again:                          # the remembered names may be out of date
+            self._faces_changed.clear()
+            self._memory = FaceMemory()
         detections = self._detector.detect(frame)
-        if self._recognizer is not None and (index % self.every_n_frames == 0 or resized):
-            found = self._recognizer.recognize(frame, detections)
-            self._memory.remember(found, detections, now)
+        if self._recognizer is not None and (index % self.every_n_frames == 0 or resized or enrolled_again):
+            check = self._recognizer.check_faces(frame, detections)
+            self._memory.remember(check.faces, detections, now)
+            self._take_photo_if_ready(frame, check.boxes, now, generation)
         faces = self._memory.current(detections, now)
 
         # The boxes are drawn on a copy: the camera's own frame goes into the view untouched.
@@ -1064,6 +1328,87 @@ def cut_out(frame: np.ndarray, box: Box) -> np.ndarray:
     """The pixels inside the box, at their own size (never enlarged)."""
     x1, y1, x2, y2 = box
     return np.ascontiguousarray(frame[y1:y2, x1:x2])
+
+
+def shrunk(frame: np.ndarray, max_side: int) -> np.ndarray:
+    """The frame made smaller so its longer side is at most max_side; never enlarged."""
+    height, width = frame.shape[:2]
+    longer = max(width, height)
+    if longer <= max_side:
+        return frame
+    scale = max_side / longer
+    size = (max(1, round(width * scale)), max(1, round(height * scale)))
+    return cv2.resize(frame, size, interpolation=cv2.INTER_AREA)
+
+
+# ---- photos for enrolment --------------------------------------------------------------
+
+
+def pose_for(photos_taken: int) -> str:
+    """What to ask the person for before the next photo, e.g. after 1 photo: turn a little left."""
+    return PHOTO_POSES[photos_taken % len(PHOTO_POSES)]
+
+
+def photo_hint(frame: np.ndarray, boxes: Sequence[Box]) -> str:
+    """What the person should do before a photo can be taken; "" when the frame is good.
+
+    `boxes` are all the faces found in the frame, however small. The rules:
+    exactly one face, at least PHOTO_MIN_FACE_WIDTH pixels wide, and sharp.
+
+    Sharp means the variance of the Laplacian of the face, measured at
+    SHARPNESS_WIDTH pixels wide (the size the face model reads a face), is above
+    SHARPNESS_THRESHOLD. The test images in tests/test_pipeline.py show the
+    scale: a drawn face scores several hundred, the same face blurred by 2
+    pixels (what a moving head or a camera out of focus gives) scores below 20,
+    and an even, featureless patch scores about 0. 30 refuses clearly blurred
+    faces but lets slightly soft ones through, because real faces have less
+    fine detail than a drawing and a session that never takes a photo helps nobody.
+    """
+    if not boxes:
+        return HINT_NO_FACE
+    if len(boxes) > 1:
+        return HINT_ONE_PERSON
+    box = boxes[0]
+    if box[2] - box[0] < PHOTO_MIN_FACE_WIDTH:
+        return HINT_CLOSER
+    if sharpness(cut_out(frame, box)) <= SHARPNESS_THRESHOLD:
+        return HINT_STILL
+    return ""
+
+
+def sharpness(face: np.ndarray) -> float:
+    """How crisp a face cut-out is: the variance of its Laplacian at SHARPNESS_WIDTH pixels wide.
+    0.0 for an empty cut-out."""
+    height, width = face.shape[:2]
+    if width == 0 or height == 0:
+        return 0.0
+    size = (SHARPNESS_WIDTH, max(1, round(height * SHARPNESS_WIDTH / width)))
+    resized = cv2.resize(face, size, interpolation=cv2.INTER_AREA)
+    gray = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY) if resized.ndim == 3 else resized
+    return float(cv2.Laplacian(gray, cv2.CV_64F).var())
+
+
+def next_photo_number(folder: Path) -> int:
+    """One more than the highest n of the photo_<n> files in the folder; 1 when there are none."""
+    numbers = [int(match.group(1)) for path in folder.iterdir()
+               if (match := PHOTO_NAME.fullmatch(path.stem))]
+    return max(numbers, default=0) + 1
+
+
+def save_photo(folder: Path, frame: np.ndarray) -> Path:
+    """Save the frame as the next free photo_<n>.jpg in the folder, never over another file."""
+    ok, buffer = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), PHOTO_JPEG_QUALITY])
+    if not ok:
+        raise RuntimeError("OpenCV could not encode the photo as JPEG")
+    number = next_photo_number(folder)
+    while True:
+        path = folder / f"photo_{number}.jpg"
+        try:
+            with open(path, "xb") as file:      # "x": fails instead of writing over a file
+                file.write(buffer.tobytes())
+            return path
+        except FileExistsError:
+            number += 1
 
 
 def first_line(error: Exception) -> str:

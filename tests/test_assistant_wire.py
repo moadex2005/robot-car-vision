@@ -206,6 +206,26 @@ def test_wire_follow_up_with_a_marked_picture_sends_two_pictures(settings: dict[
     assert answer.text == "That part is the hinge."
 
 
+def test_wire_describe_scene_sends_the_picture_without_the_web_tool(settings: dict[str, Any]) -> None:
+    picture = bytes([0xFF, 0xD8, 0xFF, 0xE0]) + b"whole camera picture"
+    wire = Wire([reply_json([{"type": "text", "text": "Hi."}]),
+                 reply_json([{"type": "thinking", "thinking": "", "signature": "S3"},
+                             {"type": "text", "text": "A desk with a laptop on it."}])])
+    bot = bot_on(settings, wire)
+    bot.ask("one")                                   # chat history that must not go along
+    answer = bot.describe_scene(picture)
+    body = wire.bodies[1]
+    assert body["messages"] == [{"role": "user", "content": [
+        {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg",
+                                     "data": base64.standard_b64encode(picture).decode("ascii")}},
+        {"type": "text", "text": "Describe the scene."},
+    ]}]
+    assert body["system"] == [{"type": "text", "text": assistant.SCENE_PROMPT,
+                               "cache_control": {"type": "ephemeral"}}]
+    assert "tools" not in body
+    assert answer == assistant.Answer(text="A desk with a laptop on it.")
+
+
 def test_bom_from_a_piped_powershell_line_is_stripped_under_cp1252() -> None:
     assert assistant.clean(b"\xef\xbb\xbf/quit".decode("cp1252")) == "/quit"
 

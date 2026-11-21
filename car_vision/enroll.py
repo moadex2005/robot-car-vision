@@ -13,12 +13,18 @@ they are never printed.
 This module and car_vision.recognizer are the only ones that use insightface;
 the face model is loaded with recognizer.load_face_model, only when there are
 photos to read.
+
+The running program enrols again without a restart (car_vision.pipeline):
+it calls encode_people with the face model it already has, then
+save_enrolment, and shows the notes on the page instead of printing them.
 """
 
 from __future__ import annotations
 
 import argparse
 import logging
+from collections.abc import Callable
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -26,20 +32,33 @@ import cv2
 import numpy as np
 
 from car_vision.config import ConfigError, load_config, require, resolve_path, section
-from car_vision.faces import ABOUT_FILE, Person, has_about_text, load_people, normalized, save_embeddings
+from car_vision.faces import (
+    ABOUT_FILE,
+    PHOTO_SUFFIXES,
+    Person,
+    has_about_text,
+    load_people,
+    normalized,
+    photos_in,
+    save_embeddings,
+)
 from car_vision.recognizer import FaceModelError, embedding_of, load_face_model
 
-PHOTO_SUFFIXES = (".jpg", ".jpeg", ".png")
 SYSTEM_FILES = ("thumbs.db", "desktop.ini")
 ENOUGH_PHOTOS = 3
 CLEAR_WINNER = 2.0        # the largest face must be at least twice the area of the next
 
 
-def photos_in(folder: Path) -> list[Path]:
-    """Every jpg, jpeg or png in the folder, any letter case, in name order."""
-    if not folder.is_dir():
-        return []
-    return sorted(p for p in folder.iterdir() if p.is_file() and p.suffix.lower() in PHOTO_SUFFIXES)
+@dataclass
+class Enrolment:
+    """What one enrolment run found: the people, their face vectors, and notes for the user."""
+
+    people: dict[str, Person]
+    found: dict[str, list[Path]]            # person id -> their photo files
+    used: dict[str, int]                    # person id -> photos that gave a face vector
+    ids: list[str] = field(default_factory=list)                 # one id per face vector
+    vectors: np.ndarray = field(default_factory=lambda: np.zeros((0, 0), dtype=np.float32))
+    notes: list[str] = field(default_factory=list)               # skipped photos, ignored files, ...
 
 
 def read_photo(path: Path) -> np.ndarray | None:
@@ -74,65 +93,89 @@ def pick_face(faces: list[Any]) -> tuple[Any | None, str]:
 
 
 def enroll(settings: dict, face_model: Any = None) -> dict[str, int]:
-    """Encode every usable photo and save the vectors. Returns person id -> photos used.
+    """Encode every usable photo, save the vectors and print a report. Returns person id -> photos used.
 
-    The people are the sub-folders of photos_dir.
+    The people are the sub-folders of photos_dir. The face model is loaded
+    only when there are photos to read, unless one is given.
     """
     photos_dir = resolve_path(require(settings, "photos_dir", str))
     embeddings_path = resolve_path(require(settings, "embeddings_file", str))
+
+    def get_face_model() -> Any:
+        return face_model if face_model is not None else load_face_model(settings)
+
+    enrolment = encode_people(photos_dir, get_face_model)
+    if enrolment.people:
+        print_table(enrolment.people, enrolment.found, enrolment.used)
+    for note in enrolment.notes + save_enrolment(enrolment, photos_dir, embeddings_path):
+        print(note)
+    return enrolment.used
+
+
+def encode_people(photos_dir: Path, get_face_model: Callable[[], Any]) -> Enrolment:
+    """Read every person folder under photos_dir and turn their photos into face vectors.
+
+    get_face_model is called only when there is at least one photo. Nothing
+    is printed or saved: what the user should know goes into the notes.
+    """
+    photos_dir = Path(photos_dir)
     problems: dict[str, str] = {}             # folder name -> what is wrong with it
     people = load_people(photos_dir, problems)
-
     found = {person_id: photos_in(photos_dir / person_id) for person_id in people}
+    enrolment = Enrolment(people, found, {person_id: 0 for person_id in people})
     if not photos_dir.is_dir():
-        print(f"The photo folder does not exist: {photos_dir}")
+        enrolment.notes.append(f"The photo folder does not exist: {photos_dir}")
     elif not people:
-        print(f"There are no person folders in {photos_dir}.")
-    print_ignored_files(photos_dir, people)
+        enrolment.notes.append(f"There are no person folders in {photos_dir}.")
+    enrolment.notes.extend(ignored_files_notes(photos_dir, people))
 
-    ids: list[str] = []
     rows: list[np.ndarray] = []
-    used = {person_id: 0 for person_id in people}
     if any(found.values()):
-        if face_model is None:
-            face_model = load_face_model(settings)
+        face_model = get_face_model()
         for person_id, photos in found.items():
             for photo in photos:
                 vector, reason = encode_photo(face_model, photo)
                 if vector is None:
-                    print(f"Skipped {person_id}/{photo.name}: {reason}")
+                    enrolment.notes.append(f"Skipped {person_id}/{photo.name}: {reason}")
                     continue
-                ids.append(person_id)
+                enrolment.ids.append(person_id)
                 rows.append(vector)
-                used[person_id] += 1
-
-    if people:
-        print_table(people, found, used)
-    print_about_notes(people, problems)
-
+                enrolment.used[person_id] += 1
     if rows:
-        save_embeddings(embeddings_path, ids, np.vstack(rows))
-        enrolled = sum(1 for count in used.values() if count > 0)
-        print(f"Saved {len(rows)} face vectors for {enrolled} people to {embeddings_path}")
-    else:
-        print(f"Nobody was enrolled, so {embeddings_path.name} was not written.\n"
-              f"Put 3 to 10 clear photos of each person in {photos_dir}\\<person id>\\ "
-              "(jpg or png), one face per photo, then run this again.")
-        remove_old_embeddings(embeddings_path)
-    return used
+        enrolment.vectors = np.vstack(rows)
+    enrolment.notes.extend(count_notes(people, found, enrolment.used))
+    enrolment.notes.extend(about_notes(people, problems))
+    return enrolment
 
 
-def remove_old_embeddings(path: Path) -> None:
-    """Delete faces saved by an earlier run, so people who were removed are not still recognised."""
+def save_enrolment(enrolment: Enrolment, photos_dir: Path, embeddings_path: Path) -> list[str]:
+    """Write the face vectors to embeddings_path and return what to tell the user.
+
+    When nobody was enrolled, an old file is removed instead, so people who
+    were removed are not still recognised.
+    """
+    embeddings_path = Path(embeddings_path)
+    if enrolment.ids:
+        save_embeddings(embeddings_path, enrolment.ids, enrolment.vectors)
+        enrolled = sum(1 for count in enrolment.used.values() if count > 0)
+        return [f"Saved {len(enrolment.ids)} face vectors for {enrolled} people to {embeddings_path}"]
+    notes = [f"Nobody was enrolled, so {embeddings_path.name} was not written.\n"
+             f"Put 3 to 10 clear photos of each person in {photos_dir}\\<person id>\\ "
+             "(jpg or png), one face per photo, then run this again."]
+    removed = remove_old_embeddings(embeddings_path)
+    return notes + ([removed] if removed else [])
+
+
+def remove_old_embeddings(path: Path) -> str:
+    """Delete faces saved by an earlier run. Returns what happened, or "" when there was no file."""
     if not path.is_file():
-        return
+        return ""
     try:
         path.unlink()
     except OSError as error:
-        print(f"Could not remove the old {path.name} ({error.strerror or error}); "
-              "delete it by hand, or people from an earlier run are still recognised.")
-        return
-    print(f"Removed the old {path.name}, so nobody is recognised until people are enrolled again.")
+        return (f"Could not remove the old {path.name} ({error.strerror or error}); "
+                "delete it by hand, or people from an earlier run are still recognised.")
+    return f"Removed the old {path.name}, so nobody is recognised until people are enrolled again."
 
 
 def encode_photo(face_model: Any, photo: Path) -> tuple[np.ndarray | None, str]:
@@ -155,19 +198,26 @@ def encode_photo(face_model: Any, photo: Path) -> tuple[np.ndarray | None, str]:
 
 
 def print_table(people: dict, found: dict[str, list[Path]], used: dict[str, int]) -> None:
+    """The table of photos found and photos used per person, with a blank line around it."""
     width = max([len("person")] + [len(person_id) for person_id in people])
     print()
     print(f"{'person':<{width}}  photos found  photos used")
     for person_id in people:
         print(f"{person_id:<{width}}  {len(found[person_id]):>12}  {used[person_id]:>11}")
     print()
+
+
+def count_notes(people: dict, found: dict[str, list[Path]], used: dict[str, int]) -> list[str]:
+    """A note for each person who was not enrolled, or has fewer usable photos than is reliable."""
+    notes = []
     for person_id in people:
         if used[person_id] == 0:
             reason = "no photos found" if not found[person_id] else "no usable photo"
-            print(f"Not enrolled: {person_id} ({reason})")
+            notes.append(f"Not enrolled: {person_id} ({reason})")
         elif used[person_id] < ENOUGH_PHOTOS:
-            print(f"Warning: {person_id} has only {used[person_id]} usable photo(s); "
-                  f"{ENOUGH_PHOTOS} or more make recognition more reliable")
+            notes.append(f"Warning: {person_id} has only {used[person_id]} usable photo(s); "
+                         f"{ENOUGH_PHOTOS} or more make recognition more reliable")
+    return notes
 
 
 def ignored_files(folder: Path) -> list[str]:
@@ -183,22 +233,24 @@ def ignored_files(folder: Path) -> list[str]:
                   and not p.name.startswith("."))
 
 
-def print_ignored_files(photos_dir: Path, people: dict[str, Person]) -> None:
-    """One line per person with files in other formats, such as .heic or .webp."""
+def ignored_files_notes(photos_dir: Path, people: dict[str, Person]) -> list[str]:
+    """One note per person with files in other formats, such as .heic or .webp."""
+    notes = []
     for person_id in people:
         names = ignored_files(photos_dir / person_id)
         if names:
-            print(f"Ignored (not jpg or png): {', '.join(f'{person_id}/{name}' for name in names)}")
+            notes.append(f"Ignored (not jpg or png): {', '.join(f'{person_id}/{name}' for name in names)}")
+    return notes
 
 
-def print_about_notes(people: dict[str, Person], problems: dict[str, str]) -> None:
+def about_notes(people: dict[str, Person], problems: dict[str, str]) -> list[str]:
     """A note for each folder or about.md with a problem, and for each about.md missing or empty."""
-    for problem in problems.values():
-        print(f"Note: {problem}")
+    notes = [f"Note: {problem}" for problem in problems.values()]
     for person_id, person in people.items():
         if not has_about_text(person) and person_id not in problems:
-            print(f"Note: {person_id} has no about.md (or an empty one), so they are shown "
-                  "by folder name, with no card text.")
+            notes.append(f"Note: {person_id} has no about.md (or an empty one), so they are shown "
+                         "by folder name, with no card text.")
+    return notes
 
 
 def main(argv: list[str] | None = None) -> int:

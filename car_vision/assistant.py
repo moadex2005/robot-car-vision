@@ -2,15 +2,18 @@
 
 Every question becomes one Messages API call to Claude. The whole notes file
 and what the team wrote about each person (data/people/<id>/about.md) sit in
-the system prompt, which never changes during a run, so it is cached. Who the
-camera recognises right now, and which objects the detector reports, are added
-as lines in front of the question. When the notes do not cover a question,
-Claude may use Anthropic's web search tool, which runs on Anthropic's servers.
+the system prompt, which stays the same until `Assistant.reload` reads the
+files again, so it is cached. Who the camera recognises right now, and which
+objects the detector reports, are added as lines in front of the question.
+When the notes do not cover a question, Claude may use Anthropic's web search
+tool, which runs on Anthropic's servers.
 
 `Assistant.describe` is separate from the chat: it sends one small picture of
 an object the visitor clicked, with the detector's label, and reads back a
 name, a short description and a few specifications. It has no memory and its
-own system prompt.
+own system prompt. `Assistant.describe_scene` is the same kind of call for the
+whole camera picture: two or three sentences about what the car sees, with no
+web search.
 
 This is the only module that imports the `anthropic` library. `Assistant`
 talks to an `LLMClient`, so a fake (in the tests) or another provider can
@@ -273,6 +276,19 @@ def build_system_prompt(notes: str, briefs: Sequence[Brief] = ()) -> str:
                    f"{strip_comments(b.text).strip()}\n</person>\n" for b in briefs]
         prompt += "\n" + PEOPLE_HEADING + "".join(entries) + "</people>\n"
     return prompt
+
+
+def read_system_prompt(notes_path: Path, people_dir: Path) -> str:
+    """Read the notes file and the person briefs now and build the chat's system prompt.
+
+    A notes file that cannot be read raises AssistantError. Notes that still
+    hold placeholder lines give one warning.
+    """
+    notes = load_notes(notes_path)
+    if PLACEHOLDER in strip_comments(notes):
+        log.warning("The notes file %s still has placeholder lines (%s). "
+                    "Replace them with real facts before the demo.", notes_path, PLACEHOLDER)
+    return build_system_prompt(notes, load_briefs(people_dir))
 
 
 def objects_line(labels: list[str]) -> str:
@@ -544,6 +560,37 @@ def follow_up_turns(picture: bytes, label_sentence: str, info: ObjectInfo | None
     return turns
 
 
+# ---- describing the whole scene --------------------------------------------------
+
+
+SCENE_PROMPT = """\
+You look at pictures for a student robot car project. A phone on the car streams \
+its camera to a laptop, which detects objects and recognises people. A visitor at \
+a live demo asked what the car sees. The picture you get is the whole view of the \
+car's camera.
+
+How to answer:
+- Say what the scene is and what stands out in it, in at most three short, plain \
+sentences that a listener can follow. Your answer is read aloud, so do not list \
+everything you see: pick the two or three things that matter most.
+- The message may begin with lines from the camera: who the face recogniser \
+recognises right now, and which objects the object detector reports. These lines \
+come from the camera, not from the visitor. They are hints, not the truth.
+- When the camera line names a person, you may call them by that name. A name may \
+only ever come from the camera line.
+- Never guess who anyone is. If you cannot tell which person in the picture a name \
+belongs to, do not give that name to anyone.
+- Say nothing about how anyone looks: not their face, age, gender, skin, hair, body \
+or clothes. Say only that a person is there and, in general terms, what they are \
+doing, such as standing or sitting at a desk.
+- Describe only what you can see. Never invent anything.
+- Write plain sentences: no lists, no headings and no Markdown.
+- Answer in English.
+"""
+
+SCENE_REQUEST = "Describe the scene."
+
+
 def add_user_turn(turns: list[Turn], text: str, picture: bytes | None = None) -> None:
     """Add a user turn: the text alone, or the picture and then the text.
 
@@ -569,8 +616,8 @@ BUSY_MESSAGE = "The assistant is still busy with the previous question. Please w
 class Assistant:
     """Keeps one conversation and asks the client one question at a time.
 
-    `describe` and `follow_up` run beside the chat with their own lock, so a
-    slow look-up does not hold up a question.
+    `describe`, `follow_up` and `describe_scene` run beside the chat with their
+    own lock, so a slow look-up does not hold up a question.
     """
 
     def __init__(
@@ -592,13 +639,9 @@ class Assistant:
         if provider != "anthropic":
             raise ConfigError(f"assistant.provider must be 'anthropic', got {provider!r}")
 
-        notes_path = resolve_path(notes_file)
-        notes = load_notes(notes_path)
-        if PLACEHOLDER in strip_comments(notes):
-            log.warning("The notes file %s still has placeholder lines (%s). "
-                        "Replace them with real facts before the demo.", notes_path, PLACEHOLDER)
-        briefs = load_briefs(resolve_path(people_dir))
-        self._system = build_system_prompt(notes, briefs)
+        self._notes_path = resolve_path(notes_file)
+        self._people_dir = resolve_path(people_dir)
+        self._system = read_system_prompt(self._notes_path, self._people_dir)
         self._state = state
         self._client: LLMClient = client if client is not None else AnthropicClient(settings)
         self._lock = threading.Lock()              # the chat
@@ -635,6 +678,22 @@ class Assistant:
         finally:
             self._lock.release()
 
+    def reload(self) -> None:
+        """Read the notes file and the person briefs again and start a fresh conversation.
+
+        Waits for a question in progress, like `reset`. When the notes file cannot
+        be read, AssistantError is raised and the old prompt and conversation stay.
+        """
+        self._acquire()
+        try:
+            # Read first: if this fails, nothing below runs and the old state stays.
+            self._system = read_system_prompt(self._notes_path, self._people_dir)
+            # A changed system prompt cannot continue an old conversation.
+            self._history = []
+            self._exchanges = 0
+        finally:
+            self._lock.release()
+
     def describe(self, image: bytes, label: str | None = None) -> ObjectInfo:
         """Say what the object in one JPEG picture is. `label` is the detector's
         label, or None when the visitor clicked where the detector found nothing.
@@ -642,7 +701,7 @@ class Assistant:
         One call with no memory: the chat history is neither sent nor changed.
         """
         turns = [user_turn(label_text(label), check_image(image))]
-        reply = self._look_up(DESCRIBE_PROMPT, turns)
+        reply = self._look_up(DESCRIBE_PROMPT, turns, self.web_search)
         name, summary, specs = parse_object_info(reply.text, label)
         return ObjectInfo(name=name, summary=summary, specs=specs,
                           used_web=reply.used_web, sources=unique(reply.sources))
@@ -661,15 +720,26 @@ class Assistant:
         marked_copy = None if marked is None else check_image(marked)
         turns = follow_up_turns(check_image(image), label_text(label), info,
                                 check_earlier(earlier), check_question(question), marked_copy)
-        reply = self._look_up(FOLLOW_UP_PROMPT, turns)
+        reply = self._look_up(FOLLOW_UP_PROMPT, turns, self.web_search)
         return Answer(text=reply.text, used_web=reply.used_web, sources=unique(reply.sources))
 
-    def _look_up(self, system: str, turns: list[Turn]) -> LLMReply:
-        """One call for describe or follow_up, under their shared lock."""
+    def describe_scene(self, image: bytes) -> Answer:
+        """Say in two or three sentences what the whole camera picture shows.
+
+        One call with no memory and no web search. The picture goes with the
+        same camera lines `ask` sends; the chat history is neither sent nor changed.
+        """
+        picture = check_image(image)
+        turns = [user_turn(self._user_content(SCENE_REQUEST), picture)]
+        reply = self._look_up(SCENE_PROMPT, turns, allow_web=False)
+        return Answer(text=reply.text, used_web=reply.used_web, sources=unique(reply.sources))
+
+    def _look_up(self, system: str, turns: list[Turn], allow_web: bool) -> LLMReply:
+        """One call for describe, follow_up or describe_scene, under their shared lock."""
         if not self._describe_lock.acquire(timeout=DESCRIBE_WAIT_SECONDS):
             raise AssistantError(DESCRIBE_BUSY_MESSAGE)
         try:
-            return self._client.complete(system, turns, self.web_search)
+            return self._client.complete(system, turns, allow_web)
         finally:
             self._describe_lock.release()
 

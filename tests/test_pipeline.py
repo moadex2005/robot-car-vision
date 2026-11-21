@@ -15,12 +15,17 @@ import cv2
 import numpy as np
 import pytest
 
+from car_vision import enroll as enroll_module
 from car_vision import pipeline as pipeline_module
 from car_vision.config import ConfigError
-from car_vision.faces import Person
+from car_vision.faces import FaceMatcher, Person, load_embeddings
+from car_vision.people import PeopleBook
 from car_vision.phone import parse_size
-from car_vision.pipeline import NOBODY_ENROLLED, Pipeline
+from car_vision.pipeline import (HINT_CANCELLED, HINT_CLOSER, HINT_NO_FACE, HINT_ONE_PERSON, HINT_STILL,
+                                 HINT_SWITCHED, NOBODY_ENROLLED, SHARPNESS_THRESHOLD, Pipeline,
+                                 next_photo_number, photo_hint, save_photo, sharpness)
 from car_vision.reactions import WARNING_TEXT, ReactionEngine
+from car_vision.recognizer import FaceCheck, Recognizer
 from car_vision.state import Detection, RecognizedFace, WorldState
 
 PIPELINE_FILE = Path(__file__).resolve().parent.parent / "car_vision" / "pipeline.py"
@@ -123,6 +128,10 @@ class FakeRecognizer:
         if self.calls in self.fail_on:
             raise ValueError("face model broke")
         return list(self.faces)
+
+    def check_faces(self, frame, detections=()):
+        faces = self.recognize(frame, detections)
+        return FaceCheck(faces, [face.box for face in faces])
 
     def person(self, person_id):
         return self.people.get(person_id)
@@ -1697,3 +1706,467 @@ def test_pipeline_imports_no_third_party_library_but_cv2_and_numpy():
         elif isinstance(node, ast.ImportFrom) and node.module and node.level == 0:
             found.add(node.module.split(".")[0])
     assert found - allowed == set()
+
+
+# ---- people: photos from the live camera, and enrolling again ------------------------------
+#
+# These tests use the real Recognizer with a fake face model, so the photo session sees the
+# same face boxes the loop gets, and enrolling again really reads the saved photos.
+
+FACE_BOX = (200, 60, 360, 260)                  # 160 pixels wide
+TINY_FACE = (520, 60, 550, 90)                  # too small to name (min_face_pixels is 40), still a face
+LINA = np.eye(8, dtype=np.float32)[2]
+SARA_VECTOR = np.eye(8, dtype=np.float32)[0]
+LINA_ID = "lina_haddad"                       # the id PeopleBook makes from "Lina Haddad"
+
+
+def drawn_face(size, seed=0):
+    """A cartoon face with a little camera noise: sharp edges, like a face in focus."""
+    rng = np.random.default_rng(seed)
+    image = np.full((size, size, 3), 90, np.uint8)
+    middle = size // 2
+    cv2.ellipse(image, (middle, middle), (int(size * 0.35), int(size * 0.45)), 0, 0, 360, (150, 170, 200), -1)
+    for side in (-1, 1):
+        eye = (middle + side * size // 6, middle - size // 8)
+        cv2.circle(image, eye, size // 16, (40, 40, 40), -1)
+        cv2.line(image, (eye[0] - size // 10, middle - size // 5), (eye[0] + size // 10, middle - size // 5),
+                 (50, 50, 60), 2)
+    cv2.ellipse(image, (middle, middle + size // 5), (size // 8, size // 20), 0, 0, 180, (60, 60, 120), 2)
+    return np.clip(image + rng.normal(0, 4, image.shape), 0, 255).astype(np.uint8)
+
+
+def face_frame(blur=0.0, size=(640, 360)):
+    """A camera frame with a drawn face inside FACE_BOX."""
+    width, height = size
+    frame = np.full((height, width, 3), 60, np.uint8)
+    x1, y1, x2, y2 = FACE_BOX
+    frame[y1:y2, x1:x2] = cv2.resize(drawn_face(x2 - x1), (x2 - x1, y2 - y1))
+    return cv2.GaussianBlur(frame, (0, 0), blur) if blur else frame
+
+
+class FakeFace:
+    """Shaped like an InsightFace face."""
+
+    def __init__(self, box, vector):
+        self.bbox = np.asarray(box, dtype=np.float32)
+        self.normed_embedding = np.asarray(vector, dtype=np.float32)
+
+
+class ScriptedFaceModel:
+    """Sees the faces at `boxes` in every picture. Whose face it is follows the picture's
+    brightness: dark pictures show Sara, bright ones Lina (this survives saving as JPEG)."""
+
+    def __init__(self, boxes=(FACE_BOX,), delay=0.0):
+        self.boxes = list(boxes)
+        self.delay = delay
+        self.calls = 0
+
+    def get(self, image):
+        self.calls += 1
+        if self.delay:
+            time.sleep(self.delay)
+        vector = SARA_VECTOR if image.mean() < 50 else LINA
+        return [FakeFace(box, vector) for box in self.boxes]
+
+
+def people_config(tmp_path, every_n=1):
+    recognizer = {**CONFIG["recognizer"], "every_n_frames": every_n,
+                  "photos_dir": str(tmp_path / "people"), "embeddings_file": str(tmp_path / "embeddings.npz")}
+    return {**CONFIG, "recognizer": recognizer}
+
+
+def real_recognizer(tmp_path, model):
+    """The real Recognizer with a fake face model and nobody enrolled yet."""
+    settings = people_config(tmp_path)["recognizer"]
+    return Recognizer(settings, face_model=model, people={}, matcher=FaceMatcher([], np.zeros((0, 0)), 0.42))
+
+
+@pytest.fixture
+def book(tmp_path):
+    """A photo folder with Lina in it (an about.md, no photos yet)."""
+    book = PeopleBook(tmp_path / "people", tmp_path / "people.removed")
+    book.save("Lina Haddad", "Driver", ["Drives the car in the demo"])
+    return book
+
+
+@pytest.fixture
+def quick(monkeypatch):
+    """No wait between photos and a short timeout; a test can change both."""
+    monkeypatch.setattr(pipeline_module, "PHOTO_GAP_SECONDS", 0.0)
+    monkeypatch.setattr(pipeline_module, "PHOTO_TIMEOUT_SECONDS", 30.0)
+    return monkeypatch
+
+
+def photo_pipeline(make, tmp_path, boxes=(FACE_BOX,), source=None, every_n=1, delay=0.0):
+    model = ScriptedFaceModel(boxes, delay)
+    pipeline = make(source=source if source is not None else FakeSource(frames=10_000, picture=face_frame()),
+                    detector=FakeDetector(detections=[]), recognizer=real_recognizer(tmp_path, model),
+                    config=people_config(tmp_path, every_n))
+    return pipeline, model
+
+
+def photos_of(book, person_id=LINA_ID):
+    return sorted(p.name for p in (book.photos_dir / person_id).glob("photo_*.jpg"))
+
+
+def progress_is(pipeline, **expected):
+    def check():
+        progress = pipeline.photo_progress()
+        return progress is not None and all(progress[key] == value for key, value in expected.items())
+    return check
+
+
+# ---- the sharpness rule ------------------------------------------------------------
+
+
+@pytest.mark.parametrize("size", [80, 160, 320])
+def test_the_sharpness_threshold_lies_between_a_sharp_and_a_blurred_face(size):
+    sharp = drawn_face(size)
+    blurred = cv2.GaussianBlur(sharp, (0, 0), 2 * size / 112)     # 2 pixels at the size the model reads
+    flat = np.full_like(sharp, 128)
+    assert sharpness(sharp) > 10 * SHARPNESS_THRESHOLD
+    assert sharpness(blurred) < 0.7 * SHARPNESS_THRESHOLD
+    assert sharpness(flat) == 0.0
+    assert sharpness(sharp[:0]) == 0.0                             # an empty cut-out
+
+
+@pytest.mark.parametrize("boxes, blur, hint", [
+    ([], 0.0, HINT_NO_FACE),
+    ([FACE_BOX, TINY_FACE], 0.0, HINT_ONE_PERSON),
+    ([(200, 60, 279, 140)], 0.0, HINT_CLOSER),                    # 79 pixels wide
+    ([(200, 60, 280, 140)], 0.0, ""),                              # 80 is enough
+    ([FACE_BOX], 3.0, HINT_STILL),
+    ([FACE_BOX], 0.0, ""),
+])
+def test_photo_hint_for_each_rule(boxes, blur, hint):
+    assert photo_hint(face_frame(blur), boxes) == hint
+
+
+# ---- photo sessions ------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("boxes, blur, hint", [
+    ([], 0.0, HINT_NO_FACE),
+    ([FACE_BOX, TINY_FACE], 0.0, HINT_ONE_PERSON),
+    ([(200, 60, 260, 120)], 0.0, HINT_CLOSER),
+    ([FACE_BOX], 3.0, HINT_STILL),
+])
+def test_no_photo_is_taken_until_every_rule_holds(make, tmp_path, book, quick, boxes, blur, hint):
+    source = FakeSource(frames=10_000, picture=face_frame(blur))
+    pipeline, _model = photo_pipeline(make, tmp_path, boxes, source)
+    pipeline.start()
+    pipeline.start_photos(LINA_ID, 3)
+    assert wait_until(progress_is(pipeline, hint=hint))
+    time.sleep(0.1)
+    assert pipeline.photo_progress() == {"person_id": LINA_ID, "taken": 0, "wanted": 3, "state": "taking",
+                                         "hint": hint, "notes": []}
+    assert photos_of(book) == []
+
+
+def test_photos_are_taken_until_the_count_then_everyone_is_enrolled(make, tmp_path, book, quick, caplog):
+    assert save_photo(book.photos_dir / LINA_ID, face_frame()).name == "photo_1.jpg"    # one from before
+    pipeline, _model = photo_pipeline(make, tmp_path)
+    assert pipeline.photo_progress() is None                       # no session yet
+    pipeline.start()
+    with caplog.at_level(logging.DEBUG):
+        pipeline.start_photos(LINA_ID, 3)
+        assert wait_until(progress_is(pipeline, state="done"))
+    progress = pipeline.photo_progress()
+    assert (progress["taken"], progress["wanted"], progress["hint"]) == (3, 3, "")
+    assert f"Saved 4 face vectors for 1 people to {tmp_path / 'embeddings.npz'}" in progress["notes"]
+    assert photos_of(book) == ["photo_1.jpg", "photo_2.jpg", "photo_3.jpg", "photo_4.jpg"]
+    photo = cv2.imread(str(book.photos_dir / LINA_ID / "photo_4.jpg"))
+    assert photo.shape == (360, 640, 3)                            # the clean frame at its own size
+    assert np.abs(photo.astype(int) - face_frame().astype(int)).mean() < 3      # nothing drawn on it
+    assert pipeline.enrolled_ids() == {LINA_ID}
+    assert load_embeddings(tmp_path / "embeddings.npz")[0] == [LINA_ID] * 4
+    # Lina is recognised in the video now, without a restart.
+    assert wait_until(lambda: [f.name for f in pipeline.state.snapshot().faces] == ["Lina Haddad"])
+    # Taking photos and enrolling log only the person id and counts. (The greeting the
+    # reactions log once Lina is recognised is not part of the photo session.)
+    logged = " ".join(record.getMessage() for record in caplog.records
+                      if record.name in ("car_vision.pipeline", "car_vision.recognizer", "car_vision.enroll"))
+    assert LINA_ID in logged
+    assert "Lina Haddad" not in logged and "Driver" not in logged
+
+
+def test_a_photo_is_not_taken_too_soon_after_the_last(make, tmp_path, book, quick):
+    quick.setattr(pipeline_module, "PHOTO_GAP_SECONDS", 10.0)
+    pipeline, _model = photo_pipeline(make, tmp_path)
+    pipeline.start()
+    pipeline.start_photos(LINA_ID, 3)
+    assert wait_until(progress_is(pipeline, taken=1))
+    time.sleep(0.2)
+    assert pipeline.photo_progress()["taken"] == 1
+    # Nothing is wrong, so the hint asks for the pose of the next photo.
+    assert pipeline.photo_progress()["hint"] == pipeline_module.PHOTO_POSES[1]
+    assert photos_of(book) == ["photo_1.jpg"]
+
+
+def test_time_up_with_three_photos_enrols_and_says_fewer_were_taken(make, tmp_path, book, quick):
+    quick.setattr(pipeline_module, "PHOTO_TIMEOUT_SECONDS", 0.5)
+    pipeline, _model = photo_pipeline(make, tmp_path, source=FakeSource(frames=3, picture=face_frame()))
+    pipeline.start_photos(LINA_ID, 5)                               # before start(): every frame counts
+    pipeline.start()
+    assert wait_until(progress_is(pipeline, state="done"))
+    progress = pipeline.photo_progress()
+    assert progress["taken"] == 3
+    assert progress["notes"][0].startswith("Only 3 of 5 photos were taken within")
+    assert pipeline.enrolled_ids() == {LINA_ID}
+
+
+def test_time_up_with_two_photos_fails_and_keeps_them(make, tmp_path, book, quick):
+    quick.setattr(pipeline_module, "PHOTO_TIMEOUT_SECONDS", 0.5)
+    pipeline, _model = photo_pipeline(make, tmp_path, source=FakeSource(frames=2, picture=face_frame()))
+    pipeline.start_photos(LINA_ID, 5)
+    pipeline.start()
+    assert wait_until(progress_is(pipeline, state="failed"))
+    progress = pipeline.photo_progress()
+    assert progress["taken"] == 2
+    assert "Only 2 clear photo(s)" in progress["hint"] and "at least 3" in progress["hint"]
+    assert photos_of(book) == ["photo_1.jpg", "photo_2.jpg"]
+    assert pipeline.enrolled_ids() == set()
+    assert not (tmp_path / "embeddings.npz").exists()
+
+
+def test_the_time_runs_out_even_while_no_frames_come(make, tmp_path, book, quick):
+    quick.setattr(pipeline_module, "PHOTO_TIMEOUT_SECONDS", 0.3)
+    source = FakeSource(frames=0)                                  # the phone sends nothing
+    source.connected = False
+    pipeline, _model = photo_pipeline(make, tmp_path, source=source)
+    pipeline.start()
+    pipeline.start_photos(LINA_ID, 3)
+    assert wait_until(progress_is(pipeline, state="failed"))
+    assert "Only 0 clear photo(s)" in pipeline.photo_progress()["hint"]
+
+
+def test_a_session_survives_a_phone_that_drops_out_and_returns(make, tmp_path, book, quick):
+    source = FakeSource(frames=1, picture=face_frame())
+    pipeline, _model = photo_pipeline(make, tmp_path, source=source)
+    pipeline.start_photos(LINA_ID, 3)
+    pipeline.start()
+    assert wait_until(progress_is(pipeline, taken=1))
+    source.connected = False                                       # gone for a while
+    time.sleep(0.1)
+    assert pipeline.photo_progress()["state"] == "taking"
+    source.connected, source.frames = True, 3                      # and back with new frames
+    assert wait_until(progress_is(pipeline, state="done"))
+    assert pipeline.photo_progress()["taken"] == 3
+
+
+class GrowingSource(FakeSource):
+    """One frame at 640 x 360, then frames at 1280 x 720 (another picture size was chosen)."""
+
+    def __init__(self):
+        super().__init__(frames=10_000, picture=face_frame())
+        self.large = face_frame(size=(1280, 720))
+
+    def read(self):
+        frame, sequence = super().read()
+        return (self.large.copy() if sequence > 1 else frame), sequence
+
+
+def test_a_session_survives_a_change_of_picture_size(make, tmp_path, book, quick):
+    pipeline, _model = photo_pipeline(make, tmp_path, source=GrowingSource())
+    pipeline.start_photos(LINA_ID, 3)
+    pipeline.start()
+    assert wait_until(progress_is(pipeline, state="done"))
+    sizes = [cv2.imread(str(book.photos_dir / LINA_ID / name)).shape[:2] for name in photos_of(book)]
+    assert sizes == [(360, 640), (720, 1280), (720, 1280)]
+
+
+def test_cancel_ends_the_session_and_keeps_the_photos(make, tmp_path, book, quick):
+    quick.setattr(pipeline_module, "PHOTO_GAP_SECONDS", 10.0)
+    pipeline, _model = photo_pipeline(make, tmp_path)
+    pipeline.cancel_photos()                                       # nothing to cancel: no error
+    assert pipeline.photo_progress() is None
+    pipeline.start()
+    pipeline.start_photos(LINA_ID, 3)
+    assert wait_until(progress_is(pipeline, taken=1))
+    pipeline.cancel_photos()
+    assert pipeline.photo_progress() == {"person_id": LINA_ID, "taken": 1, "wanted": 3, "state": "failed",
+                                         "hint": HINT_CANCELLED, "notes": []}
+    time.sleep(0.1)
+    assert pipeline.photo_progress()["state"] == "failed"
+    assert photos_of(book) == ["photo_1.jpg"]
+
+
+def test_a_second_session_is_refused_while_one_runs(make, tmp_path, book, quick):
+    quick.setattr(pipeline_module, "PHOTO_GAP_SECONDS", 10.0)
+    book.save("Omar Ali")
+    pipeline, _model = photo_pipeline(make, tmp_path)
+    pipeline.start_photos(LINA_ID, 3)
+    with pytest.raises(ValueError, match="already"):
+        pipeline.start_photos("omar_ali", 3)
+    pipeline.cancel_photos()
+    pipeline.start_photos("omar_ali", 4)                           # once it ended, a new one may begin
+    assert pipeline.photo_progress()["person_id"] == "omar_ali"
+    assert pipeline.photo_progress()["taken"] == 0
+
+
+@pytest.mark.parametrize("person_id", ["nobody", "../people", "Lina", "", None])
+def test_start_photos_for_an_unknown_person_is_a_key_error(make, tmp_path, book, person_id):
+    pipeline, _model = photo_pipeline(make, tmp_path)
+    with pytest.raises(KeyError):
+        pipeline.start_photos(person_id)
+    assert pipeline.photo_progress() is None
+
+
+@pytest.mark.parametrize("count", [2, 11, 0, -5, "5", 4.0, True, None])
+def test_start_photos_takes_3_to_10(make, tmp_path, book, count):
+    pipeline, _model = photo_pipeline(make, tmp_path)
+    with pytest.raises(ValueError, match="3 to 10"):
+        pipeline.start_photos(LINA_ID, count)
+
+
+def test_use_phone_cancels_a_session(make, tmp_path, book, quick):
+    quick.setattr(pipeline_module, "PHOTO_GAP_SECONDS", 10.0)
+    model = ScriptedFaceModel()
+    pipeline = make(source=FakeSource(frames=10_000, picture=face_frame()), detector=FakeDetector(detections=[]),
+                    recognizer=real_recognizer(tmp_path, model), config=people_config(tmp_path),
+                    source_factory=SourceFactory(phone_source(frames=10_000)))
+    pipeline.start()
+    pipeline.start_photos(LINA_ID, 3)
+    assert wait_until(progress_is(pipeline, taken=1))
+    pipeline.use_phone(PHONE)
+    progress = pipeline.photo_progress()
+    assert (progress["state"], progress["hint"]) == ("failed", HINT_SWITCHED)
+    assert progress["hint"].startswith("Cancelled")
+
+
+def test_a_photo_that_cannot_be_saved_ends_the_session_as_failed(make, tmp_path, book, quick):
+    pipeline, _model = photo_pipeline(make, tmp_path)
+    pipeline.start_photos(LINA_ID, 3)
+    book.remove(LINA_ID)                                            # the folder went away meanwhile
+    pipeline.start()
+    assert wait_until(progress_is(pipeline, state="failed"))
+    assert pipeline.photo_progress()["hint"].startswith("Could not save the photo")
+
+
+def test_next_photo_number_and_save_photo_never_write_over_a_file(tmp_path):
+    assert next_photo_number(tmp_path) == 1
+    for name in ("photo_2.jpg", "photo_9.JPG", "photo_x.jpg", "other_20.jpg"):
+        (tmp_path / name).write_bytes(b"old")
+    assert next_photo_number(tmp_path) == 10
+    assert save_photo(tmp_path, face_frame()).name == "photo_10.jpg"
+    assert (tmp_path / "photo_9.JPG").read_bytes() == b"old"
+
+
+# ---- enrolling again ------------------------------------------------------------------
+
+
+def plain_jpeg(path, value):
+    ok, data = cv2.imencode(".jpg", np.full((120, 160, 3), value, np.uint8))
+    path.write_bytes(data.tobytes())
+
+
+def test_reload_people_recognises_a_new_person_and_forgets_a_removed_one(make, tmp_path, book, monkeypatch):
+    monkeypatch.setattr(enroll_module, "load_face_model", lambda settings: pytest.fail("a second model was loaded"))
+    sara = book.save("Sara Ahmed", "Team lead")
+    plain_jpeg(book.photos_dir / "sara_ahmed" / "photo_1.jpg", 20)       # dark: the fake model sees Sara
+    book.save("Omar Ali")                                               # no photos
+    # The face is checked only on the first frame and when told to: the memory keeps the rest.
+    pipeline, model = photo_pipeline(make, tmp_path, every_n=1_000_000,
+                                     source=FakeSource(frames=10_000, picture=np.full((360, 640, 3), 200, np.uint8)))
+    pipeline.start()
+    assert wait_until(lambda: [f.name for f in pipeline.state.snapshot().faces] == ["Unknown"])
+
+    plain_jpeg(book.photos_dir / LINA_ID / "photo_1.jpg", 200)           # bright: Lina
+    notes = pipeline.reload_people()
+    assert pipeline.enrolled_ids() == {LINA_ID, "sara_ahmed"}
+    assert "Not enrolled: omar_ali (no photos found)" in notes
+    assert load_embeddings(tmp_path / "embeddings.npz")[0] == [LINA_ID, "sara_ahmed"]
+    assert wait_until(lambda: [f.name for f in pipeline.state.snapshot().faces] == ["Lina Haddad"])
+    assert "Nobody is enrolled yet" not in " ".join(pipeline.status()["notes"])
+
+    book.remove(LINA_ID)
+    pipeline.reload_people()
+    assert pipeline.enrolled_ids() == {"sara_ahmed"}
+    assert wait_until(lambda: [f.name for f in pipeline.state.snapshot().faces] == ["Unknown"])
+    dark = np.full((360, 640, 3), 20, np.uint8)
+    assert [f.name for f in pipeline._recognizer.recognize(dark)] == [sara.name]
+
+    book.remove("sara_ahmed")
+    pipeline.reload_people()
+    assert pipeline.enrolled_ids() == set()
+    assert not (tmp_path / "embeddings.npz").exists()
+    assert NOBODY_ENROLLED in pipeline.status()["notes"]
+
+
+def test_enrolling_again_keeps_the_video_running(make, tmp_path, book):
+    for number in range(1, 9):
+        plain_jpeg(book.photos_dir / LINA_ID / f"photo_{number}.jpg", 200)
+    detector = FakeDetector(detections=[])
+    model = ScriptedFaceModel(delay=0.03)                          # each picture takes 30 ms
+    pipeline = make(source=FakeSource(frames=100_000, picture=face_frame()), detector=detector,
+                    recognizer=real_recognizer(tmp_path, model), config=people_config(tmp_path, every_n=1))
+    pipeline.start()
+    assert wait_until(lambda: detector.calls > 0)
+    before = detector.calls
+    began = time.monotonic()
+    pipeline.reload_people()                                       # 8 photos: at least 240 ms
+    assert time.monotonic() - began >= 0.24
+    assert detector.calls - before >= 3                            # frames went on while it ran
+    assert pipeline.enrolled_ids() == {LINA_ID}
+
+
+def test_with_recognition_off_every_people_method_fails_plainly(monkeypatch, tmp_path, book):
+    def broken(*args, **kwargs):
+        raise RuntimeError("CUDA provider missing\nmore detail")
+
+    monkeypatch.setattr(pipeline_module, "Recognizer", broken)
+    pipeline = Pipeline(people_config(tmp_path), source=FakeSource(frames=3), detector=FakeDetector())
+    try:
+        with pytest.raises(RuntimeError, match="^Face recognition is off: CUDA provider missing$"):
+            pipeline.reload_people()
+        with pytest.raises(ValueError, match="Face recognition is off: CUDA provider missing"):
+            pipeline.start_photos(LINA_ID)
+        assert pipeline.enrolled_ids() == set()
+        assert pipeline.photo_progress() is None
+        pipeline.cancel_photos()
+        pipeline.start()
+        assert wait_until(lambda: pipeline.scene_photo() is not None)
+    finally:
+        pipeline.stop()
+
+
+# ---- the picture for "Describe the scene" ------------------------------------------------
+
+
+def jpeg_size(data):
+    image = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
+    return image.shape[1], image.shape[0]
+
+
+@pytest.mark.parametrize("size, max_side, expected", [
+    ((640, 360), 960, (640, 360)),          # never enlarged
+    ((640, 360), 640, (640, 360)),
+    ((640, 360), 320, (320, 180)),
+    ((1920, 1080), 960, (960, 540)),
+    ((360, 640), 320, (180, 320)),          # the longer side counts, also when it is the height
+])
+def test_scene_photo_sizes(make, size, max_side, expected):
+    width, height = size
+    picture = np.full((height, width, 3), 90, np.uint8)
+    pipeline = make(source=FakeSource(frames=3, picture=picture))
+    assert pipeline.scene_photo() is None                          # before the first frame
+    pipeline.start()
+    assert wait_until(lambda: pipeline.scene_photo() is not None)
+    assert jpeg_size(pipeline.scene_photo(max_side)) == expected
+
+
+def test_scene_photo_is_the_clean_frame_and_none_while_the_view_is_cleared(make):
+    picture = np.full((360, 640, 3), 90, np.uint8)
+    pipeline = make(source=FakeSource(frames=3, picture=picture),
+                    source_factory=SourceFactory(phone_source(frames=0, connected=False))).start()
+    assert wait_until(lambda: pipeline.scene_photo() is not None)
+    image = cv2.imdecode(np.frombuffer(pipeline.scene_photo(), np.uint8), cv2.IMREAD_COLOR)
+    assert np.abs(image.astype(int) - 90).max() <= 3                # no boxes drawn on it
+    pipeline.use_phone(PHONE)
+    assert pipeline.scene_photo() is None
+
+
+@pytest.mark.parametrize("max_side", [0, -1, 2.5, "960", True])
+def test_scene_photo_refuses_a_wrong_size(make, max_side):
+    with pytest.raises(ValueError):
+        make().scene_photo(max_side)

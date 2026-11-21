@@ -8,6 +8,10 @@ This module and car_vision.enroll are the only ones that import insightface or
 onnxruntime. Both are imported inside load_face_model, so importing this file
 stays cheap and the unit tests can pass a fake face model instead.
 
+The running program can enrol again without a restart: enrolment borrows the
+loaded model (Recognizer.face_model, which lets one thread use it at a time)
+and reload_known swaps in the new people and saved faces.
+
 Run it on its own to see the live result:
 
     .venv\\Scripts\\python.exe -m car_vision.recognizer --source webcam
@@ -20,8 +24,10 @@ from __future__ import annotations
 
 import argparse
 import logging
+import threading
 import time
 from collections.abc import Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -181,6 +187,40 @@ def track_for(face_box: Box, detections: Sequence[Detection]) -> int | None:
     return None if best is None else best.track_id
 
 
+def display_name(people: dict[str, Person], person_id: str | None) -> str:
+    """The name to show: the person's name, their id when they have no folder, or UNKNOWN."""
+    if person_id is None:
+        return UNKNOWN
+    person = people.get(person_id)
+    return person.name if person is not None else person_id
+
+
+class SharedFaceModel:
+    """The loaded face model, used by one thread at a time.
+
+    The video loop checks faces with it, and enrolment (run again from the
+    page) reads photos with it. Each takes the lock for one picture only, so
+    they take turns picture by picture and the video never waits long.
+    """
+
+    def __init__(self, model: Any) -> None:
+        self.model = model
+        self._lock = threading.Lock()
+
+    def get(self, image: np.ndarray) -> list[Any]:
+        """The faces InsightFace finds in one picture."""
+        with self._lock:
+            return list(self.model.get(image))
+
+
+@dataclass(frozen=True)
+class FaceCheck:
+    """The result of one face check on one frame."""
+
+    faces: list[RecognizedFace]     # what recognize() returns: faces big enough to trust
+    boxes: list[Box]                # every face the model found, small ones too, clipped to the frame
+
+
 class Recognizer:
     """Finds the faces in a frame and names the enrolled people among them."""
 
@@ -193,42 +233,71 @@ class Recognizer:
         embeddings_file: str = require(settings, "embeddings_file", str)
 
         # Cheap files first, so a mistake in them shows before the slow model load.
-        self._people = people if people is not None else load_people(resolve_path(photos_dir))
+        people = people if people is not None else load_people(resolve_path(photos_dir))
         if matcher is None:
             ids, embeddings = load_embeddings(resolve_path(embeddings_file), FACE_VECTOR_SIZE)
             matcher = FaceMatcher(ids, embeddings, threshold)
-        self._matcher = matcher
+        # The known people and their matcher always change together (see reload_known).
+        self._known_lock = threading.Lock()
+        self._people, self._matcher = people, matcher
         self._warn_about_mismatches()
-        self._model = face_model if face_model is not None else load_face_model(settings)
+        self._model = SharedFaceModel(face_model if face_model is not None else load_face_model(settings))
 
     @property
     def providers(self) -> dict[str, str]:
         """The provider each face model runs on; empty for a fake model."""
-        return face_model_providers(self._model)
+        return face_model_providers(self._model.model)
+
+    @property
+    def face_model(self) -> SharedFaceModel:
+        """The loaded face model, for enrolling again without loading a second one."""
+        return self._model
 
     def person(self, person_id: str) -> Person | None:
         """What the team wrote about a person (their folder and about.md), or None."""
-        return self._people.get(person_id)
+        people, _matcher = self._known()
+        return people.get(person_id)
+
+    def enrolled_ids(self) -> set[str]:
+        """The ids of everyone with saved face vectors."""
+        _people, matcher = self._known()
+        return matcher.person_ids
+
+    def reload_known(self, people: dict[str, Person], matcher: FaceMatcher) -> None:
+        """Use these people and saved faces from now on, both in one step.
+
+        Safe while recognize() runs on another thread: a check already under
+        way finishes with the old pair, the next one uses the new pair.
+        """
+        with self._known_lock:
+            self._people, self._matcher = dict(people), matcher
 
     def recognize(self, frame: np.ndarray,
                   detections: Sequence[Detection] = ()) -> list[RecognizedFace]:
         """One RecognizedFace per face big enough to trust, named or UNKNOWN."""
+        return self.check_faces(frame, detections).faces
+
+    def check_faces(self, frame: np.ndarray, detections: Sequence[Detection] = ()) -> FaceCheck:
+        """recognize(), plus the box of every face found, however small (for taking photos)."""
         if frame is None or getattr(frame, "size", 0) == 0:
             raise ValueError("recognize() needs a camera frame, got an empty one")
+        people, matcher = self._known()
         height, width = frame.shape[:2]
+        boxes: list[Box] = []
         found: list[tuple[Box, str | None, float]] = []
         for face in self._model.get(frame):
             corners = np.asarray(face.bbox, dtype=np.float32)[:4]
+            boxes.append(clip_box(corners, width, height))
             if min(corners[2] - corners[0], corners[3] - corners[1]) < self.min_face_pixels:
                 continue                               # too far away to trust
             vector = embedding_of(face)
-            person_id, score = (None, 0.0) if vector is None else self._matcher.match(vector)
-            found.append((clip_box(corners, width, height), person_id, score))
+            person_id, score = (None, 0.0) if vector is None else matcher.match(vector)
+            found.append((boxes[-1], person_id, score))
 
         found = self._one_face_per_person(found)
-        return [
+        faces = [
             RecognizedFace(
-                name=self._display_name(person_id),
+                name=display_name(people, person_id),
                 similarity=score,
                 box=box,
                 person_id=person_id,
@@ -236,6 +305,7 @@ class Recognizer:
             )
             for box, person_id, score in found
         ]
+        return FaceCheck(faces, boxes)
 
     # ---- helpers ------------------------------------------------------------------
 
@@ -256,17 +326,17 @@ class Recognizer:
             result.append((box, person_id, score))
         return result
 
-    def _display_name(self, person_id: str | None) -> str:
-        if person_id is None:
-            return UNKNOWN
-        person = self._people.get(person_id)
-        return person.name if person is not None else person_id
+    def _known(self) -> tuple[dict[str, Person], FaceMatcher]:
+        """The known people and their matcher, read together."""
+        with self._known_lock:
+            return self._people, self._matcher
 
     def _warn_about_mismatches(self) -> None:
         """One warning when the person folders and the saved faces do not agree."""
-        enrolled = self._matcher.person_ids
-        not_enrolled = sorted(set(self._people) - enrolled)
-        no_folder = sorted(enrolled - set(self._people))
+        people, matcher = self._known()
+        enrolled = matcher.person_ids
+        not_enrolled = sorted(set(people) - enrolled)
+        no_folder = sorted(enrolled - set(people))
         problems = []
         if not_enrolled:
             problems.append(f"not enrolled yet, so never recognised: {', '.join(not_enrolled)} "

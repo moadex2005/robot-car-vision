@@ -7,6 +7,8 @@ import logging
 import re
 import subprocess
 import sys
+import threading
+import time
 import types
 from pathlib import Path
 
@@ -155,6 +157,92 @@ def test_no_faces_gives_an_empty_list():
 def test_empty_frame_raises_value_error():
     with pytest.raises(ValueError):
         recognizer().recognize(np.zeros((0, 0, 3), np.uint8))
+
+
+def test_check_faces_gives_every_face_box_and_the_same_faces_as_recognize():
+    made = recognizer(FakeFace((10, 10, 49, 200), SARA),          # too small to name, still a face
+                      FakeFace((-5.0, 100.0, 90.0, 200.0), OMAR))
+    check = made.check_faces(frame())
+    assert check.boxes == [(10, 10, 49, 200), (0, 100, 90, 200)]
+    assert check.faces == made.recognize(frame())
+    assert [f.name for f in check.faces] == ["Omar Ali"]
+
+
+def test_no_faces_gives_no_boxes():
+    assert recognizer().check_faces(frame()) == recognizer_module.FaceCheck([], [])
+
+
+# ---- enrolling again while the loop runs ------------------------------------------------
+
+
+def test_reload_known_swaps_people_and_saved_faces_together():
+    made = recognizer(FakeFace((100, 100, 180, 200), STRANGER))
+    assert made.recognize(frame())[0].name == UNKNOWN
+    lina = Person("lina", "Lina Haddad")
+    made.reload_known({"lina": lina}, FaceMatcher(["lina"], np.stack([STRANGER]), threshold=0.42))
+    assert made.recognize(frame())[0].name == "Lina Haddad"
+    assert made.person("lina") is lina and made.person("sara") is None
+    assert made.enrolled_ids() == {"lina"}
+
+
+def test_reload_known_is_safe_while_recognize_runs_on_another_thread():
+    # Two pairs that each make sense alone. Mixing them (people of one, faces of the
+    # other) would show a face by its id, "alpha" or "beta", instead of a name.
+    pairs = [({"alpha": Person("alpha", "Alpha Name")}, FaceMatcher(["alpha"], np.stack([SARA]), 0.42)),
+             ({"beta": Person("beta", "Beta Name")}, FaceMatcher(["beta"], np.stack([SARA]), 0.42))]
+
+    class SlowModel(FakeFaceModel):
+        def get(self, image):
+            time.sleep(0.0005)                  # let the other thread swap in the middle of a check
+            return super().get(image)
+
+    made = Recognizer(SETTINGS, face_model=SlowModel(FakeFace((100, 100, 180, 200), SARA)),
+                      people=pairs[0][0], matcher=pairs[0][1])
+    names, errors, stop = set(), [], threading.Event()
+
+    def keep_recognising():
+        try:
+            while not stop.is_set():
+                names.update(face.name for face in made.recognize(frame()))
+        except Exception as error:          # reported below
+            errors.append(error)
+
+    thread = threading.Thread(target=keep_recognising)
+    thread.start()
+    for turn in range(300):
+        made.reload_known(*pairs[turn % 2])
+        time.sleep(0.0002)
+    stop.set()
+    thread.join(timeout=5)
+    assert errors == []
+    assert names == {"Alpha Name", "Beta Name"}
+
+
+def test_the_shared_face_model_lets_one_thread_use_it_at_a_time():
+    class CountsUsers(FakeFaceModel):
+        def __init__(self):
+            super().__init__()
+            self.users, self.most = 0, 0
+
+        def get(self, image):
+            self.users += 1
+            self.most = max(self.most, self.users)
+            time.sleep(0.002)
+            self.users -= 1
+            return super().get(image)
+
+    model = CountsUsers()
+    made = Recognizer(SETTINGS, face_model=model, people={},
+                      matcher=FaceMatcher([], np.zeros((0, SIZE)), 0.42))
+    shared = made.face_model
+    threads = [threading.Thread(target=lambda: [shared.get(frame()) for _ in range(10)]) for _ in range(3)]
+    threads.append(threading.Thread(target=lambda: [made.recognize(frame()) for _ in range(10)]))
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+    assert model.calls == 40
+    assert model.most == 1
 
 
 def test_person_returns_the_info_card():

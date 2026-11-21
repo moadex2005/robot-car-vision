@@ -280,3 +280,45 @@ def test_enroll_never_prints_an_embedding(team, capsys):
     enroll(settings, face_model=FakeFaceModel())
     out = capsys.readouterr().out
     assert "[" not in out and "0.333" not in out and "1.0" not in out
+
+
+# ---- enrolling from the running program: notes instead of printing ---------------------
+
+
+def test_encode_people_returns_the_notes_and_prints_nothing(team, capsys):
+    settings, folder = team
+    model = FakeFaceModel()
+    enrolment = enroll_module.encode_people(folder / "people", lambda: model)
+    assert capsys.readouterr().out == ""
+    assert enrolment.used == {"lina": 0, "omar": 0, "sara": 3}
+    assert enrolment.ids == ["sara", "sara", "sara"]
+    assert enrolment.vectors.shape == (3, SIZE)
+    assert set(enrolment.people) == {"lina", "omar", "sara"}
+    assert "Not enrolled: lina (no photos found)" in enrolment.notes
+    assert "Skipped sara/broken.jpg: unreadable (not a jpg or png image, or damaged)" in enrolment.notes
+    assert "Ignored (not jpg or png): sara/notes.txt" in enrolment.notes
+    assert any(note.startswith("Note: Skipped the folder 'Not Valid'") for note in enrolment.notes)
+    assert not (folder / "embeddings.npz").exists()             # saving is a separate step
+
+
+def test_encode_people_asks_for_the_face_model_only_when_there_are_photos(tmp_path):
+    (tmp_path / "people" / "sara").mkdir(parents=True)
+    enrolment = enroll_module.encode_people(tmp_path / "people", lambda: must_not_load(None))
+    assert enrolment.ids == [] and enrolment.notes == [
+        "Not enrolled: sara (no photos found)",
+        "Note: sara has no about.md (or an empty one), so they are shown by folder name, with no card text."]
+
+
+def test_save_enrolment_writes_the_vectors_or_removes_an_old_file(team):
+    settings, folder = team
+    path = folder / "embeddings.npz"
+    enrolment = enroll_module.encode_people(folder / "people", FakeFaceModel)
+    notes = enroll_module.save_enrolment(enrolment, folder / "people", path)
+    assert notes == [f"Saved 3 face vectors for 1 people to {path}"]
+    assert load_embeddings(path)[0] == ["sara", "sara", "sara"]
+
+    nobody = enroll_module.Enrolment(people={}, found={}, used={})
+    notes = enroll_module.save_enrolment(nobody, folder / "people", path)
+    assert notes[0].startswith("Nobody was enrolled")
+    assert notes[1].startswith("Removed the old embeddings.npz")
+    assert not path.exists()

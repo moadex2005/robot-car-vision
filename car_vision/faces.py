@@ -4,7 +4,8 @@ Pure logic with no camera and no model, so all of it can be tested with
 made-up numbers:
 
 - load_people reads the person folders under data/people/: each folder is one
-  person, described by an optional hand-written about.md.
+  person, described by an optional hand-written about.md; photos_in lists the
+  photos in one folder.
 - save_embeddings and load_embeddings keep the face vectors made by enroll.
 - FaceMatcher tells which enrolled person a face vector belongs to, if any.
 - FaceMemory keeps faces on screen between the frames where faces are checked.
@@ -29,6 +30,7 @@ log = logging.getLogger(__name__)
 
 ENROLL_COMMAND = r".venv\Scripts\python.exe -m car_vision.enroll"
 ABOUT_FILE = "about.md"
+PHOTO_SUFFIXES = (".jpg", ".jpeg", ".png")       # the photo files enrolment reads, in any letter case
 PERSON_ID = re.compile(r"[a-z0-9_]+")            # a folder name: small letters, digits, underscores
 HTML_COMMENT = re.compile(r"<!--.*?-->", re.DOTALL)
 # "Role: x", "Role : x", "**Role:** x" and "**Role**: x", in any letter case.
@@ -92,6 +94,14 @@ def read_person(folder: Path, problems: dict[str, str] | None = None) -> Person:
                f"{error} Until then {folder.name} is shown by folder name, with no card text.")
         return Person(person_id=folder.name, name=folder.name)
     return parse_about(folder.name, text)
+
+
+def photos_in(folder: Path) -> list[Path]:
+    """Every jpg, jpeg or png in the folder, any letter case, in name order."""
+    folder = Path(folder)
+    if not folder.is_dir():
+        return []
+    return sorted(p for p in folder.iterdir() if p.is_file() and p.suffix.lower() in PHOTO_SUFFIXES)
 
 
 def report(problems: dict[str, str] | None, folder_name: str, message: str) -> None:

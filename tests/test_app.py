@@ -1524,8 +1524,18 @@ def test_template_has_no_animation_that_runs_all_the_time_behind_the_glass():
     page = TEMPLATE.read_text(encoding="utf-8")
     assert "animation-timeline: scroll(root)" in page        # the shapes follow the scroll position
     endless = [line.strip() for line in page.splitlines() if "infinite" in line and "animation" in line]
-    # Only two small things may loop: the status dot, and the waiting dots while an answer is on its way.
-    assert all("ping" in line or "blink" in line for line in endless), endless
+    # Only three small things may loop: the status dot, the waiting dots while an answer is on its
+    # way, and the waves on the Voice button, which loop only while words are being spoken.
+    speaking = [line for line in endless if line.startswith(".voice-button.is-speaking ")]
+    assert all("ping" in line or "blink" in line for line in endless if line not in speaking), endless
+    assert len(speaking) == 1
+    # The waves loop only under is-speaking, and the script takes that class off when speech ends
+    # (its end event, an error, the last-resort timer and hush() all go through these two).
+    assert 'voiceButton.classList.toggle("is-speaking", on);' in page
+    for function in ("function talkEnded(", "function hush("):
+        body = page[page.index(function):]
+        assert "showSpeaking(false);" in body[:body.index("\n}\n")], function
+    assert "showSpeaking(true);" in page[page.index("function pieceStarted("):page.index("function waitForTalk(")]
 
 
 def test_template_only_makes_links_for_http_and_https():
@@ -1816,6 +1826,176 @@ def test_template_brush_follows_the_rules_of_the_marking():
     assert "requestAnimationFrame" not in page[page.index("// ---- the brush"):page.index("// ---- asking more")]
     # Never for a person: the tools are shown only for something the API may see.
     assert 'allowBrush(data.describable === true && data.kind !== "person" && !data.person)' in page
+
+
+# ---- voice: speaking and asking by voice --------------------------------------------------
+
+LISTEN_PRIVACY = ("Asking by voice sends the sound of your question to your browser's speech service "
+                  "(Microsoft or Google) to turn it into text.")
+SPEAK_PRIVACY = ('A "Natural" or online voice sends the text of the answer to that service to be spoken; '
+                 "the other voices stay on this computer.")
+
+
+def tag_with_id(page, element_id):
+    match = re.search(r'<[a-z]+\b[^>]*\bid="' + element_id + r'"[^>]*>', page)
+    assert match, element_id
+    return match.group(0)
+
+
+def between(page, start, end):
+    return page[page.index(start):page.index(end, page.index(start))]
+
+
+def test_template_has_the_voice_button_its_box_the_microphones_and_the_caption():
+    page = rendered_page()
+    around = ids_around(page)
+    assert "nav" in around["voiceButton"]
+    assert 'id="voiceButton" type="button" aria-expanded="false" aria-controls="voiceBox"' in page
+    assert '<div class="voice-box glass" id="voiceBox" role="dialog" aria-label="Voice" hidden>' in page
+    for inside in ("voiceSwitch", "voiceChoice", "voiceTest"):
+        assert "voiceBox" in around[inside], inside
+    assert '<input type="checkbox" id="voiceSwitch" role="switch">' in page and "Speak the answers" in page
+    assert 'id="voiceTest" type="button">Test</button>' in page
+    assert 'The most natural voices are the "Natural" ones in Microsoft Edge; they need the internet.' in page
+    assert "askForm" in around["askMic"] and "followForm" in around["followMic"]
+    assert "watch" in around["stageMic"] and "frame" in around["stageMic"]
+    assert "frame" in around["caption"] and "watch" in around["caption"]
+    assert "caption" in around["captionQuestion"] and "caption" in around["captionAnswer"]
+    # Every new control is a labelled button, hidden until the script found the API it needs.
+    for button in ("voiceButton", "askMic", "followMic", "stageMic"):
+        tag = tag_with_id(page, button)
+        assert tag.startswith("<button") and 'type="button"' in tag and "aria-label=" in tag, tag
+        assert re.search(r"\shidden\b", tag), tag
+    # Near the chat and in the footer; each sentence shown only where its API exists.
+    line = ('<p class="voice-privacy" hidden><span class="privacy-listen" hidden>' + LISTEN_PRIVACY +
+            '</span> <span class="privacy-speak" hidden>' + SPEAK_PRIVACY + "</span></p>")
+    assert page.count(line) == 2
+    draw = between(page, "function drawVoicePrivacy()", "\n}\n")
+    assert 'querySelectorAll(".privacy-listen")) part.hidden = Recognition === null;' in draw
+    assert 'querySelectorAll(".privacy-speak")) part.hidden = speech === null;' in draw
+    assert "line.hidden = Recognition === null && speech === null;" in draw
+    for function in ("function setUpVoice()", "function loseSpeech()", "function loseListening()"):
+        assert "drawVoicePrivacy();" in between(page, function, "\n}\n"), function
+
+
+def test_template_feature_detects_speaking_and_listening():
+    page = TEMPLATE.read_text(encoding="utf-8")
+    speech = between(page, "function findSpeech()", "let speech = findSpeech();")
+    assert "try {" in speech and "catch (error)" in speech
+    assert "window.speechSynthesis" in speech and "window.SpeechSynthesisUtterance" in speech
+    assert 'typeof synth.speak === "function"' in speech and 'typeof Utterance === "function"' in speech
+    listening = between(page, "function findRecognition()", "let Recognition = findRecognition();")
+    assert "window.SpeechRecognition || window.webkitSpeechRecognition" in listening
+    assert "try {" in listening and 'typeof found === "function"' in listening
+    setup = between(page, "function setUpVoice()", "setUpVoice();\n")
+    assert "voiceButton.hidden = speech === null;" in setup
+    assert "button.hidden = Recognition === null;" in setup and "drawVoicePrivacy();" in setup
+    # A call that throws hides its controls instead of breaking the page.
+    assert "loseSpeech();" in between(page, "function startTalking(", "function utterance(")
+    assert "loseListening();" in between(page, "function startListening(", "function beginHearing(")
+    assert "catch (error)" in between(page, "function beginHearing(", "function waitForWords(")
+    assert 'recognizer.lang = "en-US";' in page
+
+
+def test_template_speaks_reactions_on_the_change_not_on_every_poll():
+    page = TEMPLATE.read_text(encoding="utf-8")
+    reactions = between(page, "function drawReactions(", "let online = null;")
+    assert 'if (!changed("reactions", reactions)) return;' in reactions      # the same poll again: silence
+    assert 'if (alarm && warning.hidden) say(WARNING_SPEECH, "warning");' in reactions
+    assert reactions.index("say(WARNING_SPEECH") < reactions.index("warning.hidden = !alarm;")
+    assert "const added = wanted.filter((text) => !present.has(text));" in reactions
+    assert 'if (added.length) say(added.join(" "), "greeting");' in reactions
+    assert 'WARNING_SPEECH = "Careful. A person is close in front of the car."' in page
+
+
+def test_template_speaks_each_answer_once_and_never_an_error():
+    page = TEMPLATE.read_text(encoding="utf-8")
+    assert page.count('answerArrived("chat", data.text, false);') == 1
+    assert page.count('answerArrived("follow", data.text, false);') == 1
+    assert 'if (!isProblem) say(text, "answer");' in page
+    assert 'say(sentences(name, info.summary), "answer");' in between(page, "function showInfo(", "const errorText")
+    assert 'say(sentences(data.person.name, data.person.role), "answer");' in page
+    # A late answer for a thing no longer shown is dropped before it could be spoken.
+    follow = page[page.index("async function askFollowUp("):]
+    assert follow.index("if (mine !== lookup || id !== followId) return;") < follow.index("showFollowReply(reply)")
+    describe = between(page, "async function describe(", "// ---- the brush")
+    assert describe.index("if (mine !== lookup) return;") < describe.index("showInfo(data)")
+    # One thing at a time; the warning is cut off only by another warning or hush().
+    speak = between(page, "function speak(", "function startTalking(")
+    assert 'if (talking && talking.kind === "warning" && kind !== "warning") return;' in speak
+    assert "if (!speech || hearing) return;" in speak                    # never while listening
+    assert speak.index("hush();") < speak.index("setTimeout(() => startTalking(talk), SPEAK_DELAY_MS)")
+    assert "MAX_SPOKEN_CHARS = 600" in page and "PIECE_CHARS = 160" in page
+
+
+def test_template_cleans_text_for_the_ear():
+    page = TEMPLATE.read_text(encoding="utf-8")
+    ear = between(page, "function earText(", "function cutAtSentence(")
+    assert r"/\bhttps?:\/\/\S+/gi" in ear and r"/\bFrom the web\b:?/gi" in ear
+    assert "[*_`~|#]+" in ear and "cutAtSentence(lines.join(\" \"), MAX_SPOKEN_CHARS)" in ear
+
+
+def test_template_chooses_a_natural_english_voice_and_speaks_english():
+    page = TEMPLATE.read_text(encoding="utf-8")
+    rank = between(page, "function voiceRank(", "function englishVoices(")
+    assert "/natural/i.test(name) ? 0 : /online/i.test(name) || /^google/i.test(name) ? 1 : 2" in rank
+    assert 'lang === "en-us" ? 0 : lang === "en-gb" ? 1 : 2' in rank
+    assert "voices.filter((voice) => voice && isEnglish(voice))" in page   # never another language
+    assert "voices.find((voice) => voice.name === wanted) || voices[0] || null" in page
+    assert 'words.lang = voice && voice.lang ? asText(voice.lang) : "en-US";' in page
+    assert '"voiceschanged"' in page                                       # voices may arrive late
+    assert 'voiceChoice.value = voices.some((voice) => voice.name === wanted) ? wanted : "auto";' in page
+
+
+def test_template_remembers_voice_in_storage_and_waits_for_the_first_click():
+    page = TEMPLATE.read_text(encoding="utf-8")
+    storage = between(page, "function readStored(", "// The browser's speaking parts")
+    assert storage.count("try {") == 2 and storage.count("catch (error)") == 2
+    assert "window.localStorage.getItem(key)" in storage and "window.localStorage.setItem(key, value)" in storage
+    assert 'let voiceWanted = readStored(VOICE_KEY) === "on";' in page        # off by default
+    assert "const voiceActive = () => speech !== null && voiceWanted && pageTouched;" in page
+    assert 'window.addEventListener("pointerdown", notePageTouched' in page
+    assert 'window.addEventListener("keydown", notePageTouched' in page
+    assert "if (!on) hush();" in page                                          # switching off hushes
+
+
+def test_template_escape_hushes_before_it_closes_anything():
+    page = TEMPLATE.read_text(encoding="utf-8")
+    keys = page[page.index('document.addEventListener("keydown"'):]
+    assert keys.index("if (stopVoice()) return;") < keys.index("closeTopmost();")
+    body = between(page, "function closeTopmost()", 'document.addEventListener("keydown"')
+    order = [body.index(step) for step in ("closeCameraBox(true)", "closeVoiceBox(true)", "leaveFullView()",
+                                           "closeDetails()")]
+    assert order == sorted(order)
+    assert "closeVoiceBox(false);" in between(page, "function enterFullView()", "function leaveFullView()")
+
+
+def test_template_listening_sends_once_and_never_empty():
+    page = TEMPLATE.read_text(encoding="utf-8")
+    end = between(page, "function endListening(", "function sendHeard(")
+    assert "if (session.done) return;" in end and "session.done = true;" in end
+    assert "session.final && target.field.value.trim()" in end and "!session.cancelled" in end
+    assert "if (!question || busy) return false;" in between(page, "function sendChat()", "function chatProblem(")
+    assert "if (!question || followId === null || followQuestion.disabled) return false;" in page
+    assert "const wasTalking = hush();" in between(page, "function startListening(", "function beginHearing(")
+    assert "recognizer.interimResults = true;" in page and "recognizer.continuous = false;" in page
+    for code in ("not-allowed", "no-speech", "network", "aborted"):
+        assert f'"{code}":' in page, code
+    for message in ("The microphone was not allowed.", "Nothing was heard.", "No internet for speech",
+                    "The browser stopped listening."):
+        assert message in page, message
+    assert 'const LISTENING = "Listening ...";' in page
+
+
+def test_template_caption_and_voice_box_are_solid_and_out_of_the_way():
+    page = TEMPLATE.read_text(encoding="utf-8")
+    caption = css_rule(page, ".caption")
+    assert "backdrop-filter" not in caption and "background: #1c1c1e" in caption
+    assert "bottom: calc(" in caption                                      # above the row of pills
+    assert "bottom:" in css_rule(page, ".stage:not(.is-full) .caption")   # shown on the page too (the scene)
+    assert "display: none" in css_rule(page, ".stage:not(.is-full) .stage-mic")
+    assert "backdrop-filter: none" in css_rule(page, ".glass.voice-box")
+    assert "CAPTION_MS = 12000" in page
 
 
 # ---- which files may use flask --------------------------------------------------------------

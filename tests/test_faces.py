@@ -16,6 +16,7 @@ from car_vision.faces import (
     load_embeddings,
     load_people,
     parse_about,
+    photos_in,
     save_embeddings,
 )
 from car_vision.state import Detection, RecognizedFace
@@ -152,6 +153,14 @@ def test_windows_line_endings():
 
 
 # ---- load_people ------------------------------------------------------------------
+
+
+def test_photos_in_lists_jpg_and_png_in_any_letter_case_in_name_order(tmp_path):
+    for name in ("b.PNG", "a.jpg", "c.JPEG", "d.webp", "about.md"):
+        (tmp_path / name).write_bytes(b"x")
+    (tmp_path / "e.jpg").mkdir()                            # a folder is not a photo
+    assert [p.name for p in photos_in(tmp_path)] == ["a.jpg", "b.PNG", "c.JPEG"]
+    assert photos_in(tmp_path / "missing") == []
 
 
 def test_load_people_makes_one_person_per_folder_in_name_order(tmp_path):

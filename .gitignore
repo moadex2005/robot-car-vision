@@ -11,6 +11,8 @@ __pycache__/
 data/people/*
 data/people.json
 data/camera.json
+data/people.removed/
+data/knowledge.md.bak
 data/embeddings.npz
 
 # Downloaded model weights and recordings are large and can be fetched again

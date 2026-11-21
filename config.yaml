@@ -1,0 +1,55 @@
+# Every setting of the car vision program lives in this one file.
+# Change a value, save, and start the program again.
+
+stream:
+  source: webcam            # phone, webcam or file
+  phone_url: "http://192.168.43.1:8080/video"   # the address IP Webcam shows, plus /video
+  webcam_index: 0           # 0 is the laptop's built-in camera
+  file_path: data/samples/car_clip.mp4          # a clip recorded from the car
+  width: 640
+  height: 480
+  reconnect_seconds: 2.0    # wait this long before trying a dropped stream again
+  loop_file: true           # play the clip again when it ends
+
+detector:
+  model: yolo26n.pt         # nano size: the fastest one
+  models_dir: models        # weights are downloaded here on the first run
+  confidence: 0.4           # higher = fewer false alarms, more misses
+  image_size: 640
+  device: auto              # auto, cuda or cpu
+  tracker: bytetrack.yaml   # gives each object a number that follows it
+
+recognizer:
+  model_pack: buffalo_l     # InsightFace face detector and face encoder
+  models_dir: models
+  detection_size: 640
+  device: auto              # auto, cuda or cpu
+  match_threshold: 0.42     # cosine similarity; lower = strangers match, higher = known people missed
+  every_n_frames: 5         # faces are checked on every 5th frame to keep the video fast
+  min_face_pixels: 40       # ignore faces smaller than this, they are too far to trust
+  people_file: data/people.json
+  photos_dir: data/people   # one folder of photos per person
+  embeddings_file: data/embeddings.npz
+
+assistant:
+  provider: anthropic
+  model: claude-opus-5-5
+  effort: low               # low, medium or high; low answers fastest
+  max_tokens: 16000
+  notes_file: data/knowledge.md
+  web_search: true          # look on the web when the notes do not have the answer
+  web_search_max_uses: 3
+  history_turns: 10         # how many earlier question-answer pairs are sent along
+  seen_within_seconds: 3.0  # a person counts as "in front of the camera" this long after the last sighting
+
+reactions:
+  greet_cooldown_seconds: 60        # greet the same person at most this often
+  close_box_height_ratio: 0.75      # a person whose box is taller than this share of the frame is "close"
+  close_hold_seconds: 0.5           # they must stay close this long before the warning shows
+  message_seconds: 4.0              # how long a greeting stays on screen
+
+app:
+  host: 127.0.0.1           # only this laptop can open the demo page
+  port: 5000
+  jpeg_quality: 80
+  log_file: logs/car_vision.log

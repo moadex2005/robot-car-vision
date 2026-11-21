@@ -1,0 +1,38 @@
+# Install PyTorch first, from its own index, so it comes with graphics-card support:
+#
+#   .venv\Scripts\python.exe -m pip install torch==2.14.1 torchvision==0.29.1 --index-url https://download.pytorch.org/whl/cu130
+#
+# Then install everything below:
+#
+#   .venv\Scripts\python.exe -m pip install -r requirements.txt
+#
+# Last, repair ONNX Runtime. InsightFace pulls in the processor-only build, which
+# overwrites the graphics-card build, so remove both and put the right one back:
+#
+#   .venv\Scripts\python.exe -m pip uninstall -y onnxruntime onnxruntime-gpu
+#   .venv\Scripts\python.exe -m pip install --no-deps onnxruntime-gpu==1.32.0
+#
+# check_env.py fails on "ONNX Runtime fell back to CPUExecutionProvider" if this step was missed.
+
+# Camera and drawing
+opencv-python==4.14.0.94
+numpy>=2.0,<3
+
+# Object detection and tracking (YOLO). lapx is what the tracker uses to match boxes.
+ultralytics==8.4.216
+lapx==0.13.1
+
+# Face recognition. onnxruntime-gpu runs the face models on the graphics card.
+onnxruntime-gpu==1.32.0
+insightface==2.1
+
+# Assistant
+anthropic
+python-dotenv
+
+# Demo page
+flask
+
+# Settings and tests
+pyyaml
+pytest

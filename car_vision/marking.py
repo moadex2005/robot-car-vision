@@ -9,7 +9,9 @@ question.
 Only the outline of the brushed region is drawn (a magenta line with a thin
 white line outside it), so the part that was marked stays as it was and the
 model can still see it. A loop drawn around something marks everything inside
-the loop. Uses OpenCV and numpy only.
+the loop. A marking over nearly the whole photo leaves no outline to see;
+marked_share tells the server so, and it then asks about the whole photo.
+Uses OpenCV and numpy only.
 """
 
 from __future__ import annotations
@@ -27,22 +29,55 @@ OUTLINE_SHARE = 1 / 120       # the magenta line is this share of the shorter si
 MIN_OUTLINE_PX = 2            # ... and never thinner than this
 MAGENTA = (255, 0, 255)       # OpenCV colours are blue, green, red
 WHITE = (255, 255, 255)
+NEARLY_ALL = 0.9              # a marking over more than this share of the photo marks no part at all
+QUALITY_STEP = 10             # when the JPEG is too large, it is saved again this much lower ...
+MIN_QUALITY = 25              # ... but never below this
 
 
-def mark_photo(photo: bytes, strokes: Sequence[Stroke], quality: int = 85) -> bytes:
+def mark_photo(photo: bytes, strokes: Sequence[Stroke], quality: int = 85,
+               max_bytes: int | None = None) -> bytes:
     """The JPEG photo, same size, with the outline of the brushed region drawn on it.
 
-    ValueError when the bytes are not a picture, when there are no strokes, or
-    when a point is not a pair of numbers.
+    With `max_bytes`, the JPEG is saved again at lower quality until it fits.
+    ValueError when the bytes are not a picture, when there are no strokes,
+    when a point is not a pair of numbers, or when it does not fit even at
+    MIN_QUALITY.
     """
     image = decode(photo)
+    draw_outline(image, marked_region(image, strokes))
+    while True:
+        encoded = encode(image, quality)
+        if max_bytes is None or len(encoded) <= max_bytes:
+            return encoded
+        if quality <= MIN_QUALITY:
+            raise ValueError(f"The marked photo is too large to send ({len(encoded)} bytes, "
+                             f"the limit is {max_bytes} bytes).")
+        quality = max(MIN_QUALITY, quality - QUALITY_STEP)
+
+
+def marked_share(photo: bytes, strokes: Sequence[Stroke]) -> float:
+    """How much of the photo the marking covers, from 0 to 1 (the inside of loops counts).
+
+    Over NEARLY_ALL there is no outline left to see, so the question is about the whole photo.
+    """
+    image = decode(photo)
+    region = marked_region(image, strokes)
+    return float(np.count_nonzero(region)) / region.size
+
+
+def marked_region(image: np.ndarray, strokes: Sequence[Stroke]) -> np.ndarray:
+    """The brushed region on this picture, loops filled in: 255 inside, 0 outside."""
     if not strokes or not any(len(stroke) for stroke in strokes):
         raise ValueError("There is nothing marked to draw.")
     height, width = image.shape[:2]
-    region = fill_loops(brush_mask(strokes, width, height))
-    draw_outline(image, region)
-    # Full colour detail (4:4:4): the usual JPEG halves colour detail, which turns a thin
-    # magenta line into a pale smear.
+    return fill_loops(brush_mask(strokes, width, height))
+
+
+def encode(image: np.ndarray, quality: int) -> bytes:
+    """The picture as JPEG bytes with full colour detail (4:4:4).
+
+    The usual JPEG halves colour detail, which turns a thin magenta line into a pale smear.
+    """
     options = [cv2.IMWRITE_JPEG_QUALITY, int(quality),
                cv2.IMWRITE_JPEG_SAMPLING_FACTOR, cv2.IMWRITE_JPEG_SAMPLING_FACTOR_444]
     ok, encoded = cv2.imencode(".jpg", image, options)

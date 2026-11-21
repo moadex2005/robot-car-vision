@@ -60,6 +60,7 @@ class FakeInfo:
 
 
 PHOTO = cv2.imencode(".jpg", np.full((40, 30, 3), 120, np.uint8))[1].tobytes()
+BIG_PHOTO = cv2.imencode(".jpg", np.full((240, 320, 3), 120, np.uint8))[1].tobytes()
 LAPTOP = Target("object", "laptop", 0.834, 7, PHOTO)
 CUP = Target("object", "cup", 0.6, None, PHOTO)                  # the tracker gave it no number
 AREA = Target("area", "", 0.0, None, PHOTO)
@@ -488,6 +489,33 @@ def test_a_second_click_on_the_same_tracked_object_is_answered_from_the_cache():
     assert len(assistant.looked_up) == 1
 
 
+@dataclass(frozen=True)
+class EpochTarget(Target):
+    """A Target with the pipeline's epoch, whether or not pipeline.Target has it yet."""
+
+    epoch: int = 0
+
+
+def test_after_the_track_numbers_start_again_the_same_track_is_looked_up_again():
+    assistant = FakeAssistant()
+    pipeline = FakePipeline(target=EpochTarget("object", "laptop", 0.8, 7, PHOTO, epoch=0))
+    client = client_for(assistant, pipeline)
+    inspect_then_describe(client)
+    pipeline.target_result = EpochTarget("object", "laptop", 0.8, 7, PHOTO, epoch=1)   # new numbers, same label
+    second, described = inspect_then_describe(client)
+    assert second["info"] is None                              # not the old object's description
+    assert len(assistant.looked_up) == 2
+    third, _described = inspect_then_describe(client)
+    assert third["info"]["name"] == "Laptop" and len(assistant.looked_up) == 2   # same epoch: from memory
+
+
+def test_the_cache_key_holds_the_epoch_and_a_target_without_one_is_epoch_0():
+    assert app_module.cache_key(Inspection("object", "laptop", 7, PHOTO, epoch=3)) == (3, 7, "laptop")
+    assert app_module.cache_key(Inspection("area", "", None, PHOTO, epoch=3)) is None
+    client = client_for(pipeline=FakePipeline(target=LAPTOP))     # a Target from before epochs
+    assert client.post("/api/inspect", json={"x": 0.5, "y": 0.5}).status_code == 200
+
+
 class SlowAssistant(FakeAssistant):
     """describe() waits until the test lets it go, so two requests can overlap."""
 
@@ -810,9 +838,11 @@ class FakeMarking:
 
     def __init__(self):
         self.calls = []
+        self.limits = []                    # the max_bytes of every call
 
-    def __call__(self, photo, strokes, quality=85):
+    def __call__(self, photo, strokes, quality=85, max_bytes=None):
         self.calls.append((photo, strokes))
+        self.limits.append(max_bytes)
         return b"marked copy"
 
 
@@ -837,6 +867,43 @@ def test_strokes_are_drawn_on_the_stored_photo_and_the_assistant_gets_the_marked
     assert fake_marking.calls == [(PHOTO, [[(0.2, 0.3), (0.25, 0.35), (0.3, 0.4)], [(1.0, 0.0)]])]
     assert assistant.follow_ups == [(PHOTO, "laptop", STORED_LAPTOP_INFO, (), "What is this part?")]
     assert assistant.marked == [b"marked copy"]                 # the original photo still goes first
+    assert fake_marking.limits == [app_module.MAX_IMAGE_BYTES]  # never larger than the assistant accepts
+
+
+@pytest.mark.parametrize("strokes", [None, []])
+def test_null_or_an_empty_list_of_strokes_is_an_ordinary_question(fake_marking, strokes):
+    assistant = FakeAssistant()
+    client = client_for(assistant)
+    inspection, _described = inspect_then_describe(client)
+    assert ask_about_a_part(client, inspection["id"], strokes).status_code == 200
+    ask_more(client, inspection["id"], "And then?")
+    assert assistant.marked == [None, None] and fake_marking.calls == []
+    assert assistant.follow_ups[1][3] == (("What is this part?", "Answer 1"),)   # no "marked" note
+
+
+WHOLE_PHOTO = [{"points": [[x / 10, y / 25] for y in range(26)                  # back and forth, row by row
+                           for x in (range(11) if y % 2 == 0 else range(10, -1, -1))]}]
+ALL_FOUR_EDGES = [{"points": [[0, 0], [1, 0], [1, 1], [0, 1], [0, 0]]}]
+
+
+@pytest.mark.parametrize("strokes", [WHOLE_PHOTO, ALL_FOUR_EDGES])
+def test_a_marking_over_nearly_the_whole_photo_is_an_ordinary_question(fake_marking, strokes):
+    """Brushed all over, or along all four edges, there is no outline left to see."""
+    assistant = FakeAssistant()
+    client = client_for(assistant, FakePipeline(target=Target("object", "laptop", 0.8, 7, BIG_PHOTO)))
+    inspection, _described = inspect_then_describe(client)
+    assert ask_about_a_part(client, inspection["id"], strokes).status_code == 200
+    ask_more(client, inspection["id"], "And then?")
+    assert fake_marking.calls == [] and assistant.marked == [None, None]
+    assert assistant.follow_ups[1][3] == (("What is this part?", "Answer 1"),)
+
+
+def test_a_marking_of_a_part_of_the_same_photo_is_still_marked(fake_marking):
+    assistant = FakeAssistant()
+    client = client_for(assistant, FakePipeline(target=Target("object", "laptop", 0.8, 7, BIG_PHOTO)))
+    inspection, _described = inspect_then_describe(client)
+    ask_about_a_part(client, inspection["id"], [{"points": [[0.3, 0.3], [0.7, 0.3], [0.7, 0.7], [0.3, 0.7], [0.3, 0.3]]}])
+    assert assistant.marked == [b"marked copy"]
 
 
 def test_the_real_marking_gives_the_assistant_a_picture_of_the_same_size():
@@ -889,10 +956,8 @@ def test_the_most_strokes_and_points_and_the_edges_are_accepted(fake_marking):
 @pytest.mark.parametrize("strokes", [
     "not a list",
     {"points": [[0.5, 0.5]]},
-    None,
     5,
-    [],                                                           # say nothing instead of an empty marking
-    [{"points": [[0.5, 0.5]]}] * 13,                              # more than 12 strokes
+    [{"points": [[0.5, 0.5]]}] * 13,                             # more than 12 strokes
     [{"points": []}],                                             # a stroke with no point
     [{"points": [[0.5, 0.5]] * 401}],                             # more than 400 points
     [[[0.5, 0.5]]],                                               # a stroke that is not {"points": ...}
@@ -1645,7 +1710,7 @@ def test_template_has_the_phone_picture_row():
     assert '<option value="keep">Leave the phone as it is</option>' in page
     assert '<span id="pictureHint">Smaller pictures arrive sooner.</span>' in page and '" The page shows "' in page
     assert 'id="pictureNow"' in page and '"The phone sends "' in page
-    assert '"/api/camera/picture", { choice: pictureChoice.value }' in page   # only the choice is sent
+    assert '"/api/camera/picture", { choice }' in page                       # only the choice is sent
     assert 'pictureRow.hidden = picture === null;' in page
     assert 'pictureChoice.addEventListener("change"' in page                 # posts as soon as it changes
     assert "showCameraResult(errorText(data, response" in page                 # errors in the result line
@@ -1688,6 +1753,30 @@ def test_template_full_view_never_depends_on_the_fullscreen_api():
     assert "overflow: hidden" in css_rule(page, "html.full-view, html.full-view body")
     full = css_rule(page, ".stage.is-full")
     assert "position: fixed" in full and "inset: 0" in full and "background: #000" in full
+
+
+def test_template_full_view_makes_the_page_behind_inert_and_puts_it_back():
+    """Without real full screen, Tab could reach the Camera button behind the stage."""
+    page = TEMPLATE.read_text(encoding="utf-8")
+    inert = page[page.index("function setPageBehindInert()"):page.index("function enterFullView()")]
+    assert "other.inert = true;" in inert and "madeInert.push(other)" in inert
+    assert "other.inert = false;" in inert and "madeInert = [];" in inert
+    assert "if (other === node || other.inert" in inert          # never the stage, never what was inert already
+    enter = page[page.index("function enterFullView()"):page.index("function leaveFullView()")]
+    leave = page[page.index("function leaveFullView()"):page.index("function toggleFullView()")]
+    assert "setPageBehindInert();" in enter and "putPageBehindBack();" in leave
+    # Every way out (button, F, Escape, the browser leaving full screen) goes through leaveFullView.
+    assert page.count("putPageBehindBack();") == 1
+    assert "\n  fullView = false;" in leave and page.count("\n  fullView = false;") == 1   # the only place
+
+
+def test_template_sends_picture_choices_one_after_the_other():
+    page = TEMPLATE.read_text(encoding="utf-8")
+    change = page[page.index('pictureChoice.addEventListener("change"'):page.index("// ---- the delay test")]
+    assert "if (pictureSending) pictureNext = pictureChoice.value;" in change   # only the newest waits
+    assert "else sendPicture(pictureChoice.value);" in change
+    assert "pictureSending = true;" in change and "pictureSending = false;" in change
+    assert "sendPicture(next);" in change                                  # sent when the first is answered
 
 
 def test_template_escape_closes_the_camera_box_then_the_full_view_then_the_panel():

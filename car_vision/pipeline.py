@@ -82,6 +82,11 @@ READ_BACK_TRIES = 2            # after a change the size is read back from the p
 READ_BACK_WAIT_SECONDS = 1.0   # ... this long later
 STREAM_SETTLE_SECONDS = 0.5    # the phone's stream needs this long to switch to a new picture size
 MAX_SHOWN_SIZE = (1920, 1080)  # a chosen picture size is shown at most this large
+MAX_ASKS = 3                   # at most this many size requests to one phone ...
+ASK_WINDOW_SECONDS = 60.0      # ... within this long; then the phone is left as it is
+PAUSE_STEP_SECONDS = 0.02      # a waiting phone thread checks this often whether it must give way
+TOO_MANY_ASKS = ("The phone changed its picture size back {} times within a minute; it is left as it is "
+                 "until the next Connect or another choice in the Camera box.")
 
 
 @dataclass(frozen=True)
@@ -94,6 +99,7 @@ class Target:
     track_id: int | None
     photo: bytes                 # JPEG cut from the clean frame
     person: Person | None = None # the recognised person, for kind "person"
+    epoch: int = 0               # goes up whenever track numbers start again (new camera, new frame size)
 
 
 @dataclass(frozen=True)
@@ -107,6 +113,7 @@ class View:
     frame: np.ndarray
     detections: tuple[Detection, ...]
     faces: tuple[RecognizedFace, ...]
+    epoch: int = 0                      # the track-number epoch this frame's track numbers belong to
 
     @property
     def size(self) -> tuple[int, int]:
@@ -173,11 +180,15 @@ class Pipeline:
         self._started = False                  # start() was called
         self._loop_running = False             # the loop thread runs (it ends after too many failures)
 
+        self._epoch = 0                        # goes up whenever track numbers start again
         self._picture: PhonePicture | None = None   # None: not a phone, or it did not say
         self._picture_round = 0                # goes up for every new phone or choice; the newest wins
+        self._stream_size: Size | None = None  # what the phone sent when its stream was last opened
+        self._asked_at: list[float] = []       # when this phone was asked for a size (this connect, this choice)
+        self._gave_up_asking = False           # too many asks: leave the phone as it is
 
         self._switch_lock = threading.Lock()   # one use_phone() at a time
-        self._picture_lock = threading.Lock()  # one talk with the phone about its picture at a time
+        self._phone_locks: dict[str, threading.Lock] = {}   # one talk with each phone at a time
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         # Only the loop thread uses these.
@@ -270,6 +281,7 @@ class Pipeline:
                                  "Choose one of the sizes in the list.")
             self._picture_choice = wanted
             self._set_phone_box()
+            self._forget_asks()                 # a new choice may ask the phone again
         log.info("Phone picture: %s", wanted)
         self._check_phone_picture()
 
@@ -329,7 +341,7 @@ class Pipeline:
             return None
         target, box = found
         photo = self._encode(cut_out(view.frame, photo_box(box, view.size)))
-        return replace(target, photo=photo)
+        return replace(target, photo=photo, epoch=view.epoch)
 
     # ---- start-up --------------------------------------------------------------
 
@@ -355,8 +367,15 @@ class Pipeline:
     # ---- the phone's picture size (a short thread of its own) ------------------
     #
     # Each call of _check_phone_picture() starts a new "round". The thread of an
-    # older round finds out that it is no longer the newest before it writes or
-    # asks anything, and stops. Only one thread talks to the phone at a time.
+    # older round checks that it is still the newest before every request to the
+    # phone and while it waits, and stops as soon as it is not. Only one thread
+    # talks to the same phone at a time; a phone that does not answer never holds
+    # up a round for another phone.
+    #
+    # The stream is opened again when the phone sends another size than it did
+    # when the stream was opened (see _open_stream_again). That is decided from
+    # what the phone says, not from which round asked, so a change asked for by
+    # a round that a newer one replaced is still followed by a reopen.
 
     def _check_phone_picture(self) -> None:
         """Read the phone's picture sizes and ask for the chosen one, off the video loop.
@@ -378,53 +397,107 @@ class Pipeline:
         Every step gives up quietly: a phone that is off or another camera app
         just leaves status()["phone_picture"] at None.
         """
-        with self._picture_lock:
+        with self._phone_lock(url):
             if not self._is_newest(work):
                 return
             current, offered = read_picture_sizes(url, self._fetch)
-            if current is None or not self._keep_picture(work, current, offered):
+            picture = self._keep_picture(work, current, offered) if current is not None else None
+            if picture is None:
                 return
-            wanted = self._wanted_size(current, offered)
-            if wanted is None or not self._is_newest(work):
+            self._open_stream_again(work, current)    # a change an older round asked for
+            wanted = self._wanted_size(current, list(picture.offered))
+            if wanted is None or not self._may_ask(work):
                 return
             log.info("Asking the phone for %s pictures instead of %s", size_text(wanted), size_text(current))
-            if ask_for_size(url, wanted, self._fetch) and self._read_back(url, work, wanted, offered):
-                self._open_stream_again(work)
+            if ask_for_size(url, wanted, self._fetch):
+                now_sent = self._read_back(url, work, wanted, picture.offered)
+                if now_sent is not None:
+                    self._open_stream_again(work, now_sent)
 
-    def _read_back(self, url: str, work: int, wanted: Size, offered: list[Size]) -> bool:
+    def _read_back(self, url: str, work: int, wanted: Size, offered: Sequence[Size]) -> Size | None:
         """Keep what the phone says it sends after the change; once more a moment later if it lags.
-        True when the phone now sends the size that was asked for.
+        Returns the size the phone said it sends last; None when it stopped answering or a
+        newer round began.
 
         Only the current size is taken from these answers. The list of offered
         sizes stays the one read before the change: while its camera restarts,
         the real phone lists just one size for a moment.
         """
+        current = None
         for attempt in range(READ_BACK_TRIES):
-            if attempt > 0:
-                self._stop.wait(READ_BACK_WAIT_SECONDS)
+            if attempt > 0 and not self._pause(work, READ_BACK_WAIT_SECONDS):
+                return None
             if not self._is_newest(work):
-                return False
+                return None
             current, _listed_during_restart = read_picture_sizes(url, self._fetch)
-            if current is None or not self._keep_picture(work, current, offered):
-                return False
+            if current is None or self._keep_picture(work, current, offered) is None:
+                return None
             if current == wanted:
-                return True
-        return False
+                break
+        return current
 
-    def _open_stream_again(self, work: int) -> None:
-        """After the phone changed its picture size, read its stream afresh.
+    def _open_stream_again(self, work: int, now_sent: Size) -> None:
+        """Read the phone's stream afresh when the phone now sends another size than it did
+        when the stream was opened. The first size heard from a phone is taken as that size.
 
         Seen on the real phone: the stream reader fixes the frame size when it
         opens the stream, so without this the frames stay the old size however
         large the phone's pictures are now. The short wait lets the phone send
         its first pictures in the new size before the stream is opened again.
         """
-        self._stop.wait(STREAM_SETTLE_SECONDS)
+        with self._lock:
+            if work != self._picture_round or self._stream_size == now_sent:
+                return
+            if self._stream_size is None:
+                self._stream_size = now_sent
+                return
+        if not self._pause(work, STREAM_SETTLE_SECONDS):
+            return                              # the newer round decides again from what it hears
         with self._lock:
             if work != self._picture_round or self._source.source != "phone":
                 return
             source = self._source
+            self._stream_size = now_sent
         source.reopen()
+
+    def _phone_lock(self, url: str) -> threading.Lock:
+        """The lock that keeps the talk with the phone at this address to one thread at a time."""
+        with self._lock:
+            return self._phone_locks.setdefault(url, threading.Lock())
+
+    def _pause(self, work: int, seconds: float) -> bool:
+        """Wait, but give way at once to a newer round or to stop(). True when still the newest."""
+        deadline = time.monotonic() + seconds
+        while not self._stop.is_set() and self._is_newest(work):
+            left = deadline - time.monotonic()
+            if left <= 0:
+                return True
+            self._stop.wait(min(left, PAUSE_STEP_SECONDS))
+        return False
+
+    def _may_ask(self, work: int) -> bool:
+        """True when this round may ask the phone for a size now, and counts the ask.
+
+        A phone that changes its size back each time would otherwise be asked
+        for ever: after 3 asks within a minute it is left as it is, with one
+        warning, until the next Connect or another choice.
+        """
+        now = time.monotonic()
+        with self._lock:
+            if work != self._picture_round or self._gave_up_asking:
+                return False
+            self._asked_at = [at for at in self._asked_at if now - at < ASK_WINDOW_SECONDS]
+            if len(self._asked_at) >= MAX_ASKS:
+                self._gave_up_asking = True
+                log.warning(TOO_MANY_ASKS.format(MAX_ASKS))
+                return False
+            self._asked_at.append(now)
+            return True
+
+    def _forget_asks(self) -> None:
+        """Start counting asks afresh (a new phone or a new choice). Call with self._lock held."""
+        self._asked_at = []
+        self._gave_up_asking = False
 
     def _wanted_size(self, current: Size, offered: list[Size]) -> Size | None:
         """The size to ask the phone for under the present choice; None to leave it as it is."""
@@ -445,18 +518,19 @@ class Pipeline:
         with self._lock:
             return work == self._picture_round
 
-    def _keep_picture(self, work: int, current: Size, offered: list[Size]) -> bool:
-        """Keep what the phone said, unless a newer round began meanwhile (then False).
+    def _keep_picture(self, work: int, current: Size, offered: Sequence[Size]) -> PhonePicture | None:
+        """Keep what the phone said and return it, unless a newer round began meanwhile (then None).
 
-        Now that the offered sizes are known, a chosen size can take effect: the
-        phone source gets its box here.
+        A shorter list than this phone gave before is not kept (see
+        offered_to_keep). Now that the offered sizes are known, a chosen size can
+        take effect: the phone source gets its box here.
         """
         with self._lock:
             if work != self._picture_round:
-                return False
-            self._picture = PhonePicture(current, tuple(offered))
+                return None
+            self._picture = PhonePicture(current, offered_to_keep(self._picture, offered))
             self._set_phone_box()
-            return True
+            return self._picture
 
     def _set_phone_box(self) -> None:
         """Give the phone source the box for the present choice. Call with self._lock held.
@@ -484,6 +558,9 @@ class Pipeline:
         # and gets the chosen box once it says it offers that size (_keep_picture).
         self._picture = None
         self._picture_round += 1                # what the old phone still says is ignored
+        self._stream_size = None                # the new stream's size is learned from the new phone
+        self._forget_asks()
+        self._epoch += 1                        # track numbers of the new camera start again
         self._view = None
         self._error = None
         self._on_screen = []
@@ -541,8 +618,8 @@ class Pipeline:
         index = self._frames
         self._frames += 1
 
+        resized = self._note_frame_size(frame)      # before detect(): the detector restarts its tracks too
         detections = self._detector.detect(frame)
-        resized = self._note_frame_size(frame)
         if self._recognizer is not None and (index % self.every_n_frames == 0 or resized):
             found = self._recognizer.recognize(frame, detections)
             self._memory.remember(found, detections, now)
@@ -553,7 +630,6 @@ class Pipeline:
         draw.draw_detections(drawn, detections)
         draw.draw_faces(drawn, faces)
         jpeg = self._encode(drawn)
-        view = View(frame, tuple(detections), tuple(faces))
         height, width = frame.shape[:2]
         with self._lock:                        # state, picture, view and reactions change together
             if self._generation != generation:
@@ -562,8 +638,9 @@ class Pipeline:
             self._state.update_faces(faces, now)
             on_screen = self._reactions.update(self._state.snapshot(), now)
             self._jpeg = jpeg
-            self._view = view
+            self._view = View(frame, tuple(detections), tuple(faces), self._epoch)
             self._on_screen = list(on_screen)
+            phone_not_heard = self._picture is None
         self._last_drawn = drawn
         came_back = self._lost_line is not None and index > 0    # this camera had dropped out and returned
         self._lost_line = None
@@ -571,7 +648,19 @@ class Pipeline:
         if came_back:
             # Seen on the real phone: when its camera app restarts, it sends its own
             # picture size again (1920 x 1080), so the chosen size is asked for once more.
+            # Its stream was opened again by the reader, at the size the phone sends now.
+            self._forget_stream_size()
             self._check_phone_picture()
+        elif index == 0 and phone_not_heard:
+            # The first picture from a phone that has not said anything about its sizes
+            # yet: its camera app was not serving when it was asked at start-up or at
+            # Connect. Now it is, so ask again. (Does nothing for a clip or the webcam.)
+            self._check_phone_picture()
+
+    def _forget_stream_size(self) -> None:
+        """The reader opened the stream again by itself: its size is learned afresh from the phone."""
+        with self._lock:
+            self._stream_size = None
 
     def _note_frame_size(self, frame: np.ndarray) -> bool:
         """True when this frame is not the size of the one before from this camera.
@@ -579,13 +668,16 @@ class Pipeline:
         That happens when another picture size is chosen or the phone changes
         its own. The remembered faces are then forgotten, because their boxes are
         in the old size's pixels; the caller checks the faces again at once.
-        (The detector starts its tracker again by itself.)
+        The detector starts its track numbers again by itself, so a new track
+        epoch begins: a track number from before means something else now.
         """
         height, width = frame.shape[:2]
         resized = self._frame_size is not None and (width, height) != self._frame_size
         self._frame_size = (width, height)
         if resized:
             self._memory = FaceMemory()
+            with self._lock:
+                self._epoch += 1
         return resized
 
     def _too_many_failures(self, error: Exception, generation: int) -> bool:
@@ -734,6 +826,18 @@ def shown_box(choice: str, picture: PhonePicture | None, config_box: Size) -> Si
     if size is None or picture is None or size not in picture.offered:
         return config_box
     return fitted_size(size[0], size[1], *MAX_SHOWN_SIZE)
+
+
+def offered_to_keep(earlier: PhonePicture | None, offered: Sequence[Size]) -> tuple[Size, ...]:
+    """The offered sizes to keep for this phone: the new list, unless it lacks a size the earlier one had.
+
+    Seen on the real phone: while its camera restarts it lists just the one
+    size it sends. Taking that list would make a chosen size "not offered".
+    The earlier list belongs to the same phone, because a switch forgets it.
+    """
+    if earlier is not None and not set(earlier.offered) <= set(offered):
+        return earlier.offered
+    return tuple(offered)
 
 
 CardOf = Callable[[RecognizedFace], Person]     # the person a known face belongs to

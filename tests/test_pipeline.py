@@ -1062,7 +1062,11 @@ def test_another_camera_app_changes_nothing_and_shows_nothing(make):
     pipeline = make(source=phone_source(frames=5), detector=detector, phone_fetch=nothing).start()
     assert wait_until(lambda: nothing.calls and detector.calls == 5)
     time.sleep(0.05)
-    assert nothing.calls == ["http://192.168.0.2:8080/status.json?show_avail=1"]   # asked once, gave up
+    # Asked at start-up and once more on the first picture (it might not have been serving yet),
+    # then never again: not for each of the other four frames. (When the first picture comes
+    # before the start-up question went out, that question gives way and it is asked once.)
+    assert set(nothing.calls) == {"http://192.168.0.2:8080/status.json?show_avail=1"}
+    assert 1 <= len(nothing.calls) <= 2
     assert picture_of(pipeline) is None
     assert pipeline.status()["error"] is None
 
@@ -1390,6 +1394,205 @@ def test_the_close_warning_does_not_depend_on_the_frame_size(make, size, scale):
                     recognizer=FakeRecognizer(faces=[]), reactions=ReactionEngine(CONFIG["reactions"])).start()
     assert wait_until(lambda: pipeline.status()["reactions"])
     assert pipeline.status()["reactions"] == [{"kind": "warning", "text": WARNING_TEXT}]
+
+
+# ---- talking with the phone: the harder cases --------------------------------------------
+
+
+class NotServingYet(FakePhoneApp):
+    """A phone whose camera app does not answer until `serving` is set."""
+
+    serving = False
+
+    def __call__(self, url, timeout):
+        if not self.serving:
+            with self._lock:
+                self.calls.append(url)
+            raise ConnectionRefusedError("the camera app is not serving yet")
+        return super().__call__(url, timeout)
+
+
+@pytest.mark.parametrize("when", ["start-up", "connect"])
+def test_a_phone_that_was_not_serving_is_asked_on_its_first_picture(make, when):
+    app, phone = NotServingYet(), phone_source(frames=0, connected=False)
+    if when == "start-up":
+        pipeline = make(source=phone, phone_fetch=app).start()
+    else:
+        pipeline = make(source=FakeSource(frames=3), phone_fetch=app, source_factory=SourceFactory(phone)).start()
+        pipeline.use_phone("http://192.168.0.2:8080/video")
+    assert wait_until(lambda: app.calls)                    # asked, and no answer
+    time.sleep(0.05)
+    assert picture_of(pipeline) is None
+    app.serving = True                                      # the camera app starts serving ...
+    phone.connected, phone.frames = True, 3                 # ... and its pictures arrive
+    assert wait_until(lambda: (picture_of(pipeline) or {}).get("current") == "640x360")
+    time.sleep(0.05)
+    assert app.sizes_asked == ["640x360"]                   # asked once, not once per frame
+
+
+class AnswersOkLate(FakePhoneApp):
+    """Takes a new size at once, but holds its "Ok" until the test lets it go."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.asked, self.answer = threading.Event(), threading.Event()
+
+    def __call__(self, url, timeout):
+        reply = super().__call__(url, timeout)
+        if "set=" in url:
+            self.asked.set()
+            assert self.answer.wait(5)
+        return reply
+
+
+def test_the_stream_is_reopened_even_when_a_newer_round_replaced_the_one_that_asked(make, monkeypatch):
+    """1280x720, then keep, then 1280x720 within a second: the phone sends 1280 x 720,
+    and the stream must be opened again although the round that asked was replaced."""
+    monkeypatch.setattr(pipeline_module, "STREAM_SETTLE_SECONDS", 0.01)
+    app, source = AnswersOkLate(current="640x360"), phone_source()
+    pipeline = make(source=source, phone_fetch=app, config=picture_config("keep")).start()
+    assert wait_until(lambda: picture_of(pipeline) is not None)
+    pipeline.set_phone_picture("1280x720")
+    assert app.asked.wait(3)                                # the phone has the new size, its Ok is on the way
+    pipeline.set_phone_picture("keep")
+    pipeline.set_phone_picture("1280x720")
+    app.answer.set()
+    assert wait_until(lambda: getattr(source, "reopens", 0) == 1)
+    time.sleep(0.1)
+    assert getattr(source, "reopens", 0) == 1 and app.sizes_asked == ["1280x720"]
+
+
+def test_offered_to_keep_keeps_the_longer_list_of_the_same_phone():
+    earlier = offering("640x360", "1280x720", "1920x1080")
+    sizes = [(640, 360), (1280, 720), (1920, 1080)]
+    assert pipeline_module.offered_to_keep(None, [(1920, 1080)]) == ((1920, 1080),)
+    assert pipeline_module.offered_to_keep(earlier, [(1920, 1080)]) == earlier.offered      # shorter
+    assert pipeline_module.offered_to_keep(earlier, [(1920, 1080), (640, 480), (800, 600)]) == earlier.offered
+    assert pipeline_module.offered_to_keep(earlier, sizes + [(800, 450)]) == (*sizes, (800, 450))   # more: taken
+
+
+class ListsOneSizeOnce(FakePhoneApp):
+    """Like the real phone while its camera restarts: the next status lists only the size it sends."""
+
+    short_once = False
+
+    def __call__(self, url, timeout):
+        if self.short_once and url.endswith("show_avail=1"):
+            self.short_once = False
+            full, self.offered = self.offered, [self.current]
+            try:
+                return super().__call__(url, timeout)
+            finally:
+                self.offered = full
+        return super().__call__(url, timeout)
+
+
+def test_the_came_back_check_keeps_the_good_list_of_offered_sizes(make, monkeypatch):
+    monkeypatch.setattr(pipeline_module, "STREAM_SETTLE_SECONDS", 0.01)
+    app, source = ListsOneSizeOnce(), phone_source(frames=3)
+    pipeline = make(source=source, phone_fetch=app, config=picture_config("1280x720")).start()
+    assert wait_until(lambda: (picture_of(pipeline) or {}).get("current") == "1280x720")
+    source.connected = False                                # the camera app restarts ...
+    assert wait_until(lambda: pipeline._lost_line is not None)
+    app.current, app.short_once = "1920x1080", True         # ... sends its own size, lists only that
+    source.connected = True
+    source.frames += 3
+    assert wait_until(lambda: app.sizes_asked == ["1280x720", "1280x720"])   # still "offered": asked again
+    assert wait_until(lambda: picture_of(pipeline)["current"] == "1280x720")
+    assert picture_of(pipeline)["offered"] == BY_AREA
+    assert set(source.boxes) == {(1280, 720)}               # the box never fell back
+
+
+class BouncingPhoneSource(FakeSource):
+    """A phone that goes back to 1920 x 1080 whenever its stream is opened again,
+    and whose stream drops for a moment each time."""
+
+    def __init__(self, app):
+        super().__init__(frames=1)
+        self.source, self.app, self.reopens = "phone", app, 0
+
+    def reopen(self):
+        self.reopens += 1
+        self.app.current = "1920x1080"
+        self.connected = False
+        threading.Timer(0.03, self.come_back).start()
+
+    def come_back(self):
+        with self._lock:
+            self.frames += 1
+        self.connected = True
+
+
+def test_a_phone_that_keeps_changing_back_is_asked_at_most_three_times(make, monkeypatch, caplog):
+    caplog.set_level(logging.WARNING, logger="car_vision.pipeline")
+    monkeypatch.setattr(pipeline_module, "STREAM_SETTLE_SECONDS", 0.01)
+    app = FakePhoneApp()
+    source = BouncingPhoneSource(app)
+    pipeline = make(source=source, phone_fetch=app, config=picture_config("auto")).start()
+    assert wait_until(lambda: len(app.sizes_asked) == 3)
+    assert wait_until(lambda: any("3 times" in record.getMessage() for record in caplog.records))
+    time.sleep(0.3)                                         # several more drops and returns would fit here
+    assert len(app.sizes_asked) == 3
+    assert len([r for r in caplog.records if "3 times" in r.getMessage()]) == 1
+    pipeline.set_phone_picture("auto")                      # a new choice may ask again
+    assert wait_until(lambda: len(app.sizes_asked) >= 4)
+
+
+def test_a_dead_phone_does_not_hold_up_the_next_one(make):
+    dead, alive = FakePhoneApp(gate=threading.Event()), FakePhoneApp()
+    network = Network({"192.168.1.10:8080": dead, "192.168.1.11:8080": alive})
+    factory = SourceFactory(phone_source(), phone_source())
+    pipeline = make(source=FakeSource(frames=1), phone_fetch=network, source_factory=factory).start()
+    try:
+        pipeline.use_phone("http://192.168.1.10:8080/video")
+        assert wait_until(lambda: dead.calls)               # stuck waiting on the dead phone ...
+        began = time.monotonic()
+        pipeline.use_phone("http://192.168.1.11:8080/video")
+        assert wait_until(lambda: (picture_of(pipeline) or {}).get("current") == "640x360", timeout=1.0)
+        assert time.monotonic() - began < 0.5               # ... and the next phone did not wait for it
+    finally:
+        dead.gate.set()
+    time.sleep(0.05)
+    assert dead.sizes_asked == []
+
+
+def test_a_round_waiting_to_read_back_gives_way_to_a_newer_one(make):
+    app = FakePhoneApp(lies=True)                           # says Ok, keeps 1920 x 1080: a read-back waits 1 s
+    pipeline = phone_at_start(make, app, choice="keep")
+    assert wait_until(lambda: picture_of(pipeline) is not None and pipeline.latest_jpeg() is not None)
+    time.sleep(0.05)                                        # the start-up talk is over
+    base = len(app.calls)
+    pipeline.set_phone_picture("1280x720")
+    assert wait_until(lambda: len(app.calls) == base + 3)   # status, ask, first read-back: now it waits
+    began = time.monotonic()
+    pipeline.set_phone_picture("keep")
+    assert wait_until(lambda: len(app.calls) == base + 4, timeout=1.0)
+    assert time.monotonic() - began < 0.3                   # not after the older round's second
+    time.sleep(1.2)
+    assert len(app.calls) == base + 4                       # the older round never read back again
+
+
+def test_the_track_epoch_goes_up_when_track_numbers_start_again(make):
+    source = FakeSource(frames=2)
+    pipeline = started(make, source=source, source_factory=SourceFactory(phone_source(frames=3)))
+    assert pipeline.target(track_id=2).epoch == 0
+    source.frames += 2                                      # more frames of the same size: same epoch
+    assert wait_until(lambda: source.sequence == 4)
+    time.sleep(0.05)
+    assert pipeline.target(track_id=2).epoch == 0
+    source.picture = np.full((720, 1280, 3), 60, np.uint8)  # a new frame size: the detector starts again
+    source.frames += 1
+    assert wait_until(lambda: pipeline.state.snapshot().frame_size == (1280, 720))
+    assert pipeline.target(track_id=2).epoch == 1
+    assert pipeline.target(x=0.5, y=0.5).epoch == 1         # every kind of target carries it
+    pipeline.use_phone(PHONE)                               # a new camera
+    assert wait_until(lambda: pipeline.state.snapshot().frame_size == (320, 240))
+    assert wait_until(lambda: pipeline.target(track_id=2) is not None)
+    assert pipeline.target(track_id=2).epoch == 2
+
+
+def test_a_target_has_epoch_0_unless_told_otherwise():
+    assert pipeline_module.Target("area", "", 0.0, None, b"").epoch == 0
 
 
 # ---- start-up ---------------------------------------------------------------------------

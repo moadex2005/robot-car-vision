@@ -41,9 +41,9 @@ from typing import Any
 from flask import Flask, Response, jsonify, render_template, request
 from werkzeug.exceptions import HTTPException
 
-from car_vision.assistant import Assistant, AssistantError, ObjectInfo
+from car_vision.assistant import MAX_IMAGE_BYTES, Assistant, AssistantError, ObjectInfo
 from car_vision.config import ConfigError, load_config, require, resolve_path, section
-from car_vision.marking import mark_photo
+from car_vision.marking import NEARLY_ALL, mark_photo, marked_share
 from car_vision.phone import load_remembered, phone_url, remember, same_phone
 from car_vision.pipeline import Pipeline
 from car_vision.stream import SOURCES
@@ -119,6 +119,7 @@ class Inspection:
     person_name: str | None = None           # the recognised person, for kind "person"
     info: ObjectInfo | None = None           # the description, once /api/describe has answered
     pairs: tuple[tuple[str, str], ...] = ()  # the follow-up questions and answers so far
+    epoch: int = 0                           # goes up whenever the pipeline's track numbers start again
 
 
 class InspectionStore:
@@ -215,11 +216,15 @@ class LookupGate:
                     del self._gates[key]             # nobody waits for this object any more
 
 
-def cache_key(inspection: Inspection) -> tuple[int, str] | None:
-    """Only tracked objects are cached: an area or an untracked box may be anything next time."""
+def cache_key(inspection: Inspection) -> tuple[int, int, str] | None:
+    """Only tracked objects are cached: an area or an untracked box may be anything next time.
+
+    The epoch is part of the key: track numbers start again when the picture size or
+    the camera changes, and track 3 then may be another object with the same label.
+    """
     if inspection.kind != "object" or inspection.track_id is None:
         return None
-    return inspection.track_id, inspection.label
+    return inspection.epoch, inspection.track_id, inspection.label
 
 
 # ---- turning answers into JSON -------------------------------------------------------------
@@ -315,13 +320,16 @@ def as_fraction(number: int | float) -> float | None:
 STROKES_SHAPE = 'Send the marking as a list of strokes, like [{"points": [[0.4, 0.5], [0.42, 0.52]]}].'
 
 
-def read_strokes(strokes: Any) -> list[list[tuple[float, float]]] | str:
+def read_strokes(strokes: Any) -> list[list[tuple[float, float]]] | str | None:
     """The brush strokes from a /api/follow_up body as lists of (x, y), or the reason they are wrong.
 
     Each point is two numbers from 0 to 1 across and down the photo. The
     page sends at most MAX_STROKES strokes of at most MAX_STROKE_POINTS points.
+    No strokes (null, an empty list, or the key left out) is None: no marking.
     """
-    if not isinstance(strokes, list) or not strokes:
+    if strokes is None or strokes == []:
+        return None
+    if not isinstance(strokes, list):
         return STROKES_SHAPE
     if len(strokes) > MAX_STROKES:
         return f"At most {MAX_STROKES} strokes can be marked, got {len(strokes)}."
@@ -432,7 +440,8 @@ def create_app(pipeline: Any, assistant: Any, camera_file: Path | None = None) -
         if target is None:
             return jsonify(error=GONE), 404
         inspection = Inspection(target.kind, target.label, target.track_id, target.photo,
-                                person_name=target.person.name if target.person is not None else None)
+                                person_name=target.person.name if target.person is not None else None,
+                                epoch=int(getattr(target, "epoch", 0)))   # older Targets have no epoch
         key = cache_key(inspection)
         cached = answers.get(key) if key is not None else None
         if cached is not None:                         # the page shows it at once: it is this click's description
@@ -481,11 +490,9 @@ def create_app(pipeline: Any, assistant: Any, camera_file: Path | None = None) -
         if not isinstance(inspection_id, str) or not isinstance(question, str):
             return jsonify(error='Send the id and the question as JSON, like '
                                  '{"id": "kq3...", "question": "How heavy is it?"}.'), 400
-        strokes = None                                # no "strokes": a question about the whole photo
-        if "strokes" in body:
-            strokes = read_strokes(body["strokes"])
-            if isinstance(strokes, str):
-                return jsonify(error=strokes), 400
+        strokes = read_strokes(body.get("strokes"))   # None: a question about the whole photo
+        if isinstance(strokes, str):
+            return jsonify(error=strokes), 400
         question = question.strip()
         problem = question_problem(question)
         if problem is not None:
@@ -501,6 +508,7 @@ def create_app(pipeline: Any, assistant: Any, camera_file: Path | None = None) -
                 return jsonify(error=NO_MARKING_FOR_PEOPLE), 400
             if len(inspection.pairs) >= MAX_FOLLOW_UPS:
                 return jsonify(error=TOO_MANY_FOLLOW_UPS), 400
+            strokes = marking_of_a_part(inspection, strokes)
             reply, code = answer_follow_up(assistant, inspection, question, strokes)
             if "error" not in reply:                  # a failed question is not kept
                 kept = MARKED_PREFIX + question if strokes is not None else question
@@ -611,6 +619,22 @@ def answer_follow_up(assistant: Any, inspection: Inspection, question: str,
     return answer_json(answer), 200
 
 
+def marking_of_a_part(inspection: Inspection,
+                      strokes: list[list[tuple[float, float]]] | None) -> list[list[tuple[float, float]]] | None:
+    """The strokes, or None when they cover nearly the whole photo.
+
+    Brushed all over, or along all four edges, the marking leaves no outline to see,
+    so the question is asked about the whole photo, as an ordinary one.
+    """
+    if strokes is None:
+        return None
+    try:
+        share = marked_share(inspection.photo, strokes)
+    except ValueError:                            # not a picture: the assistant will say so
+        return None
+    return None if share > NEARLY_ALL else strokes
+
+
 def ask_about_object(assistant: Any, inspection: Inspection, question: str,
                      strokes: list[list[tuple[float, float]]] | None) -> Any:
     """The assistant's answer about an object or an area, with the marked copy when there are strokes.
@@ -620,7 +644,7 @@ def ask_about_object(assistant: Any, inspection: Inspection, question: str,
     photo, label = inspection.photo, inspection.label or None
     if strokes is None:
         return assistant.follow_up(photo, label, inspection.info, inspection.pairs, question)
-    marked = mark_photo(photo, strokes)
+    marked = mark_photo(photo, strokes, max_bytes=MAX_IMAGE_BYTES)   # never over what the assistant takes
     return assistant.follow_up(photo, label, inspection.info, inspection.pairs, question, marked=marked)
 
 

@@ -278,6 +278,17 @@ def test_read_picture_sizes_skips_junk_in_the_list():
     assert phone.read_picture_sizes(STREAM, fetch) == ((1920, 1080), [(640, 360), (1280, 720)])
 
 
+def test_collecting_the_offered_sizes_stops_at_max_sizes(monkeypatch):
+    listed = [f"{width}x480" for width in range(1, 5001)]          # 5000 different sizes
+    parsed = []
+    real_parse = phone.parse_size
+    monkeypatch.setattr(phone, "parse_size", lambda text: parsed.append(text) or real_parse(text))
+    offered = phone.offered_sizes(listed)
+    assert offered == [(width, 480) for width in range(1, phone.MAX_SIZES + 1)]
+    assert len(parsed) == phone.MAX_SIZES                            # the rest is not even looked at
+    assert phone.offered_sizes(["640x360"] * 5000 + ["1280x720"]) == [(640, 360), (1280, 720)]
+
+
 @pytest.mark.parametrize("answer", [
     "<html>Another camera app</html>",
     "",

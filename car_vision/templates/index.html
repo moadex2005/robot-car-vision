@@ -2098,7 +2098,8 @@ function drawConnecting(status) {
 const pictureRow = byId("pictureRow"), pictureChoice = byId("pictureChoice");
 const pictureNow = byId("pictureNow"), pictureShown = byId("pictureShown"), pictureHint = byId("pictureHint");
 const autoOption = pictureChoice.options[0], keepOption = pictureChoice.options[1];
-let picturePosts = 0;          // choices sent and not answered yet; the select is left alone meanwhile
+let pictureSending = false;    // a choice is on its way; the select is left alone meanwhile
+let pictureNext = null;        // the newest choice made while one was on its way, or null
 
 // "640x360" as the page writes it: "640 × 360".
 const sizeLabel = (text) => asText(text).replace("x", " × ");
@@ -2126,7 +2127,7 @@ function drawPicture(status) {
   const optionsChanged = changed("pictureOptions", { offered: picture.offered, choice: picture.choice });
   if (optionsChanged) pictureChoice.replaceChildren(...pictureOptions(picture));
   const choiceChanged = changed("pictureChoice", picture.choice);
-  if (optionsChanged || (choiceChanged && picturePosts === 0)) pictureChoice.value = picture.choice;
+  if (optionsChanged || (choiceChanged && !pictureSending && pictureNext === null)) pictureChoice.value = picture.choice;
   setText(pictureNow, picture.current ? "The phone sends " + sizeLabel(picture.current) : "");
   drawPictureHelp();
 }
@@ -2141,11 +2142,19 @@ function drawPictureHelp() {
   setText(pictureShown, shown);
 }
 
-pictureChoice.addEventListener("change", async () => {
+// Choices go to the server one after the other: two quick changes could otherwise reach the
+// threaded server in the wrong order. While one is on its way, only the newest choice made
+// meanwhile is kept, and it is sent when the first is answered; the ones in between are dropped.
+pictureChoice.addEventListener("change", () => {
   drawPictureHelp();
-  picturePosts += 1;
+  if (pictureSending) pictureNext = pictureChoice.value;
+  else sendPicture(pictureChoice.value);
+});
+
+async function sendPicture(choice) {
+  pictureSending = true;
   try {
-    const { response, data } = await postJson("/api/camera/picture", { choice: pictureChoice.value });
+    const { response, data } = await postJson("/api/camera/picture", { choice });
     if (response.ok && data && data.ok === true) {
       if (cameraResult.classList.contains("problem")) showCameraResult("", false);
     } else {
@@ -2156,9 +2165,14 @@ pictureChoice.addEventListener("change", async () => {
     showCameraResult("Program not running: the choice could not be sent.", true);
     delete drawn.pictureChoice;
   } finally {
-    picturePosts -= 1;
+    pictureSending = false;
   }
-});
+  if (pictureNext !== null) {
+    const next = pictureNext;
+    pictureNext = null;
+    sendPicture(next);
+  }
+}
 
 // ---- the delay test -----------------------------------------------------------
 //
@@ -2206,11 +2220,32 @@ let leftScreenAt = -Infinity;
 
 const isScreenFull = () => document.fullscreenElement === stage;
 
+// While the full view covers the window, the page behind it must not be reachable by Tab
+// either: everything outside the stage is made inert, and exactly that is put back after.
+let madeInert = [];            // the elements this page made inert for the full view
+
+function setPageBehindInert() {
+  for (let node = stage; node !== document.body; node = node.parentElement) {
+    for (const other of node.parentElement.children) {
+      if (other === node || other.inert || other.tagName === "SCRIPT") continue;
+      other.inert = true;
+      madeInert.push(other);
+    }
+  }
+}
+
+function putPageBehindBack() {
+  for (const other of madeInert) other.inert = false;
+  madeInert = [];
+}
+
 function enterFullView() {
   fullView = true;
   closeCameraBox(false);               // the box is outside the live view
   stage.classList.add("is-full");
   document.documentElement.classList.add("full-view");
+  setPageBehindInert();
+  if (!stage.contains(document.activeElement)) fullButton.focus({ preventScroll: true });
   labelFullButton();
   fitDetails();                        // in full view the panel has a column of its own
   if (canAskScreen && !isScreenFull()) {
@@ -2222,6 +2257,7 @@ function leaveFullView() {
   fullView = false;
   stage.classList.remove("is-full");
   document.documentElement.classList.remove("full-view");
+  putPageBehindBack();
   labelFullButton();
   fitDetails();
   if (isScreenFull()) document.exitFullscreen().catch(() => {});

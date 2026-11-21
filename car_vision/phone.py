@@ -299,12 +299,25 @@ def sizes_in_status(answer: str) -> tuple[Size, list[Size]]:
     if current is None:
         raise ValueError("the answer has no current video_size")
     listed = available.get("video_size") if isinstance(available, dict) else None
+    return current, offered_sizes(listed if isinstance(listed, list) else [])
+
+
+def offered_sizes(listed: list) -> list[Size]:
+    """The sizes in IP Webcam's list, each once, in its order; at most MAX_SIZES of them.
+
+    Collecting stops as soon as MAX_SIZES sizes are found, and a set makes the
+    "seen before?" check quick, so even a very long list costs little.
+    """
     offered: list[Size] = []
-    for item in listed if isinstance(listed, list) else []:
+    seen: set[Size] = set()
+    for item in listed:
+        if len(offered) >= MAX_SIZES:
+            break
         size = parse_size(item)
-        if size is not None and size not in offered:
+        if size is not None and size not in seen:
+            seen.add(size)
             offered.append(size)
-    return current, offered[:MAX_SIZES]
+    return offered
 
 
 def ask_for_size(stream_url: str, size: Size, fetch: Fetch | None = None) -> bool:

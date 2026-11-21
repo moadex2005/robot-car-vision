@@ -3,7 +3,7 @@
 import cv2
 import numpy as np
 import pytest
-from car_vision.marking import MAGENTA, brush_width, mark_photo, outline_width
+from car_vision.marking import MIN_QUALITY, NEARLY_ALL, brush_width, mark_photo, marked_share, outline_width
 
 
 def photo(width=320, height=240, colour=(40, 120, 60)):
@@ -95,6 +95,44 @@ def test_the_line_grows_with_the_photo():
 def test_points_on_the_edges_and_several_strokes_work():
     marked = mark_photo(photo(200, 200), [[(0.0, 0.0), (1.0, 1.0)], [(1.0, 0.0)], [(0.0, 1.0), (0.5, 0.5)]])
     assert decoded(marked).shape == (200, 200, 3)
+
+
+def test_a_marking_along_all_four_edges_covers_the_whole_photo_and_draws_nothing():
+    """This is why the server asks such a question as an ordinary one."""
+    edges = [[(0, 0), (1, 0), (1, 1), (0, 1), (0, 0)]]
+    assert marked_share(photo(), edges) > NEARLY_ALL
+    original, marked = decoded(photo()), decoded(mark_photo(photo(), edges))
+    assert not any(is_magenta(pixel) for pixel in marked.reshape(-1, 3)[::7])
+    assert close(marked[120, 160], original[120, 160])
+
+
+def test_marked_share_of_a_part_and_of_a_loop():
+    assert marked_share(photo(), [[(0.5, 0.5)]]) < 0.05
+    assert 0.2 < marked_share(photo(), [SQUARE_LOOP]) < 0.4     # the inside of the loop counts
+    with pytest.raises(ValueError):
+        marked_share(photo(), [])
+
+
+def noisy_photo(width=1600, height=1200):
+    """A picture that compresses badly, so its JPEG is large."""
+    image = np.random.default_rng(1).integers(0, 256, (height, width, 3), dtype=np.uint8)
+    return cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, 90])[1].tobytes()
+
+
+def test_a_marked_copy_too_large_is_saved_again_at_lower_quality():
+    big = noisy_photo()
+    plain = mark_photo(big, [SQUARE_LOOP])
+    limit = len(plain) * 2 // 3
+    smaller = mark_photo(big, [SQUARE_LOOP], max_bytes=limit)
+    assert len(smaller) <= limit
+    assert decoded(smaller).shape == decoded(big).shape
+    assert mark_photo(big, [SQUARE_LOOP], max_bytes=len(plain)) == plain    # fits already: unchanged
+
+
+def test_a_marked_copy_that_cannot_fit_is_refused():
+    with pytest.raises(ValueError, match="too large"):
+        mark_photo(noisy_photo(), [SQUARE_LOOP], max_bytes=1000)
+    assert MIN_QUALITY >= 20
 
 
 @pytest.mark.parametrize("bad", [b"", b"not a picture", b"\xff\xd8\xff broken"])

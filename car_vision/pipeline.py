@@ -51,6 +51,7 @@ NO_INFO_CARDS = "No about.md was found for the enrolled people, so recognised fa
 
 PHOTO_MARGIN = 0.15            # the photo of a target is its box grown by 15 % on each side
 PHOTO_MIN_PIXELS = 160         # ... and at least this wide and high, where the frame allows
+CLIP_FINISHED = "Clip finished"   # drawn and shown when a clip has played to its end
 AREA_SHARE = 0.5               # a click on no box takes half the frame wide and half the frame high
 FACE_LABEL = "face"            # the label of a target that is a face box with no person box around it
 
@@ -124,7 +125,7 @@ class Pipeline:
         self._frames = 0                       # frames handed to the models so far
         self._failures = 0                     # broken frames in a row
         self._last_drawn: np.ndarray | None = None
-        self._showing_lost = False             # the reconnecting line is already on the last frame
+        self._lost_line: str | None = None     # the line already drawn on the last frame, if any
 
     # ---- public ------------------------------------------------------------
 
@@ -171,7 +172,8 @@ class Pipeline:
         fresh = snapshot.detections_at > 0 and time.monotonic() - snapshot.detections_at <= STALE_SECONDS
         return {
             "source": self._source.source,
-            "connected": bool(self._source.connected),
+            "connected": bool(self._source.connected) and error is None,   # a stopped loop is not live
+            "ended": bool(self._source.ended),        # a clip played to its end (loop_file: false)
             "fps": round(self._fps.value(), 1),
             "device": self._detector.device,
             "recognition": self._recognizer is not None,
@@ -270,7 +272,7 @@ class Pipeline:
             self._view = view
             self._on_screen = list(on_screen)
         self._last_drawn = drawn
-        self._showing_lost = False
+        self._lost_line = None
         self._fps.tick(now)
 
     def _too_many_failures(self, error: Exception) -> bool:
@@ -292,11 +294,16 @@ class Pipeline:
         return True
 
     def _show_stream_lost(self) -> None:
-        """Keep serving the last picture, with a reconnecting line on it (drawn once)."""
-        if self._showing_lost:
+        """Keep serving the last picture, with a line on it saying why nothing new comes.
+
+        Each line is drawn once; it is drawn again only when the reason changes,
+        e.g. from reconnecting to "Clip finished" when a clip has played to its end.
+        """
+        text = CLIP_FINISHED if self._source.ended else f"{self._source.source} stream lost - reconnecting"
+        if self._lost_line == text:
             return
-        self._showing_lost = True
-        self._show_line_on_last_frame(f"{self._source.source} stream lost - reconnecting")
+        self._lost_line = text
+        self._show_line_on_last_frame(text)
 
     def _show_line_on_last_frame(self, text: str) -> None:
         if self._last_drawn is None:
@@ -347,8 +354,9 @@ CardOf = Callable[[RecognizedFace], Person]     # the person a known face belong
 
 def objects_in_view(snapshot: WorldSnapshot, card_of: CardOf) -> list[dict[str, Any]]:
     """One entry per detection: people first, then by label, then by track number."""
-    ordered = sorted(snapshot.detections, key=list_order)
-    return [object_entry(d, snapshot.faces, snapshot.frame_size, card_of) for d in ordered]
+    owners = face_owners(snapshot.detections, snapshot.faces)
+    order = sorted(range(len(snapshot.detections)), key=lambda i: list_order(snapshot.detections[i]))
+    return [object_entry(snapshot.detections[i], owners.get(i), snapshot.frame_size, card_of) for i in order]
 
 
 def list_order(detection: Detection) -> tuple[bool, str, bool, int]:
@@ -356,10 +364,12 @@ def list_order(detection: Detection) -> tuple[bool, str, bool, int]:
     return detection.label != "person", detection.label, track is None, track if track is not None else 0
 
 
-def object_entry(detection: Detection, faces: Sequence[RecognizedFace], size: tuple[int, int],
+def object_entry(detection: Detection, face: RecognizedFace | None, size: tuple[int, int],
                  card_of: CardOf) -> dict[str, Any]:
-    """One entry, e.g. {"track_id": 7, "label": "laptop", "confidence": 0.83, "box": [...], "name": None}."""
-    face = known_face_in(detection, faces) if detection.label == "person" else None
+    """One entry, e.g. {"track_id": 7, "label": "laptop", "confidence": 0.83, "box": [...], "name": None}.
+
+    `face` is the known face that belongs to this box (see face_owners), or None.
+    """
     return {
         "track_id": int(detection.track_id) if detection.track_id is not None else None,
         "label": detection.label,
@@ -391,8 +401,8 @@ def find_target(view: View, x: float | None, y: float | None, track_id: int | No
     3. Else, when no label was asked for, the area around the point.
     """
     if track_id is not None:
-        detection = by_track(view.detections, track_id, label)
-        return detection_target(detection, view.faces, card_of) if detection is not None else None
+        index = by_track(view.detections, track_id, label)
+        return detection_target(view, index, card_of) if index is not None else None
     if x is None or y is None:
         return None
     width, height = view.size
@@ -401,17 +411,23 @@ def find_target(view: View, x: float | None, y: float | None, track_id: int | No
     if isinstance(hit, RecognizedFace):
         return face_target(hit, view, card_of)
     if isinstance(hit, Detection):
-        return detection_target(hit, view.faces, card_of)
+        return detection_target(view, index_of(view.detections, hit), card_of)
     if label is not None:
         return None                             # the thing asked for is no longer there
     return Target("area", "", 0.0, None, b""), area_box(view.size, px, py)
 
 
-def by_track(detections: Sequence[Detection], track_id: int, label: str | None) -> Detection | None:
-    for detection in detections:
+def by_track(detections: Sequence[Detection], track_id: int, label: str | None) -> int | None:
+    """The position of the detection with that track number (and label), or None."""
+    for index, detection in enumerate(detections):
         if detection.track_id == track_id and (label is None or detection.label == label):
-            return detection
+            return index
     return None
+
+
+def index_of(detections: Sequence[Detection], detection: Detection) -> int:
+    """The position of this very detection (two detections can be equal, so `is` is used)."""
+    return next(index for index, item in enumerate(detections) if item is detection)
 
 
 def smallest_box_at(view: View, px: float, py: float,
@@ -428,49 +444,73 @@ def smallest_box_at(view: View, px: float, py: float,
     return min(boxes, key=lambda item: box_area(item.box), default=None)
 
 
-def detection_target(detection: Detection, faces: Sequence[RecognizedFace],
-                     card_of: CardOf) -> tuple[Target, Box]:
+def detection_target(view: View, index: int, card_of: CardOf) -> tuple[Target, Box]:
     """An object, or a person (recognised when a known face belongs to their box)."""
+    detection = view.detections[index]
     confidence = float(detection.confidence)
     if detection.label != "person":
         return Target("object", detection.label, confidence, detection.track_id, b""), detection.box
-    face = known_face_in(detection, faces)
+    face = face_owners(view.detections, view.faces).get(index)
     person = card_of(face) if face is not None else None
     return Target("person", detection.label, confidence, detection.track_id, b"", person), detection.box
 
 
 def face_target(face: RecognizedFace, view: View, card_of: CardOf) -> tuple[Target, Box]:
     """A click on a face means that person: their person box when there is one, else the face box."""
-    body = body_of(face, view.detections)
-    if body is None:
-        person = card_of(face) if face.is_known else None
-        return Target("person", FACE_LABEL, 0.0, face.track_id, b"", person), face.box
-    target, box = detection_target(body, view.faces, card_of)
-    if face.is_known:
-        target = replace(target, person=card_of(face))
-    return target, box
+    index = body_of(face, view.detections, view.faces)
+    if index is not None:
+        return detection_target(view, index, card_of)
+    person = card_of(face) if face.is_known else None
+    return Target("person", FACE_LABEL, 0.0, face.track_id, b"", person), face.box
 
 
-def known_face_in(person_box: Detection, faces: Sequence[RecognizedFace]) -> RecognizedFace | None:
-    """The known face of a person box: the same track number, else a face centred inside the box."""
+# ---- which face belongs to which person box ------------------------------------------
+#
+# The rules, so a stranger standing behind a recognised person never gets their name:
+# - a face with a track number belongs only to the person box with that track number;
+# - a face without one belongs to the smallest person box around its centre that has
+#   no face of its own;
+# - one person is never given to two boxes in the same view.
+
+
+def face_owners(detections: Sequence[Detection], faces: Sequence[RecognizedFace]) -> dict[int, RecognizedFace]:
+    """The known face of each person box, by the box's position in `detections`."""
+    owners: dict[int, RecognizedFace] = {}
+    given: set[str] = set()                     # person ids already given to a box
     known = [face for face in faces if face.is_known]
-    for face in known:
-        if face.track_id is not None and face.track_id == person_box.track_id:
-            return face
-    for face in known:
-        if contains(person_box.box, *centre(face.box)):
-            return face
-    return None
+    for face in known:                          # matching track numbers come first and win
+        index = body_of(face, detections, faces) if face.track_id is not None else None
+        if index is not None and index not in owners and face.person_id not in given:
+            owners[index] = face
+            given.add(face.person_id)
+    untracked = [(boxes_around(face, detections, faces), face) for face in known if face.track_id is None]
+    untracked.sort(key=lambda item: box_area(detections[item[0][0]].box) if item[0] else 0)
+    for boxes, face in untracked:               # then the smallest box around the face
+        free = [index for index in boxes if index not in owners]
+        if free and face.person_id not in given:
+            owners[free[0]] = face
+            given.add(face.person_id)
+    return owners
 
 
-def body_of(face: RecognizedFace, detections: Sequence[Detection]) -> Detection | None:
-    """The person box a face belongs to: the same track number, else the smallest one around the face."""
-    people = [d for d in detections if d.label == "person"]
-    for detection in people:
-        if face.track_id is not None and detection.track_id == face.track_id:
-            return detection
-    around = [d for d in people if contains(d.box, *centre(face.box))]
-    return min(around, key=lambda d: box_area(d.box), default=None)
+def body_of(face: RecognizedFace, detections: Sequence[Detection],
+            faces: Sequence[RecognizedFace]) -> int | None:
+    """The position of the person box a face belongs to, or None."""
+    if face.track_id is not None:
+        return next((index for index, d in enumerate(detections)
+                     if d.label == "person" and d.track_id == face.track_id), None)
+    boxes = boxes_around(face, detections, faces)
+    return boxes[0] if boxes else None
+
+
+def boxes_around(face: RecognizedFace, detections: Sequence[Detection],
+                 faces: Sequence[RecognizedFace]) -> list[int]:
+    """Person boxes with no face of their own that hold the face's centre, smallest first."""
+    tracks_with_a_face = {f.track_id for f in faces if f.track_id is not None}
+    middle = centre(face.box)
+    found = [index for index, d in enumerate(detections)
+             if d.label == "person" and d.track_id not in tracks_with_a_face and contains(d.box, *middle)]
+    return sorted(found, key=lambda index: box_area(detections[index].box))
 
 
 def contains(box: Box, px: float, py: float) -> bool:

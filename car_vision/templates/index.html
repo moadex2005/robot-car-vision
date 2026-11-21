@@ -21,6 +21,8 @@
     --glass-solid: rgba(255, 255, 255, 0.94);
     --glass-edge: rgba(255, 255, 255, 0.75);
     --glass-shine: rgba(255, 255, 255, 0.9);
+    --pill-fill: linear-gradient(180deg, rgba(255, 255, 255, 0.92), rgba(255, 255, 255, 0.62));
+    --pill-shadow: 0 8px 22px rgba(0, 0, 0, 0.07), 0 1px 3px rgba(0, 0, 0, 0.05);
     --shadow: 0 18px 50px rgba(0, 0, 0, 0.08), 0 2px 8px rgba(0, 0, 0, 0.04);
     --shadow-deep: 0 40px 90px rgba(0, 0, 0, 0.18), 0 10px 30px rgba(0, 0, 0, 0.08);
     --blob-one: rgba(0, 113, 227, 0.22);
@@ -52,6 +54,8 @@
       --glass-solid: rgba(30, 30, 32, 0.95);
       --glass-edge: rgba(255, 255, 255, 0.12);
       --glass-shine: rgba(255, 255, 255, 0.16);
+      --pill-fill: linear-gradient(180deg, rgba(255, 255, 255, 0.14), rgba(255, 255, 255, 0.05));
+      --pill-shadow: 0 8px 22px rgba(0, 0, 0, 0.45);
       --shadow: 0 18px 50px rgba(0, 0, 0, 0.5), 0 2px 8px rgba(0, 0, 0, 0.3);
       --shadow-deep: 0 40px 100px rgba(0, 0, 0, 0.7), 0 10px 30px rgba(0, 0, 0, 0.4);
       --blob-one: rgba(10, 132, 255, 0.28);
@@ -157,13 +161,22 @@
   .is-live .dot { background: #30d158; }
   .is-live .dot::after { animation: ping 2s var(--ease-out) infinite; }
   .is-down .dot { background: #ff9f0a; }
-  .is-offline .dot { background: var(--warn); }
+  .is-offline .dot, .is-stopped .dot { background: var(--warn); }
+  .is-ended .dot { background: var(--grey); }
   @keyframes ping { 0% { transform: scale(1); opacity: 0.6; } 100% { transform: scale(3); opacity: 0; } }
   .status-state { font-weight: 600; }
+  .is-stopped .status-state {
+    color: var(--warn);
+    max-width: min(34vw, 30rem); overflow: hidden; text-overflow: ellipsis;   /* full text in its title */
+  }
   .status-item { color: var(--grey); }
   .status-item::before { content: "\00b7"; margin-right: 0.55rem; }
   .fps { display: inline-block; min-width: 2.6ch; text-align: right; }
-  .is-offline .status-item { display: none; }
+  .is-offline .status-item, .is-stopped .status-item { display: none; }
+
+  /* Over the moving video the bar is drawn solid: blurring a picture that changes 20 times
+     a second costs the graphics card the models need. */
+  .nav.over-video { background: var(--glass-solid); -webkit-backdrop-filter: none; backdrop-filter: none; }
 
   /* ---- buttons: pills that react like a spring ---- */
   .pill {
@@ -235,7 +248,8 @@
     object-fit: contain;
     display: block;
   }
-  .frame img.is-clickable { cursor: pointer; }   /* only over the picture, not over black bars */
+  .frame img.is-clickable { cursor: pointer; }
+  .frame img:focus-visible { outline-offset: -4px; border-radius: var(--radius-big); }   /* the frame clips outside rings */   /* only over the picture, not over black bars */
   .waiting, .offline {
     position: absolute; inset: 0;
     display: grid; place-items: center;
@@ -288,7 +302,8 @@
   .note::before { content: "Note: "; font-weight: 600; color: var(--text); }
   .stopped { color: var(--warn); font-weight: 600; }
 
-  /* In view: a wrapping row of glass pills under the video. */
+  /* In view: a wrapping row of glass pills under the video. They look like glass (a translucent
+     gradient, a hairline edge, a light line along the top) but blur nothing: there are many of them. */
   .inview { margin-top: 1.6rem; text-align: center; }
   .inview h3 { margin: 0 0 0.9rem; font-size: 0.8rem; font-weight: 600; letter-spacing: 0.14em; text-transform: uppercase; color: var(--grey); }
   .things { list-style: none; margin: 0; padding: 0; display: flex; flex-wrap: wrap; justify-content: center; gap: 0.6rem; }
@@ -296,28 +311,36 @@
   @keyframes pill-in { from { opacity: 0; transform: translateY(10px) scale(0.9); } to { opacity: 1; transform: none; } }
   .thing {
     display: inline-flex; align-items: baseline; gap: 0.6rem;
+    max-width: 100%;
     padding: 0.6rem 1.15rem;
     border-radius: 999px;
+    border: 1px solid var(--glass-edge);
+    background: var(--pill-fill);
+    box-shadow: inset 0 1px 0 var(--glass-shine), var(--pill-shadow);
     color: var(--text);
     font: inherit; font-size: 1.02rem;
+    overflow-wrap: anywhere;
     cursor: pointer;
     transition: transform 0.45s var(--spring);
   }
+  .thing.is-gone { opacity: 0.45; }   /* not seen in the last poll or two; kept so it does not flicker */
   .thing:hover { transform: translateY(-3px) scale(1.04); }
   .thing:active { transform: scale(0.95); transition-duration: 0.12s; }
   .thing-name { font-weight: 600; }
   .thing-detail { color: var(--grey); font-size: 0.85rem; font-variant-numeric: tabular-nums; }
   .thing.is-known .thing-detail { color: var(--accent); }
   .thing.is-known::before { content: ""; align-self: center; width: 0.5em; height: 0.5em; border-radius: 50%; background: var(--accent); }
-  .thing.is-open { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent), var(--shadow); }
+  .thing.is-open { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent), var(--pill-shadow); }
   .quiet { margin: 0; color: var(--grey); }
   .privacy { margin: 1.1rem auto 0; max-width: 38rem; color: var(--grey); font-size: 0.85rem; line-height: 1.45; }
 
   /* The details sheet slides in from the right. From 1280 px wide the video makes room for it. */
   .details {
+    min-width: 0;
     border-radius: var(--radius-big);
     padding: 1.3rem 1.4rem 1.5rem;
     overflow-y: auto;
+    overflow-wrap: anywhere;             /* one very long word must not make the sheet wider */
     overscroll-behavior: contain;
     animation: sheet-in 0.55s var(--ease-out);
   }
@@ -327,10 +350,14 @@
     .details { position: sticky; top: calc(var(--nav-space) + 8px); max-height: calc(100svh - var(--nav-space) - 24px); }
   }
   @media (max-width: 1279.98px) {
+    /* Here the sheet lies over the video, so it is drawn almost solid instead of blurring it. */
     .details {
       position: fixed; z-index: 40;
       top: calc(var(--nav-space) + 4px); right: 16px; bottom: 16px;
       width: min(440px, calc(100vw - 32px));
+      background: var(--glass-solid);
+      -webkit-backdrop-filter: none;
+      backdrop-filter: none;
     }
   }
   .details-top { display: flex; align-items: center; justify-content: space-between; margin-bottom: 1rem; }
@@ -373,6 +400,7 @@
   /* ---- the chat card ---- */
   .chat {
     max-width: 920px; margin: 0 auto;
+    overflow-wrap: anywhere;
     border-radius: var(--radius-big);
     padding: clamp(18px, 2.2vw, 30px);
     display: grid; grid-template-rows: auto minmax(0, 1fr) auto; gap: 1rem;
@@ -472,7 +500,7 @@
     <a href="#watch">Live view</a>
     <a href="#ask">Ask</a>
   </nav>
-  <div class="status-pill" id="status" role="status">
+  <div class="status-pill" id="status" aria-live="off">
     <span class="dot" aria-hidden="true"></span>
     <span class="status-state" id="liveText">Connecting</span>
     <span class="status-item wide" id="source">&ndash;</span>
@@ -502,7 +530,7 @@
     <div class="stage" id="watch">
       <div class="shot reveal">
         <div class="frame" id="frame">
-          <img id="video" src="/video" alt="Live camera view from the car, with labelled objects and faces">
+          <img id="video" src="/video" tabindex="-1" alt="Live camera view from the car, with labelled objects and faces">
           <div class="waiting" id="waiting">Waiting for the camera&hellip;</div>
           <div class="banners">
             <div class="capsule warning" id="warning" role="alert" hidden>
@@ -528,7 +556,7 @@
           <h3>In view</h3>
           <ul class="things" id="things"></ul>
           <p class="quiet" id="nothing">Nothing detected right now</p>
-          <p class="privacy" id="privacy">A click on an object sends a small cut-out of the picture to the assistant's API. A click on a person sends nothing.</p>
+          <p class="privacy" id="privacy">A click on an object or on an empty spot sends a small cut-out of the picture to the assistant's API. A click on a person sends nothing.</p>
         </div>
       </div>
 
@@ -574,7 +602,7 @@
 </main>
 
 <footer class="footer">
-  <p>A click on an object sends a small cut-out of the picture to the assistant's API. A click on a person sends nothing.</p>
+  <p>A click on an object or on an empty spot sends a small cut-out of the picture to the assistant's API. A click on a person sends nothing.</p>
   <p>Runs on this laptop. Nothing is sent to the car.</p>
 </footer>
 
@@ -654,6 +682,20 @@ function onScroll() {
 window.addEventListener("scroll", onScroll, { passive: true });
 onScroll();
 
+// While the video scrolls under the bar, the bar is drawn solid instead of blurring the video.
+// The watched band is the strip of the window the bar covers.
+let barWatch = null;
+function watchBarOverVideo() {
+  if (!("IntersectionObserver" in window)) return;
+  if (barWatch) barWatch.disconnect();
+  const band = Math.ceil(nav.getBoundingClientRect().bottom) + 8;
+  barWatch = new IntersectionObserver(([entry]) => nav.classList.toggle("over-video", entry.isIntersecting),
+                                      { rootMargin: "0px 0px " + (band - window.innerHeight) + "px 0px" });
+  barWatch.observe(frame);
+}
+watchBarOverVideo();
+window.addEventListener("resize", watchBarOverVideo);
+
 if ("IntersectionObserver" in window && !reducedMotion.matches) {
   const reveals = new IntersectionObserver((entries) => {
     for (const entry of entries) {
@@ -709,23 +751,51 @@ function pointOnPicture(event) {
   return { x, y };
 }
 
+// Once the frame has the picture's own shape (fitVideo), the picture fills it and there are no
+// bars, so moving the pointer needs no measuring. Only while the shapes differ (just after a new
+// stream starts) is the pointer measured, at most once per screen frame.
+let pointerEvent = null;
+
+function pictureFillsFrame() {
+  const width = video.naturalWidth, height = video.naturalHeight;
+  return width > 0 && height > 0 && frame.style.getPropertyValue("--ratio") === (width / height).toFixed(4);
+}
+
 video.addEventListener("mousemove", (event) => {
-  video.classList.toggle("is-clickable", pointOnPicture(event) !== null);
+  if (pictureFillsFrame()) {
+    if (!video.classList.contains("is-clickable")) video.classList.add("is-clickable");
+    return;
+  }
+  if (pointerEvent === null) {
+    requestAnimationFrame(() => {
+      video.classList.toggle("is-clickable", pointOnPicture(pointerEvent) !== null);
+      pointerEvent = null;
+    });
+  }
+  pointerEvent = event;
 });
 video.addEventListener("mouseleave", () => video.classList.remove("is-clickable"));
 video.addEventListener("click", (event) => {
   const point = pointOnPicture(event);
-  if (point) inspect(point, null);
+  if (point) inspect(point, null, video);
 });
 
 // ---- the status ----------------------------------------------------------
 
+const STATE_CLASSES = ["is-live", "is-down", "is-ended", "is-stopped", "is-offline"];
+
+function setState(className, text) {
+  for (const name of STATE_CLASSES) statusPill.classList.toggle(name, name === className);
+  setText(liveText, text);
+  if (liveText.title !== text) liveText.title = text;
+}
+
+// Live, reconnecting, a clip that has finished, or a loop that stopped after too many errors.
 function drawStatusLine(status) {
-  const connected = Boolean(status.connected);
-  statusPill.classList.toggle("is-live", connected);
-  statusPill.classList.toggle("is-down", !connected);
-  statusPill.classList.remove("is-offline");
-  setText(liveText, connected ? "Live" : "Reconnecting");
+  if (status.error) setState("is-stopped", "Stopped: " + asText(status.error));
+  else if (status.ended) setState("is-ended", "Clip finished");
+  else if (status.connected) setState("is-live", "Live");
+  else setState("is-down", "Reconnecting");
   setText(sourceText, asText(status.source));
   setText(fpsText, (Number(status.fps) || 0).toFixed(1));
   setText(deviceText, asText(status.device));
@@ -741,8 +811,12 @@ function drawStatusLine(status) {
 
 // ---- in view: one pill per detected thing ----------------------------------
 
+const KEEP_POLLS = 2;            // a pill stays this many polls after its object vanished, so a
+                                 // detection that flickers does not replay the pop-in or lose a press
 const thingItems = new Map();    // key -> the <li> already on the page, reused so a click is never lost
 const thingEntries = new Map();  // key -> the newest entry from the status, read when it is clicked
+const missedPolls = new Map();   // key -> how many polls in a row it was not in the status
+let thingOrder = [];             // the keys in the order they are shown
 
 function readObject(raw) {
   const box = asList(raw.box).map(Number);
@@ -753,6 +827,18 @@ function readObject(raw) {
     box: box.length === 4 && box.every(Number.isFinite) ? box : null,
     name: raw.name == null ? "" : asText(raw.name),
   };
+}
+
+// A tracked thing is known by its track number; an untracked one by its label and how many
+// untracked things with that label come before it, which stays the same from poll to poll.
+function thingKeys(entries) {
+  const counts = new Map();
+  return entries.map((entry) => {
+    if (entry.track_id !== null) return "track " + entry.track_id;
+    const number = (counts.get(entry.label) || 0) + 1;
+    counts.set(entry.label, number);
+    return "untracked " + entry.label + " " + number;
+  });
 }
 
 const percent = (confidence) => Math.round(confidence * 100) + "%";
@@ -768,7 +854,7 @@ function thingText(entry, roles) {
 
 function thingItem(key) {
   const item = make("li");
-  const button = make("button", "thing glass");
+  const button = make("button", "thing");
   button.type = "button";
   button.append(make("span", "thing-name"), make("span", "thing-detail"));
   button.addEventListener("click", () => inspectThing(key));
@@ -776,15 +862,38 @@ function thingItem(key) {
   return item;
 }
 
+// Remember what is in view now; forget a thing only after KEEP_POLLS polls without it.
+function rememberObjects(keys, entries) {
+  const seen = new Set(keys);
+  keys.forEach((key, i) => {
+    thingEntries.set(key, entries[i]);
+    missedPolls.set(key, 0);
+  });
+  for (const key of [...thingEntries.keys()]) {
+    if (seen.has(key)) continue;
+    const missed = (missedPolls.get(key) || 0) + 1;
+    if (missed > KEEP_POLLS) {
+      thingEntries.delete(key);
+      missedPolls.delete(key);
+      thingItems.delete(key);
+    } else {
+      missedPolls.set(key, missed);
+    }
+  }
+  // What is seen now in the server's order, with the vanishing pills left where they were.
+  const order = [...keys];
+  thingOrder.forEach((key, i) => {
+    if (!seen.has(key) && thingEntries.has(key)) order.splice(Math.min(i, order.length), 0, key);
+  });
+  thingOrder = order;
+  return seen;
+}
+
 function drawObjects(status) {
   const roles = new Map(asList(status.people).map((p) => [asText(p.name), asText(p.role)]));
   const entries = asList(status.objects).map(readObject);
-  thingEntries.clear();
-  const shown = entries.map((entry, index) => {
-    const key = entry.track_id !== null ? "track " + entry.track_id : "untracked " + index + " " + entry.label;
-    thingEntries.set(key, entry);
-    return { key, ...thingText(entry, roles) };
-  });
+  const seen = rememberObjects(thingKeys(entries), entries);
+  const shown = thingOrder.map((key) => ({ key, gone: !seen.has(key), ...thingText(thingEntries.get(key), roles) }));
   if (!changed("objects", shown)) return;
 
   const items = shown.map((thing) => {
@@ -797,11 +906,9 @@ function drawObjects(status) {
     setText(button.firstChild, thing.name);
     setText(button.lastChild, thing.detail);
     button.classList.toggle("is-known", thing.known);
+    button.classList.toggle("is-gone", thing.gone);
     return item;
   });
-  for (const key of [...thingItems.keys()]) {
-    if (!thingEntries.has(key)) thingItems.delete(key);
-  }
   const same = items.length === things.children.length && items.every((item, i) => things.children[i] === item);
   if (!same) things.replaceChildren(...items);
   nothing.hidden = items.length > 0;
@@ -819,13 +926,15 @@ function inspectThing(key) {
     body.y = Math.min(Math.max((y1 + y2) / 2, 0), 1);
   }
   if (body.track_id === undefined && body.x === undefined) return;
-  inspect(body, key);
+  inspect(body, key, thingItems.get(key).firstChild);
 }
 
 function clearObjects() {
   things.replaceChildren();
   thingItems.clear();
   thingEntries.clear();
+  missedPolls.clear();
+  thingOrder = [];
   nothing.textContent = "Program not running";
   nothing.hidden = false;
 }
@@ -866,9 +975,7 @@ function setOnline(isOnline) {
   greetings.replaceChildren();
   warning.hidden = true;
   notes.replaceChildren();
-  statusPill.classList.remove("is-live", "is-down");
-  statusPill.classList.add("is-offline");
-  liveText.textContent = "Program not running";
+  setState("is-offline", "Program not running");
 }
 
 async function poll() {
@@ -921,9 +1028,11 @@ function addThinking() {
   return item;
 }
 
-// Links only for http: and https: addresses, shown by host name; the link keeps the full address.
+// Links only for http: and https: addresses, shown by host name, each host once;
+// the link keeps the full address of the first page from that host.
 function webSources(urls) {
   const safe = [];
+  const hosts = new Set();
   for (const raw of urls) {
     let url;
     try {
@@ -931,11 +1040,15 @@ function webSources(urls) {
     } catch (error) {
       continue;
     }
-    if (url.protocol === "http:" || url.protocol === "https:") safe.push(url);
+    if (url.protocol !== "http:" && url.protocol !== "https:") continue;
+    const host = url.hostname.replace(/^www\./, "");
+    if (hosts.has(host)) continue;
+    hosts.add(host);
+    safe.push({ url, host });
   }
   const nodes = [];
-  for (const url of safe.slice(0, MAX_SOURCES)) {
-    const link = make("a", "source", url.hostname.replace(/^www\./, ""));
+  for (const { url, host } of safe.slice(0, MAX_SOURCES)) {
+    const link = make("a", "source", host);
     link.href = url.href;
     link.title = url.href;
     link.target = "_blank";
@@ -1007,8 +1120,9 @@ clearButton.addEventListener("click", async () => {
   if (busy) return;
   try {
     const { data } = await postJson("/api/reset", {});
-    if (data && typeof data.error === "string") {
-      addMessage("error", data.error);
+    if (!data || data.ok !== true) {             // the chat is cleared only when the server forgot it
+      addMessage("error", data && typeof data.error === "string" ? data.error
+                                                                  : "The conversation could not be cleared. Please try again.");
       return;
     }
     messages.replaceChildren(hint);
@@ -1022,11 +1136,15 @@ clearButton.addEventListener("click", async () => {
 // ---- the details panel ---------------------------------------------------
 
 let lookup = 0;          // number of the newest click; answers to older clicks are ignored
+let opener = null;       // what was clicked to open the panel; focus goes back to it on close
 
-function openDetails(key) {
+// `from` is the pill or the video that was clicked.
+function openDetails(key, from) {
   details.hidden = false;
   stage.classList.add("has-details");   // from 1280 px wide the video makes room for the sheet
   for (const [thingKey, item] of thingItems) item.firstChild.classList.toggle("is-open", thingKey === key);
+  opener = from;
+  closeButton.focus({ preventScroll: true });
 }
 
 function closeDetails() {
@@ -1034,6 +1152,8 @@ function closeDetails() {
   details.hidden = true;
   stage.classList.remove("has-details");
   for (const item of thingItems.values()) item.firstChild.classList.remove("is-open");
+  if (opener && opener.isConnected) opener.focus({ preventScroll: true });
+  opener = null;
 }
 
 closeButton.addEventListener("click", closeDetails);
@@ -1141,10 +1261,10 @@ function showInfo(info) {
 const errorText = (data, response, what) =>
   data && typeof data.error === "string" ? data.error : "The program gave no answer (status " + response.status + "). " + what;
 
-// A click on the video ({x, y}) or on the list ({track_id, label, x, y}).
-async function inspect(body, key) {
+// A click on the video ({x, y}) or on the list ({track_id, label, x, y}); `from` is what was clicked.
+async function inspect(body, key, from) {
   const mine = ++lookup;
-  openDetails(key);
+  openDetails(key, from);
   showWaiting();
   let reply;
   try {

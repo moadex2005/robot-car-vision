@@ -57,6 +57,7 @@ class FakeSource:
     def __init__(self, frames=5, size=(640, 360), picture=None):
         self.source = "file"
         self.connected = True
+        self.ended = False
         self.frames = frames
         self.sequence = 0
         self.started = False
@@ -272,6 +273,50 @@ def test_objects_has_one_entry_per_detection_people_first_then_label_then_track(
     assert objects[1]["name"] is None                   # nobody recognised in that box
     assert objects[4]["confidence"] == 0.83
     json.dumps(objects)
+
+
+STRANGER_BEHIND = Detection("person", 0.7, (80, 40, 300, 340), 5)     # Sara's face centre lies inside it too
+
+
+def test_a_stranger_behind_a_recognised_person_does_not_get_their_name(make):
+    pipeline = started(make, detections=[PERSON, STRANGER_BEHIND])
+    assert wait_until(lambda: pipeline.status()["objects"])
+    names = {o["track_id"]: o["name"] for o in pipeline.status()["objects"]}
+    assert names == {1: "Sara Ahmed", 5: None}          # one pill with her name, not two
+    assert pipeline.target(track_id=1).person == SARA
+    assert pipeline.target(track_id=5).person is None
+
+
+def owners(detections, faces):
+    return {i: face.person_id for i, face in pipeline_module.face_owners(detections, faces).items()}
+
+
+def test_a_face_with_a_track_number_belongs_only_to_that_box():
+    elsewhere = RecognizedFace("Sara Ahmed", 0.6, (150, 70, 210, 140), "sara", track_id=9)   # box 9 not in view
+    assert owners([PERSON], [elsewhere]) == {}
+
+
+def test_a_face_without_a_track_number_goes_to_the_smallest_box_around_it():
+    untracked = RecognizedFace("Sara Ahmed", 0.6, (150, 70, 210, 140), "sara", track_id=None)
+    assert owners([STRANGER_BEHIND, PERSON], [untracked]) == {1: "sara"}    # PERSON is the smaller box
+
+
+def test_a_box_with_a_face_of_its_own_gets_no_other_face():
+    own_unknown = RecognizedFace("Unknown", 0.2, (160, 80, 200, 130), None, track_id=1)
+    untracked = RecognizedFace("Sara Ahmed", 0.6, (150, 70, 210, 140), "sara", track_id=None)
+    assert owners([PERSON, STRANGER_BEHIND], [own_unknown, untracked]) == {1: "sara"}
+
+
+def test_one_person_is_never_given_to_two_boxes():
+    tracked = RecognizedFace("Sara Ahmed", 0.6, (150, 70, 210, 140), "sara", track_id=1)
+    again = RecognizedFace("Sara Ahmed", 0.5, (420, 60, 460, 110), "sara", track_id=None)
+    other = Detection("person", 0.8, (400, 40, 500, 340), 6)
+    assert owners([other, PERSON], [again, tracked]) == {1: "sara"}         # the matching track wins
+    small = Detection("person", 0.8, (390, 40, 480, 300), 7)
+    large = Detection("person", 0.8, (380, 20, 600, 350), None)
+    twice = [RecognizedFace("Sara Ahmed", 0.5, (420, 60, 460, 110), "sara", track_id=None),
+             RecognizedFace("Sara Ahmed", 0.5, (540, 60, 580, 110), "sara", track_id=None)]
+    assert owners([large, small], twice) == {1: "sara"}                     # else the smallest box
 
 
 def test_box_fractions_stay_between_0_and_1():
@@ -490,6 +535,7 @@ def test_ten_failures_in_a_row_stop_the_loop_with_an_error(make):
     assert detector.calls == 10                         # nothing more after the tenth
     error = pipeline.status()["error"]
     assert "10 frames in a row" in error and "the model broke" in error
+    assert pipeline.status()["connected"] is False      # the page must not say Live any more
     json.dumps(pipeline.status())
 
 
@@ -518,6 +564,32 @@ def test_stream_lost_keeps_the_last_frame_with_a_reconnecting_line(make):
     time.sleep(0.05)
     assert pipeline.latest_jpeg() is after              # drawn once, not on every wait
     assert pipeline.status()["connected"] is False
+
+
+def decoded(jpeg):
+    return cv2.imdecode(np.frombuffer(jpeg, np.uint8), cv2.IMREAD_COLOR).astype(int)
+
+
+def test_a_finished_clip_says_so_instead_of_reconnecting(make):
+    source = FakeSource(frames=3)
+    detector = FakeDetector()
+    pipeline = make(source=source, detector=detector).start()
+    assert wait_until(lambda: detector.calls == 3)
+    time.sleep(0.05)
+    assert pipeline.status()["ended"] is False
+    playing = pipeline.latest_jpeg()
+    source.connected = False                            # the reader sees the end of the clip ...
+    assert wait_until(lambda: pipeline.latest_jpeg() is not playing)
+    reconnecting = pipeline.latest_jpeg()
+    source.ended = True                                 # ... and a moment later knows it ended
+    assert wait_until(lambda: pipeline.latest_jpeg() is not reconnecting)
+    assert pipeline._lost_line == pipeline_module.CLIP_FINISHED
+    assert np.abs(decoded(reconnecting)[:40] - decoded(pipeline.latest_jpeg())[:40]).sum() > 1000
+    status = pipeline.status()
+    assert status["ended"] is True and status["connected"] is False
+    finished = pipeline.latest_jpeg()
+    time.sleep(0.05)
+    assert pipeline.latest_jpeg() is finished           # drawn once
 
 
 def test_status_leaves_out_old_sightings_while_the_stream_is_down(make, monkeypatch):

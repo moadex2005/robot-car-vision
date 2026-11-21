@@ -20,17 +20,20 @@ import base64
 import logging
 import math
 import secrets
+import socket
 import sys
 import threading
 import time
 import webbrowser
 from collections import OrderedDict
 from collections.abc import Callable, Hashable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from flask import Flask, Response, jsonify, render_template, request
+from werkzeug.exceptions import HTTPException
 
 from car_vision.assistant import Assistant, AssistantError
 from car_vision.config import ConfigError, load_config, require, resolve_path, section
@@ -42,6 +45,9 @@ log = logging.getLogger(__name__)
 MAX_QUESTION_CHARS = 2000
 VIDEO_MAX_FPS = 20               # /video sends at most this many frames a second
 VIDEO_POLL_SECONDS = 0.01        # how often /video looks for a new frame
+VIDEO_KEEPALIVE_SECONDS = 1.0    # with no new frame for this long, the last one is sent again, so a
+                                 # closed browser tab is noticed and its server thread ends
+PORT_CHECK_SECONDS = 0.5         # how long main() waits for an answer on the port before starting
 BOUNDARY = "frame"               # separates the pictures in the MJPEG stream
 BROWSER_DELAY_SECONDS = 1.0      # --open waits this long, so the server is up first
 LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
@@ -141,6 +147,31 @@ class AnswerCache:
                 del self._items[key]
 
 
+class LookupGate:
+    """One look-up at a time for each object, so two quick clicks make only one paid API call.
+
+    The second request waits until the first is done, then finds its answer in the cache.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._gates: dict[Hashable, list] = {}       # key -> [its lock, how many requests use it]
+
+    @contextmanager
+    def one_at_a_time(self, key: Hashable) -> Iterator[None]:
+        with self._lock:
+            gate = self._gates.setdefault(key, [threading.Lock(), 0])
+            gate[1] += 1
+        try:
+            with gate[0]:
+                yield
+        finally:
+            with self._lock:
+                gate[1] -= 1
+                if gate[1] == 0:
+                    del self._gates[key]             # nobody waits for this object any more
+
+
 def cache_key(inspection: Inspection) -> tuple[int, str] | None:
     """Only tracked objects are cached: an area or an untracked box may be anything next time."""
     if inspection.kind != "object" or inspection.track_id is None:
@@ -203,10 +234,19 @@ def read_click(body: Any) -> dict[str, Any] | str:
     if x is not None:
         if not (is_number(x) and is_number(y)):
             return "x and y must be numbers."
-        if not all(math.isfinite(v) and 0.0 <= v <= 1.0 for v in (x, y)):
+        x, y = as_fraction(x), as_fraction(y)
+        if x is None or y is None:
             return "x and y must be from 0 to 1."
-    return {"x": None if x is None else float(x), "y": None if y is None else float(y),
-            "track_id": track_id, "label": label}
+    return {"x": x, "y": y, "track_id": track_id, "label": label}
+
+
+def as_fraction(number: int | float) -> float | None:
+    """The number as a float from 0 to 1, or None (also for a whole number too big for a float)."""
+    try:
+        value = float(number)
+    except OverflowError:
+        return None
+    return value if math.isfinite(value) and 0.0 <= value <= 1.0 else None
 
 
 # ---- the web server ------------------------------------------------------------
@@ -217,6 +257,7 @@ def create_app(pipeline: Any, assistant: Any) -> Flask:
     app = Flask(__name__)
     inspections = InspectionStore()
     answers = AnswerCache()
+    gate = LookupGate()
 
     @app.get("/")
     def page() -> str:
@@ -303,25 +344,55 @@ def create_app(pipeline: Any, assistant: Any) -> Flask:
         if inspection.kind == "person":
             return jsonify(error="People are not looked up: their picture is never sent."), 400
         key = cache_key(inspection)
-        cached = answers.get(key) if key is not None else None
-        if cached is not None:
-            return jsonify(cached)
-        log.info("Looking up %s", f"a {inspection.label}" if inspection.label else "a clicked area")
-        try:
-            info = info_json(assistant.describe(inspection.photo, inspection.label or None))
-        except ValueError as error:                   # the assistant's own check of the picture or label
-            return jsonify(error=str(error)), 400
-        except AssistantError as error:               # no key, no internet, busy, refusal ...
-            return jsonify(error=str(error))
-        except Exception as error:
-            log.exception("Looking up a clicked object failed")
-            return jsonify(error=f"Something went wrong while looking it up ({type(error).__name__}). "
-                                 "Please click it again."), 500
-        if key is not None:
-            answers.put(key, info)
-        return jsonify(info)
+        if key is None:                               # an area or an untracked box: never cached
+            reply, code = look_up(assistant, inspection)
+            return jsonify(reply), code
+        with gate.one_at_a_time(key):                 # a second click on the same object waits here
+            cached = answers.get(key)
+            if cached is not None:
+                return jsonify(cached)
+            reply, code = look_up(assistant, inspection)
+            if "error" not in reply:
+                answers.put(key, reply)
+        return jsonify(reply), code
+
+    @app.errorhandler(HTTPException)
+    def http_error(error: HTTPException) -> Any:
+        """An unknown /api/ address or a wrong method gets a JSON answer, not an HTML page."""
+        if not request.path.startswith("/api/"):
+            return error
+        response = jsonify(error=error.description or error.name)
+        response.status_code = error.code or 500
+        allowed = error.get_response().headers.get("Allow")
+        if allowed:
+            response.headers["Allow"] = allowed
+        return response
+
+    @app.errorhandler(Exception)
+    def unexpected_error(error: Exception) -> Any:
+        """Anything nobody expected: logged, and a plain message instead of a traceback."""
+        log.exception("Answering %s %s failed", request.method, request.path)
+        message = f"Something went wrong ({type(error).__name__}). Please try again."
+        if request.path.startswith("/api/"):
+            return jsonify(error=message), 500
+        return Response(message, status=500, mimetype="text/plain")
 
     return app
+
+
+def look_up(assistant: Any, inspection: Inspection) -> tuple[dict[str, Any], int]:
+    """Ask the assistant what the photo shows: (the JSON answer, the HTTP status)."""
+    log.info("Looking up %s", f"a {inspection.label}" if inspection.label else "a clicked area")
+    try:
+        return info_json(assistant.describe(inspection.photo, inspection.label or None)), 200
+    except ValueError as error:                   # the assistant's own check of the picture or label
+        return {"error": str(error)}, 400
+    except AssistantError as error:               # no key, no internet, busy, refusal ...
+        return {"error": str(error)}, 200
+    except Exception as error:
+        log.exception("Looking up a clicked object failed")
+        return {"error": f"Something went wrong while looking it up ({type(error).__name__}). "
+                         "Please click it again."}, 500
 
 
 def mjpeg_stream(pipeline: Any, clock: Callable[[], float] = time.monotonic,
@@ -329,19 +400,25 @@ def mjpeg_stream(pipeline: Any, clock: Callable[[], float] = time.monotonic,
     """The parts of the MJPEG stream: each new frame once, at most VIDEO_MAX_FPS a second.
 
     The pipeline gives a new bytes object for every new picture, so `is`
-    tells a new frame from the one already sent.
+    tells a new frame from the one already sent. When nothing new comes for
+    VIDEO_KEEPALIVE_SECONDS (a stalled stream), the last picture is sent
+    again: writing is the only way to notice that the browser tab was closed,
+    and then this generator ends instead of waiting forever.
     """
     last: bytes | None = None
     next_send = 0.0
+    sent_at = 0.0
     while True:
         jpeg = pipeline.latest_jpeg()
         now = clock()
-        if jpeg is None or jpeg is last or now < next_send:
+        if jpeg is not None and jpeg is not last and now >= next_send:
+            last = jpeg                                    # a new picture
+        elif last is None or now - sent_at < VIDEO_KEEPALIVE_SECONDS:
             sleep(VIDEO_POLL_SECONDS)
             continue
-        last = jpeg
         next_send = now + 1.0 / VIDEO_MAX_FPS
-        yield jpeg_part(jpeg)
+        sent_at = now
+        yield jpeg_part(last)
 
 
 def jpeg_part(jpeg: bytes) -> bytes:
@@ -398,6 +475,19 @@ def build_assistant(config: dict[str, Any], pipeline: Pipeline) -> Any:
         return UnavailableAssistant(f"The assistant is not available: {error}")
 
 
+def already_serving(host: str, port: int, timeout: float = PORT_CHECK_SECONDS) -> bool:
+    """True when something already answers on host:port, e.g. a copy of this program.
+
+    Windows lets two servers bind the same port, so the server itself would not
+    notice; a second copy would quietly load the models again.
+    """
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
 def open_browser_soon(url: str) -> None:
     timer = threading.Timer(BROWSER_DELAY_SECONDS, webbrowser.open, args=(url,))
     timer.daemon = True
@@ -418,6 +508,11 @@ def main(argv: list[str] | None = None) -> int:
     except ConfigError as error:
         print(f"Cannot start: {error}")
         return 1
+    url = f"http://{host}:{port}/"
+    if already_serving(host, port):                   # checked before any model is loaded
+        print(f"The demo page is already running at {url} (or another program uses port {port}). "
+              "Open that address, or stop the other copy first.")
+        return 1
     setup_logging(log_file)
 
     try:
@@ -428,7 +523,6 @@ def main(argv: list[str] | None = None) -> int:
     assistant = build_assistant(config, pipeline)
     app = create_app(pipeline, assistant)
 
-    url = f"http://{host}:{port}/"
     pipeline.start()
     print(f"Demo page: {url}   (Ctrl+C stops the program)")
     if args.open:

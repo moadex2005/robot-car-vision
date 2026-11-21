@@ -9,6 +9,8 @@ import ast
 import base64
 import logging
 import re
+import socket
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -247,12 +249,34 @@ def test_page_works_and_ask_explains_when_the_assistant_could_not_be_built():
     assert client.post("/api/reset").get_json() == {"ok": True}
 
 
-def test_only_the_listed_methods_are_accepted():
+def test_only_the_listed_methods_are_accepted_and_the_answer_is_json():
     client = client_for()
-    assert client.get("/api/ask").status_code == 405
-    assert client.post("/api/status").status_code == 405
-    assert client.get("/api/inspect").status_code == 405
-    assert client.get("/api/describe").status_code == 405
+    for method, path in (("get", "/api/ask"), ("post", "/api/status"), ("get", "/api/inspect"),
+                         ("get", "/api/describe"), ("get", "/api/reset")):
+        response = getattr(client, method)(path)
+        assert response.status_code == 405
+        assert response.is_json and isinstance(response.get_json()["error"], str)
+        assert "Allow" in response.headers
+
+
+def test_an_unknown_api_address_answers_json():
+    response = client_for().post("/api/no-such-thing", json={})
+    assert response.status_code == 404
+    assert response.is_json and isinstance(response.get_json()["error"], str)
+
+
+class BrokenPipeline(FakePipeline):
+    def status(self):
+        raise KeyError("secret detail")
+
+
+def test_an_unexpected_error_in_any_api_route_answers_json_without_a_traceback():
+    client = client_for(FakeAssistant(reset_error=RuntimeError("secret detail")), BrokenPipeline())
+    for response in (client.get("/api/status"), client.post("/api/reset")):
+        assert response.status_code == 500
+        assert response.is_json
+        message = response.get_json()["error"]
+        assert "secret detail" not in message and "Traceback" not in message
 
 
 # ---- /api/inspect --------------------------------------------------------------------
@@ -342,6 +366,8 @@ def test_inspect_with_a_bad_click_is_400(body):
     ("[0.5, 0.5]", "application/json"),
     ('{"x": NaN, "y": 0.5}', "application/json"),
     ('{"x": Infinity, "y": 0.5}', "application/json"),
+    ('{"x": 1' + "0" * 400 + ', "y": 0.5}', "application/json"),       # too big for a float
+    ('{"x": 0.5, "y": -1' + "0" * 400 + "}", "application/json"),
 ])
 def test_inspect_with_a_body_that_is_not_a_json_click_is_400(body, content_type):
     pipeline = FakePipeline()
@@ -432,6 +458,50 @@ def test_a_second_click_on_the_same_tracked_object_is_answered_from_the_cache():
     assert second["info"]["name"] == "Laptop"                 # the page needs no second look-up
     assert client.post("/api/describe", json={"id": second["id"]}).get_json()["name"] == "Laptop"
     assert len(assistant.looked_up) == 1
+
+
+class SlowAssistant(FakeAssistant):
+    """describe() waits until the test lets it go, so two requests can overlap."""
+
+    def __init__(self):
+        super().__init__()
+        self.started = threading.Event()
+        self.go_on = threading.Event()
+
+    def describe(self, image, label=None):
+        self.started.set()
+        assert self.go_on.wait(5)
+        return super().describe(image, label)
+
+
+def test_two_quick_clicks_on_the_same_object_make_one_api_call():
+    assistant = SlowAssistant()
+    app = create_app(FakePipeline(), assistant)
+    app.testing = True
+    ids = [app.test_client().post("/api/inspect", json={"track_id": 7}).get_json()["id"] for _ in range(2)]
+    answers = {}
+
+    def describe(inspection_id):
+        answers[inspection_id] = app.test_client().post("/api/describe", json={"id": inspection_id}).get_json()
+
+    first = threading.Thread(target=describe, args=(ids[0],))
+    first.start()
+    assert assistant.started.wait(5)                      # the first look-up is under way ...
+    second = threading.Thread(target=describe, args=(ids[1],))
+    second.start()                                        # ... when the second click arrives
+    time.sleep(0.1)
+    assistant.go_on.set()
+    first.join(5)
+    second.join(5)
+    assert len(assistant.looked_up) == 1
+    assert answers[ids[0]] == answers[ids[1]] and answers[ids[0]]["name"] == "Laptop"
+
+
+def test_the_lookup_gate_forgets_objects_nobody_waits_for():
+    gate = app_module.LookupGate()
+    with gate.one_at_a_time((7, "laptop")):
+        pass
+    assert gate._gates == {}
 
 
 @pytest.mark.parametrize("target", [CUP, AREA])
@@ -616,6 +686,28 @@ class StillPipeline:
         return self.first if self.calls <= 30 else self.second
 
 
+class FrozenPipeline:
+    """The same picture object forever: a stream that has stalled."""
+
+    def __init__(self):
+        self.picture = b"the last picture"
+
+    def latest_jpeg(self):
+        return self.picture
+
+
+def test_a_stalled_stream_sends_the_last_frame_again_about_once_a_second():
+    clock = FakeClock()
+    pipeline = FrozenPipeline()
+    stream = mjpeg_stream(pipeline, clock=clock, sleep=clock.sleep)
+    sent_at = []
+    for _ in range(4):
+        assert next(stream) == jpeg_part(pipeline.picture)
+        sent_at.append(clock.now)
+    gaps = [b - a for a, b in zip(sent_at, sent_at[1:])]
+    assert all(1.0 - 1e-9 <= gap <= 1.0 + 0.02 for gap in gaps), gaps
+
+
 def test_stream_sends_a_frame_only_when_it_is_new():
     clock = FakeClock()
     pipeline = StillPipeline()
@@ -655,6 +747,7 @@ def fake_main(monkeypatch, tmp_path):
         return FakeAssistant()
 
     monkeypatch.setattr(app_module, "load_config", lambda: config)
+    monkeypatch.setattr(app_module, "already_serving", lambda host, port: False)   # 5000 may really be in use
     monkeypatch.setattr(app_module, "Pipeline", FakePipeline)
     monkeypatch.setattr(app_module, "Assistant", fake_assistant)
     monkeypatch.setattr(app_module.Flask, "run", fake_run)
@@ -744,6 +837,31 @@ def test_page_still_works_when_the_assistant_cannot_be_built(fake_main):
     assert "The notes file was not found" in answer.get_json()["error"]
 
 
+REAL_ALREADY_SERVING = app_module.already_serving
+
+
+def test_a_second_copy_stops_before_loading_anything_when_the_port_answers(fake_main, monkeypatch, capsys):
+    with socket.socket() as listener:                     # a real server socket, as a running copy has
+        listener.bind(("127.0.0.1", 0))
+        listener.listen()
+        port = listener.getsockname()[1]
+        monkeypatch.setattr(app_module, "already_serving", REAL_ALREADY_SERVING)
+        monkeypatch.setattr(app_module, "load_config",
+                            lambda: {**TEST_CONFIG, "app": {**TEST_CONFIG["app"], "port": port}})
+        assert main([]) == 1
+    out = capsys.readouterr().out
+    assert "already running" in out and f"http://127.0.0.1:{port}/" in out
+    assert FakePipeline.instances == []                   # no pipeline, so no model was loaded
+    assert fake_main["calls"]["run"] == []
+
+
+def test_already_serving_is_false_when_nothing_listens():
+    with socket.socket() as probe:                        # find a free port, then let it go
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    assert REAL_ALREADY_SERVING("127.0.0.1", port, timeout=0.2) is False
+
+
 def test_open_argument_opens_the_page_in_the_browser(fake_main):
     main(["--open"])
     deadline = time.monotonic() + 2.0
@@ -777,7 +895,7 @@ def test_template_uses_no_inner_html_and_no_outside_resources():
 
 def test_template_only_makes_links_for_http_and_https():
     page = TEMPLATE.read_text(encoding="utf-8")
-    assert 'url.protocol === "http:" || url.protocol === "https:"' in page
+    assert 'url.protocol !== "http:" && url.protocol !== "https:"' in page
     assert "textContent" in page
 
 
@@ -785,8 +903,9 @@ def test_template_has_the_list_the_panel_and_the_privacy_line():
     page = client_for().get("/").get_data(as_text=True)
     assert 'id="things"' in page and "In view" in page
     assert 'id="details"' in page and 'id="closeDetails"' in page and '"Escape"' in page
-    assert ("A click on an object sends a small cut-out of the picture to the assistant's API. "
-            "A click on a person sends nothing.") in page
+    privacy = ("A click on an object or on an empty spot sends a small cut-out of the picture to the "
+               "assistant's API. A click on a person sends nothing.")
+    assert page.count(privacy) == 2                                 # under the list and in the footer
     assert "Add a folder with photos and an about.md for them in data/people" in page
     assert "Something the detector has no name for" in page
     assert "/api/inspect" in page and "/api/describe" in page
@@ -797,6 +916,34 @@ def test_template_shows_a_photo_only_from_a_jpeg_data_address():
     assert 'PHOTO_PREFIX = "data:image/jpeg;base64,"' in page
     assert "address.startsWith(PHOTO_PREFIX)" in page
     assert page.count("detailPhoto.src =") == 1                     # set in one place, after that check
+
+
+def css_rule(page, selector):
+    """The body of the first CSS rule that starts with exactly this selector."""
+    match = re.search(r"^\s*" + re.escape(selector) + r"\s*\{([^}]*)\}", page, re.MULTILINE)
+    assert match, selector
+    return match.group(1)
+
+
+def test_template_keeps_blur_off_the_pills_and_off_the_video():
+    page = TEMPLATE.read_text(encoding="utf-8")
+    assert "backdrop-filter" not in css_rule(page, ".thing")        # many small pills: no blur
+    assert 'make("button", "thing")' in page                       # and not the blurring .glass class
+    assert "backdrop-filter: none" in css_rule(page, ".nav.over-video")
+    narrow = page[page.index("@media (max-width: 1279.98px)"):]
+    assert "backdrop-filter: none" in css_rule(narrow, ".details")  # the sheet over the video is solid
+
+
+def test_template_status_pill_is_quiet_and_knows_every_state():
+    page = TEMPLATE.read_text(encoding="utf-8")
+    assert '<div class="status-pill" id="status" aria-live="off">' in page
+    for text in ('"Clip finished"', '"Stopped: "', '"Reconnecting"', '"Program not running"'):
+        assert text in page
+
+
+def test_template_clears_the_chat_only_when_the_server_said_ok():
+    page = TEMPLATE.read_text(encoding="utf-8")
+    assert "data.ok !== true" in page
 
 
 def test_template_measures_the_click_against_the_picture_not_the_element():

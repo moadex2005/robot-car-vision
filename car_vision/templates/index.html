@@ -773,7 +773,8 @@
   .details-content p { margin: 0 0 0.8rem; }
   .details-content ul { margin: 0 0 1rem; padding-left: 1.15em; }
   .details-content li + li { margin-top: 0.3rem; }
-  .story p { color: var(--grey); white-space: pre-line; }
+  .details-content .intro { font-size: 1.1rem; margin: 0 0 0.6rem; }
+  .details-content .ask-more { margin: 0 0 0.4rem; text-align: left; }
   .looking { color: var(--grey); }
   .problem { color: var(--warn); font-weight: 500; }
   .specs { display: grid; grid-template-columns: minmax(0, 0.85fr) minmax(0, 1.15fr); margin: 0.4rem 0 1rem; }
@@ -2164,28 +2165,26 @@ function showTarget(target) {
   setPhoto(target.photo);
   detailTitle.textContent = titleFor(target);
   detailMeta.textContent = metaLine(target);
-  setRole(target.person ? asText(target.person.role) : "");
+  setRole("");                               // a person's role is part of the one-line introduction
   if (target.person) detailContent.replaceChildren(...personNodes(target.person));
   else if (target.kind === "person") detailContent.replaceChildren(make("p", "", UNKNOWN_HINT));
   else detailContent.replaceChildren();
 }
 
-// A recognised person: every card line, then the story as paragraphs.
+// A recognised person: one short introduction, nothing more. The owner asked for this:
+// a click says who it is, and everything else the team wrote about the person is told
+// only when the visitor asks (in the chat below, which knows the person's whole profile).
 function personNodes(person) {
-  const nodes = [];
-  const lines = asList(person.lines).map(asText).filter(Boolean);
-  if (lines.length) {
-    const list = make("ul");
-    for (const line of lines) list.append(make("li", "", line));
-    nodes.push(list);
-  }
-  const paragraphs = asText(person.story).split(/\n\s*\n/).map((p) => p.trim()).filter(Boolean);
-  if (paragraphs.length) {
-    const story = make("div", "story");
-    for (const paragraph of paragraphs) story.append(make("p", "", paragraph));
-    nodes.push(story);
-  }
-  return nodes;
+  const firstName = asText(person.name).trim().split(/\s+/).filter((word) => !/\.$/.test(word))[0] || "them";
+  return [make("p", "intro", personIntro(person)),
+          make("p", "quiet ask-more", "Ask below to know more about " + firstName + ".")];
+}
+
+// "This is Mohamed Adel. Project owner and developer."
+function personIntro(person) {
+  const name = asText(person.name).trim() || "someone the camera knows";
+  const role = asText(person.role).trim().replace(/[.\s]+$/, "");
+  return "This is " + name + "." + (role ? " " + role + "." : "");
 }
 
 // An object or an area, once the assistant has answered.

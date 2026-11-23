@@ -317,8 +317,8 @@ def person_json(person: Any) -> dict[str, Any] | None:
         "id": person.person_id,
         "name": person.name,
         "role": person.role,
-        "lines": list(person.lines),
-        "story": getattr(person, "story", ""),      # the newer Person has a story
+        # Only the name and the role go to the panel. The card lines and the story stay on the
+        # server: the assistant tells them when the visitor asks.
     }
 
 

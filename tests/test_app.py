@@ -358,9 +358,20 @@ def test_inspect_a_recognised_person():
     response = client_for(pipeline=FakePipeline(target=SARA_TARGET)).post("/api/inspect", json={"x": 0.2, "y": 0.3})
     data = response.get_json()
     assert data["kind"] == "person" and data["describable"] is False and data["info"] is None
-    assert data["person"] == {"id": "sara", "name": "Sara Ahmed", "role": "Team lead",
-                              "lines": ["Built the chassis", "Fourth-year student"],
-                              "story": "Sara joined in 2024.\n\nShe likes motors."}
+    # Only the name and the role go to the panel: the card lines and the story stay on the
+    # server and are told by the assistant when the visitor asks (the owner's request).
+    assert data["person"] == {"id": "sara", "name": "Sara Ahmed", "role": "Team lead"}
+    assert "Built the chassis" not in response.get_data(as_text=True)
+    assert "She likes motors" not in response.get_data(as_text=True)
+
+
+def test_the_person_panel_shows_one_short_introduction_only():
+    page = TEMPLATE.read_text(encoding="utf-8")
+    start = page.index("function personNodes(person)")
+    panel = page[start:page.index("// An object or an area, once the assistant has answered.", start)]
+    assert 'make("p", "intro", personIntro(person))' in panel and "Ask below to know more about" in panel
+    assert "person.lines" not in panel and "person.story" not in panel      # no list, no story
+    assert '"This is " + name + "."' in panel
 
 
 def test_inspect_an_unrecognised_person_and_an_area():

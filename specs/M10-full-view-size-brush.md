@@ -23,7 +23,7 @@ What was found: the Fullscreen API works in a real Edge window (checked by the o
 - The full view must really cover the window: check that no ancestor of the stage has a transform, filter, `contain` or `will-change` that would trap `position: fixed`, and that the navigation bar does not show through.
 - Everything from M8 B4 holds in both kinds of full view (layout, pills along the bottom, panel in its own column with a solid fill, click maths).
 
-How to check it for real: `C:\Users\USER\AppData\Local\Temp\claude\a23e0f59e07c19e5\f8c8250d-1fa9-458a-aa0e-0ed42b0fadb9\scratchpad\cdp.ps1` drives a headless Edge (which grants real full screen): `cdp.ps1 -Url http://127.0.0.1:<your port>/ -Tag <name> -Steps @("<javascript>", ...)` runs each step as a user gesture, prints its value and saves `<name>-<n>.jpg` beside the script. The built-in browser pane shows the other case (no answer from the API). Check both.
+How to check it for real: a small throw-away script, `cdp.ps1` (kept outside the project), drives a headless Edge (which grants real full screen): `cdp.ps1 -Url http://127.0.0.1:<your port>/ -Tag <name> -Steps @("<javascript>", ...)` runs each step as a user gesture, prints its value and saves `<name>-<n>.jpg` beside the script. The built-in browser pane shows the other case (no answer from the API). Check both.
 
 ### A2. The words about picture size
 

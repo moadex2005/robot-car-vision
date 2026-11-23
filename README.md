@@ -118,6 +118,10 @@ Face photos, the saved face data and `.env` are never committed to Git.
 
 These run without a camera, the network or the graphics card.
 
-## Licences worth knowing
+## Licence
 
-The YOLO weights and code from Ultralytics are AGPL-3.0, and the InsightFace pretrained face models are for non-commercial research only. Both are fine for a university project; neither may go into a commercial product as is.
+This project is released under the GNU Affero General Public License v3.0; see [LICENSE](LICENSE). That matches the object detector it is built on: the YOLO weights and code from Ultralytics are AGPL-3.0.
+
+The InsightFace pretrained face models are for non-commercial research only. That is fine for a university project; the face recognition part may not go into a commercial product as is.
+
+Model weights, face photos, face data, recorded clips and the API key are not part of this repository. The models are downloaded on the first run; everything about people stays on the computer that runs the program.

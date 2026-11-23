@@ -7,7 +7,7 @@ Read `CLAUDE.md` first. `car_vision/state.py`, `car_vision/config.py` and `confi
 ## Read before writing any SDK call
 
 Do not write Anthropic SDK code from memory; several request shapes changed this year. The reference is on this machine, under
-`C:\Users\USER\AppData\Local\Temp\claude\bundled-skills\2.1.328\f6d7b0f273dd9f5a2be79c48e87834e2\claude-api\`:
+the `claude-api` reference folder that comes with Claude Code:
 
 - `SKILL.md`: defaults, thinking and effort rules, server tools table, common pitfalls.
 - `python\claude-api\README.md`: client, system prompts, prompt caching, error handling, stop reasons, refusal fallbacks.

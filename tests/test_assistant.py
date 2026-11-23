@@ -887,7 +887,7 @@ def test_f7_real_notes_give_no_warning(settings: dict, notes_path: Path,
 
 
 def test_f7_the_shipped_template_warns(settings: dict, caplog: pytest.LogCaptureFixture) -> None:
-    settings["notes_file"] = "data/knowledge.md"
+    settings["notes_file"] = "data/knowledge.example.md"      # the template that is published
     with caplog.at_level("WARNING", logger="car_vision.assistant"):
         Assistant(settings, client=FakeClient())
     assert any("placeholder" in r.getMessage() for r in caplog.records)

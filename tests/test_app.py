@@ -1710,7 +1710,8 @@ def test_template_full_screen_wraps_video_banners_pills_and_panel():
         assert "watch" in around[inside], inside
     assert 'id="fullButton" type="button" aria-label="Full screen"' in page
     assert "stage.requestFullscreen()" in page and 'stage = byId("watch")' in page
-    assert "dblclick" not in page                                   # a click is already "inspect"
+    # A click on the video is already "inspect": the only double-click is on the panel's handle.
+    assert page.count("dblclick") == 1 and 'detailsGrip.addEventListener("dblclick"' in page
     assert 'event.key === "f"' in page and "isTyping(event.target)" in page
 
 
@@ -1730,7 +1731,8 @@ def test_template_scrolls_only_the_panel_and_the_chat_list_never_the_page():
     assert "scrollIntoView" not in page and "scrollTo(" not in page and "scrollBy(" not in page
     calls = re.findall(r"\.focus\(([^)]*)\)", page)
     assert calls and all(call.strip() == "{ preventScroll: true }" for call in calls), calls
-    assert "details.scrollTop = details.scrollHeight" in page
+    assert "detailsScroll.scrollTop = detailsScroll.scrollHeight" in page   # the panel's content scrolls
+    assert "overflow-y: auto" in css_rule(page, ".details-scroll") and "overflow: hidden" in css_rule(page, ".details")
     assert "messages.scrollTop = messages.scrollHeight" in page
     # The panel beside the video is never taller than the window below its own top, so the
     # follow-up field is always in view and typing in it never makes the browser scroll the page.
@@ -1854,6 +1856,161 @@ def test_template_brush_follows_the_rules_of_the_marking():
     assert "requestAnimationFrame" not in page[page.index("// ---- the brush"):page.index("// ---- asking more")]
     # Never for a person: the tools are shown only for something the API may see.
     assert 'allowBrush(data.describable === true && data.kind !== "person" && !data.person)' in page
+
+
+# ---- links in answers: short clickable words, not long addresses ----------------------------
+
+
+def link_pattern(page):
+    """The page's LINK_PATTERN as a Python pattern (the two syntaxes agree for this one)."""
+    match = re.search(r"const LINK_PATTERN = /(.+)/gi;", page)
+    assert match
+    return re.compile(match.group(1), re.IGNORECASE)
+
+
+def test_template_writes_every_assistant_answer_with_its_links_as_words():
+    page = TEMPLATE.read_text(encoding="utf-8")
+    message = between(page, "function messageText(", "\n}\n")
+    assert 'if (kind !== "answer") return make("p", "text", text);' in message
+    assert "paragraph.append(...answerNodes(text));" in message
+    for adder in ("function addMessage(", "function addFollowMessage("):     # the chat and the panel's chat
+        assert "item.append(messageText(kind, text));" in between(page, adder, "\n}\n"), adder
+    assert "summary.append(...answerNodes(asText(info.summary)));" in between(page, "function showInfo(", "\n}\n")
+    arrived = between(page, "function answerArrived(", "\n}\n")              # the caption
+    assert "isProblem ? asText(text) : captionNodes(text)" in arrived
+    assert "linkNode(links[i])" in between(page, "function captionNodes(", "\n}\n")
+    # In the caption, which lets clicks through to the video, a link can still be clicked.
+    assert "pointer-events: auto" in css_rule(page, ".caption .answer-link")
+
+
+def test_template_makes_a_link_only_for_a_safe_web_address():
+    page = TEMPLATE.read_text(encoding="utf-8")
+    check = between(page, "function webAddress(", "\n}\n")
+    assert "new URL(" in check and "catch (error)" in check
+    assert 'url.protocol !== "http:" && url.protocol !== "https:"' in check     # never javascript: or data:
+    assert "if (url.username || url.password) return null;" in check
+    link = between(page, "function linkNode(", "\n}\n")
+    assert 'make("a", "answer-link", part.label)' in link                     # the words go in as textContent
+    assert 'link.target = "_blank";' in link and 'link.rel = "noopener noreferrer";' in link
+    assert "link.title = part.url.href;" in link and "link.href = part.url.href;" in link
+    parts = between(page, "function linkParts(", "\n}\n")
+    assert "if (url === null) continue;" in parts                             # anything else stays plain text
+    assert "document.createTextNode(part.text)" in between(page, "function answerNodes(", "\n}\n")
+    # A label is cut at 60 characters, and one that names another site shows the real site instead.
+    assert "LINK_LABEL_CHARS = 60" in page
+    label = between(page, "function markdownLabel(", "\n}\n")
+    assert "if (!label || namesAnotherSite(label, url)) return siteName(url);" in label
+    assert "return cutLabel(label);" in label
+
+
+@pytest.mark.parametrize("text, found", [
+    ("See [LinkedIn](https://www.linkedin.com/in/someone/) for more.", "[LinkedIn](https://www.linkedin.com/in/someone/)"),
+    ("His profile is https://www.linkedin.com/in/someone/", "https://www.linkedin.com/in/someone/"),
+    ("Read [Rover](https://en.wikipedia.org/wiki/Rover_(space_exploration)) now",
+     "[Rover](https://en.wikipedia.org/wiki/Rover_(space_exploration))"),
+    ("[click](javascript:alert(1))", "[click](javascript:alert(1))"),        # found here, refused by webAddress
+    ("Mail me at someone@example.com, please.", None),
+])
+def test_link_pattern_finds_markdown_links_and_bare_addresses(text, found):
+    match = link_pattern(TEMPLATE.read_text(encoding="utf-8")).search(text)
+    assert (match.group(0) if match else None) == found
+
+
+def test_template_ends_a_bare_address_before_the_sentence_goes_on():
+    page = TEMPLATE.read_text(encoding="utf-8")
+    assert 'const ADDRESS_END = ".,);:!?";' in page
+    trim = between(page, "function trimAddress(", "\n}\n")
+    assert 'if (address[end - 1] === ")" && opened >= closed) break;' in trim   # a bracket of the address stays
+    says = re.search(r"const SAYS_WHAT_IT_IS = /(.+)/i;", page)
+    rule = re.compile(says.group(1), re.IGNORECASE)
+    for before in ("LinkedIn: ", "His profile is ", "It is at ", "Click here ", "(see "):
+        assert rule.search(before), before
+    for before in ("The code is on ", "This ", "What ", "Look at the "):
+        assert not rule.search(before), before
+    assert '? "link" : siteName(url)' in between(page, "function linkParts(", "\n}\n")
+
+
+def test_template_speaks_a_link_as_its_words_never_its_address():
+    page = TEMPLATE.read_text(encoding="utf-8")
+    ear = between(page, "function earText(", "function readableLines(")
+    assert "linkParts(text).map((part) => (part.url ? part.label : part.text))" in ear
+    assert r"/\bhttps?:\/\/\S+/gi" in ear                                     # an address left as text goes too
+    assert r'.replace(/\[([^\[\]\n]+)\]\(([^\s()]*(?:\([^\s()]*\)[^\s()]*)*)\)/g, "$1")' in ear   # [words](javascript:...)
+    # The sources under a web answer keep their own pills.
+    assert 'make("a", "source", host)' in between(page, "function webSources(", "\n}\n")
+
+
+# ---- the details panel's width: a handle on its left edge ------------------------------------
+
+
+def test_template_panel_has_a_handle_that_the_keyboard_can_use():
+    page = rendered_page()
+    around = ids_around(page)
+    assert "details" in around["detailsGrip"] and "detailsScroll" not in around["detailsGrip"]
+    grip = tag_with_id(page, "detailsGrip")
+    for part in ('role="separator"', 'aria-orientation="vertical"', 'tabindex="0"', 'aria-label="Width of the details panel"',
+                 'aria-valuemin="300"', 'aria-controls="details"'):
+        assert part in grip, part
+    for inside in ("closeDetails", "detailPhoto", "followQuestion"):           # the content scrolls under it
+        assert "detailsScroll" in around[inside], inside
+    script = TEMPLATE.read_text(encoding="utf-8")
+    draw = between(script, "function drawGrip(", "\n}\n")
+    for value in ("aria-valuemax", "aria-valuenow", "aria-valuetext"):
+        assert value in draw, value
+    keys = between(script, 'detailsGrip.addEventListener("keydown"', "\n});\n")
+    assert '"ArrowLeft" ? PANEL_STEP_PX' in keys and '"ArrowRight" ? -PANEL_STEP_PX' in keys
+    assert "event.preventDefault();" in keys and "PANEL_STEP_PX = 24" in script
+
+
+def test_template_panel_width_is_one_variable_with_todays_widths_as_default():
+    page = TEMPLATE.read_text(encoding="utf-8")
+    beside = page[page.index("@media (min-width: 1280px)"):]
+    assert "var(--details-width, clamp(360px, 27vw, 470px))" in css_rule(beside, ".stage.has-details")
+    sheet = page[page.index("@media (max-width: 1279.98px)"):]
+    assert "width: var(--details-width, min(440px, calc(100vw - 32px)));" in css_rule(sheet, ".details")
+    assert "var(--details-width, clamp(320px, 27vw, 470px))" in css_rule(page, ".stage.is-full.has-details")
+    show = between(page, "function showPanelWidth(", "\n}\n")
+    assert 'stage.style.setProperty("--details-width", width + "px")' in show
+    assert 'stage.style.removeProperty("--details-width")' in show            # none chosen: the usual width
+    # The limits, and the window or the layout changing fits the chosen width in again.
+    assert "PANEL_MIN_PX = 300" in page and "VIDEO_MIN_PX = 320" in page and "PANEL_MAX_SHARE = 0.6" in page
+    most = between(page, "function panelMax(", "\n}\n")
+    assert "window.innerWidth * PANEL_MAX_SHARE, room - gap - VIDEO_MIN_PX" in most
+    assert 'window.addEventListener("resize", fitPanelWidth);' in page
+    for function in ("function openDetails(", "function enterFullView()", "function leaveFullView()"):
+        assert "fitPanelWidth();" in between(page, function, "\n}\n"), function
+
+
+def test_template_panel_width_is_remembered_when_the_browser_allows_it():
+    page = TEMPLATE.read_text(encoding="utf-8")
+    assert 'const PANEL_WIDTH_KEY = "panelWidth";' in page
+    assert "Number(readStored(PANEL_WIDTH_KEY))" in between(page, "function readPanelChoice(", "\n}\n")   # try/catch inside
+    choose = between(page, "function choosePanelWidth(", "\n}\n")
+    assert "store(PANEL_WIDTH_KEY, panelChoice === null ? null : String(panelChoice));" in choose
+    assert 'detailsGrip.addEventListener("dblclick", () => choosePanelWidth(null));' in page
+
+
+def test_template_panel_drag_follows_the_page_rules():
+    page = TEMPLATE.read_text(encoding="utf-8")
+    for event in ("pointerdown", "pointermove", "pointerup", "pointercancel", "lostpointercapture"):
+        assert f'detailsGrip.addEventListener("{event}"' in page, event
+    start = between(page, "function startPanelDrag(", "\n}\n")
+    assert "detailsGrip.setPointerCapture(event.pointerId);" in start and "event.preventDefault();" in start
+    assert 'document.documentElement.classList.add("is-resizing");' in start
+    assert 'classList.remove("is-resizing")' in between(page, "function endPanelDrag(", "\n}\n")
+    grip = css_rule(page, ".details-grip")
+    assert "touch-action: none" in grip and "transition" not in grip         # a finger drags, never scrolls
+    resizing = css_rule(page, "html.is-resizing, html.is-resizing *")
+    assert "user-select: none" in resizing
+    # The width changes at most once per screen frame, and is not animated.
+    move = between(page, "function movePanelDrag(", "\n}\n")
+    assert "if (panelFrame) return;" in move and move.count("requestAnimationFrame(") == 1
+    assert "transition: opacity 0.2s;" in css_rule(page, ".details-grip::before")
+    for rule in (".details", ".details-scroll"):
+        assert "transition" not in css_rule(page, rule), rule
+    # The panel's content uses the room: the photo grows with the panel's width.
+    assert "container-type: inline-size" in css_rule(page, ".details-scroll")
+    assert "cqi" in css_rule(page, ".photo")
 
 
 # ---- voice: speaking and asking by voice --------------------------------------------------

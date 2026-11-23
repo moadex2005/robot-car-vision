@@ -652,19 +652,31 @@
   .quiet { margin: 0; color: var(--grey); }
   .privacy { margin: 1.1rem auto 0; max-width: 38rem; color: var(--grey); font-size: 0.85rem; line-height: 1.45; }
 
-  /* The details sheet slides in from the right. From 1280 px wide the video makes room for it. */
+  /* The details sheet slides in from the right. From 1280 px wide the video makes room for it.
+     The sheet itself does not scroll: its content does (.details-scroll), so the handle on its
+     left edge (.details-grip) stays where it is while the content moves.
+     Its width is one variable, --details-width, which the script sets on the stage when the
+     visitor has dragged the handle; each of the three layouts reads it, and without it each
+     keeps its own usual width. */
   .details {
+    position: relative;                  /* the handle is placed against the sheet's left edge */
     min-width: 0;
+    display: flex; flex-direction: column;
     border-radius: var(--radius-big);
+    overflow: hidden;
+    overflow-wrap: anywhere;             /* one very long word must not make the sheet wider */
+    animation: sheet-in 0.55s var(--ease-out);
+  }
+  .details-scroll {
+    flex: 1 1 auto; min-height: 0;
     padding: 1.3rem 1.4rem 1.5rem;
     overflow-y: auto;
-    overflow-wrap: anywhere;             /* one very long word must not make the sheet wider */
     overscroll-behavior: contain;
-    animation: sheet-in 0.55s var(--ease-out);
+    container-type: inline-size;         /* the photo grows with the sheet's width (cqi below) */
   }
   @keyframes sheet-in { from { opacity: 0; transform: translateX(48px); } to { opacity: 1; transform: none; } }
   @media (min-width: 1280px) {
-    .stage.has-details { grid-template-columns: minmax(0, 1fr) clamp(360px, 27vw, 470px); }
+    .stage.has-details { grid-template-columns: minmax(0, 1fr) var(--details-width, clamp(360px, 27vw, 470px)); }
     .details { position: sticky; top: calc(var(--nav-space) + 8px); max-height: calc(100svh - var(--nav-space) - 24px); }
   }
   @media (max-width: 1279.98px) {
@@ -672,12 +684,35 @@
     .details {
       position: fixed; z-index: 40;
       top: calc(var(--nav-space) + 4px); right: 16px; bottom: 16px;
-      width: min(440px, calc(100vw - 32px));
+      width: var(--details-width, min(440px, calc(100vw - 32px)));
+      max-width: calc(100vw - 32px);
       background: var(--glass-solid);
       -webkit-backdrop-filter: none;
       backdrop-filter: none;
     }
   }
+
+  /* The handle on the sheet's left edge: drag it (mouse, pen or finger), or focus it and press
+     the left and right arrow keys, to make the sheet wider or narrower. A thin bar in the
+     middle shows where it is; only its opacity changes. While it is dragged (is-resizing on
+     <html>) nothing on the page is selected and the page does not scroll under the finger. */
+  .details-grip {
+    position: absolute; z-index: 3; left: 0; top: 0; bottom: 0;
+    width: 14px;
+    cursor: col-resize;
+    touch-action: none;
+  }
+  .details-grip::before {
+    content: ""; position: absolute; left: 5px; top: 50%;
+    width: 4px; height: 44px; border-radius: 999px;
+    background: var(--grey);
+    opacity: 0.4;
+    transform: translateY(-50%);
+    transition: opacity 0.2s;
+  }
+  .details-grip:hover::before, .details-grip:focus-visible::before, .is-resizing .details-grip::before { opacity: 1; }
+  .details-grip:focus-visible { outline: 3px solid var(--accent); outline-offset: -3px; border-radius: var(--radius-big) 0 0 var(--radius-big); }
+  html.is-resizing, html.is-resizing * { cursor: col-resize !important; user-select: none !important; -webkit-user-select: none !important; }
   /* ---- full view: the whole live view (#watch) fills the window, or the screen ----
      The same elements as on the page, laid out again: a black stage with the video as large
      as it fits, the pills in one row over its bottom edge, and the details panel in a column
@@ -695,7 +730,7 @@
     background: #000;
   }
   .stage::backdrop { background: #000; }
-  .stage.is-full.has-details { grid-template-columns: minmax(0, 1fr) clamp(320px, 27vw, 470px); }
+  .stage.is-full.has-details { grid-template-columns: minmax(0, 1fr) var(--details-width, clamp(320px, 27vw, 470px)); }
   .stage.is-full .shot { position: relative; height: 100%; min-height: 0; opacity: 1; transform: none; }
   .stage.is-full .frame {
     width: 100%; height: 100%; aspect-ratio: auto; margin: 0;
@@ -716,7 +751,7 @@
   .stage.is-full .delay { position: absolute; top: clamp(10px, 1.2vw, 18px); left: clamp(10px, 1.2vw, 18px); z-index: 2; margin: 0; }
   .stage.is-full .delay-clock { font-size: clamp(1.6rem, 2.6vw, 3.4rem); }   /* smaller: it lies over the picture */
   .stage.is-full .details {
-    position: static; width: auto; height: 100%; max-height: none;
+    position: relative; width: auto; max-width: none; height: 100%; max-height: none;
     border-radius: 0; border-width: 0 0 0 1px;
     box-shadow: none;
     background: var(--glass-solid);
@@ -741,7 +776,7 @@
   .round svg { width: 0.9rem; height: 0.9rem; }
   .photo {
     display: block;
-    width: 100%; max-height: 32svh;
+    width: 100%; max-height: clamp(32svh, 62cqi, 56svh);   /* a wider sheet shows a larger photo */
     object-fit: contain;
     background: rgba(0, 0, 0, 0.85);
     border-radius: 20px;
@@ -843,6 +878,24 @@
   }
   .source:hover { transform: translateY(-1px) scale(1.04); }
   .more { color: var(--grey); }
+
+  /* A link inside an answer: a few underlined words (its label, "link" or the site's name),
+     never the long address, which is in its title. The sources under a web answer are pills;
+     a link in the text is plain underlined words in the same blue, so the two read as one family. */
+  .answer-link {
+    color: var(--accent);
+    text-decoration: underline;
+    text-decoration-thickness: 1px;
+    text-underline-offset: 0.18em;
+    font-weight: 500;
+    overflow-wrap: anywhere;
+  }
+  .answer-link:hover { text-decoration-thickness: 2px; }
+  .answer-link:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 4px; }
+  /* In the caption (white on near-black in both looks) the link is a light blue, and it can be
+     clicked although the caption lets every other click through to the video. */
+  .caption .answer-link { color: #64b5ff; pointer-events: auto; }
+  .caption .answer-link:focus-visible { outline-color: #64b5ff; }
 
   .ask-form { display: flex; gap: 0.7rem; }
   .ask-form input, .camera-row input, .follow-form input {
@@ -1208,52 +1261,59 @@
       </div>
 
       <aside class="details glass" id="details" aria-label="Details of what was clicked" hidden>
-        <div class="details-top">
-          <span class="details-label">Details</span>
-          <button class="round" id="closeDetails" type="button" title="Close (Esc)">
-            <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3 3l10 10M13 3 3 13" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
-            <span class="visually-hidden">Close</span>
-          </button>
-        </div>
-        <div id="detailsBody" aria-live="polite">
-          <div class="photo-box" id="photoBox">
-            <img class="photo" id="detailPhoto" alt="The part of the picture that was clicked" draggable="false" hidden>
-            <canvas class="brush-canvas" id="brushCanvas" aria-hidden="true" hidden></canvas>
-          </div>
-          <!-- The brush: only for an object or an area, never for a person. -->
-          <div class="brush-tools" id="brushTools" hidden>
-            <button class="pill small secondary brush-button" id="brushButton" type="button" aria-pressed="false"
-                    title="Brush over a part of the photo, then ask about it">
-              <svg viewBox="0 0 24 24" aria-hidden="true">
-                <path d="M14.5 4.5l5 5-7.8 7.8-5-5z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/>
-                <path d="M6.7 12.3c-2.2.2-3.4 1.6-3.6 3.6-.2 1.6-.7 2.6-1.6 3.4 2.8.5 6.4.2 8-1.4 1.1-1.1 1.4-2.4 1.2-3.4"
-                      fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-              </svg>
-              Mark a part
+        <!-- The handle on the left edge: drag it, or use the left and right arrow keys, to change
+             the panel's width; a double-click gives back the usual width. -->
+        <div class="details-grip" id="detailsGrip" role="separator" aria-orientation="vertical" tabindex="0"
+             aria-controls="details" aria-label="Width of the details panel" aria-valuemin="300"
+             title="Drag to change the panel's width. Double-click for the usual width."></div>
+        <div class="details-scroll" id="detailsScroll">
+          <div class="details-top">
+            <span class="details-label">Details</span>
+            <button class="round" id="closeDetails" type="button" title="Close (Esc)">
+              <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3 3l10 10M13 3 3 13" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+              <span class="visually-hidden">Close</span>
             </button>
-            <button class="pill small secondary" id="brushClear" type="button" hidden>Clear</button>
           </div>
-          <div class="details-title" id="detailTitle"></div>
-          <div class="details-meta" id="detailMeta"></div>
-          <div class="details-role" id="detailRole" hidden></div>
-          <div class="details-content" id="detailContent"></div>
-        </div>
-        <div class="follow" id="followUp" hidden>
-          <ol class="follow-messages" id="followMessages" aria-live="polite"></ol>
-          <p class="quiet" id="followDone" hidden>That is ten questions about this one. Click it again to ask more.</p>
-          <form class="follow-form" id="followForm" autocomplete="off">
-            <label class="visually-hidden" for="followQuestion">Ask about this</label>
-            <input id="followQuestion" type="text" maxlength="{{ max_question_chars }}" placeholder="Ask about this">
-            <button class="round mic-button" id="followMic" type="button" aria-pressed="false"
-                    aria-label="Ask about this by voice" title="Ask by voice" hidden>
-              <svg viewBox="0 0 24 24" aria-hidden="true">
-                <rect x="9" y="3" width="6" height="11" rx="3" fill="currentColor"/>
-                <path d="M5.5 11a6.5 6.5 0 0 0 13 0M12 17.5V21M8.5 21h7" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
-              </svg>
-            </button>
-            <button class="pill secondary small part-button" id="followPart" type="button" hidden>What is this part?</button>
-            <button class="pill primary small" id="followSend" type="submit">Send</button>
-          </form>
+          <div id="detailsBody" aria-live="polite">
+            <div class="photo-box" id="photoBox">
+              <img class="photo" id="detailPhoto" alt="The part of the picture that was clicked" draggable="false" hidden>
+              <canvas class="brush-canvas" id="brushCanvas" aria-hidden="true" hidden></canvas>
+            </div>
+            <!-- The brush: only for an object or an area, never for a person. -->
+            <div class="brush-tools" id="brushTools" hidden>
+              <button class="pill small secondary brush-button" id="brushButton" type="button" aria-pressed="false"
+                      title="Brush over a part of the photo, then ask about it">
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M14.5 4.5l5 5-7.8 7.8-5-5z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/>
+                  <path d="M6.7 12.3c-2.2.2-3.4 1.6-3.6 3.6-.2 1.6-.7 2.6-1.6 3.4 2.8.5 6.4.2 8-1.4 1.1-1.1 1.4-2.4 1.2-3.4"
+                        fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                </svg>
+                Mark a part
+              </button>
+              <button class="pill small secondary" id="brushClear" type="button" hidden>Clear</button>
+            </div>
+            <div class="details-title" id="detailTitle"></div>
+            <div class="details-meta" id="detailMeta"></div>
+            <div class="details-role" id="detailRole" hidden></div>
+            <div class="details-content" id="detailContent"></div>
+          </div>
+          <div class="follow" id="followUp" hidden>
+            <ol class="follow-messages" id="followMessages" aria-live="polite"></ol>
+            <p class="quiet" id="followDone" hidden>That is ten questions about this one. Click it again to ask more.</p>
+            <form class="follow-form" id="followForm" autocomplete="off">
+              <label class="visually-hidden" for="followQuestion">Ask about this</label>
+              <input id="followQuestion" type="text" maxlength="{{ max_question_chars }}" placeholder="Ask about this">
+              <button class="round mic-button" id="followMic" type="button" aria-pressed="false"
+                      aria-label="Ask about this by voice" title="Ask by voice" hidden>
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <rect x="9" y="3" width="6" height="11" rx="3" fill="currentColor"/>
+                  <path d="M5.5 11a6.5 6.5 0 0 0 13 0M12 17.5V21M8.5 21h7" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+                </svg>
+              </button>
+              <button class="pill secondary small part-button" id="followPart" type="button" hidden>What is this part?</button>
+              <button class="pill primary small" id="followSend" type="submit">Send</button>
+            </form>
+          </div>
         </div>
       </aside>
     </div>
@@ -1396,6 +1456,7 @@ const statusPill = byId("status"), liveText = byId("liveText"), notes = byId("no
 const sourceText = byId("source"), fpsText = byId("fps"), deviceText = byId("device"), facesText = byId("faces");
 const things = byId("things"), nothing = byId("nothing"), stage = byId("watch");
 const details = byId("details"), closeButton = byId("closeDetails");
+const detailsScroll = byId("detailsScroll"), detailsGrip = byId("detailsGrip");
 const detailPhoto = byId("detailPhoto"), detailTitle = byId("detailTitle"), detailMeta = byId("detailMeta");
 const detailRole = byId("detailRole"), detailContent = byId("detailContent");
 const messages = byId("messages"), hint = byId("hint"), form = byId("askForm");
@@ -1911,10 +1972,18 @@ function scrollChat() {
   messages.scrollTop = messages.scrollHeight;
 }
 
+// An answer's words with its links as short clickable words (answerNodes); anything else as it is.
+function messageText(kind, text) {
+  if (kind !== "answer") return make("p", "text", text);
+  const paragraph = make("p", "text");
+  paragraph.append(...answerNodes(text));
+  return paragraph;
+}
+
 function addMessage(kind, text) {
   hint.hidden = true;
   const item = make("li", "msg " + kind);
-  item.append(make("p", "text", text));
+  item.append(messageText(kind, text));
   messages.append(item);
   scrollChat();
   return item;
@@ -1972,6 +2041,130 @@ function webLine(sources) {
   const web = make("div", "web");
   web.append(make("span", "web-label", "From the web"), ...webSources(asList(sources)));
   return web;
+}
+
+// ---- links in answers: a short clickable word instead of a long address --------------
+//
+// The owner: "make it like LinkedIn : LINK", with the word clickable. answerNodes(text) turns
+// an answer's text into nodes for the page; it is used wherever an assistant's answer is shown
+// as text (the main chat, the panel's follow-up chat, an object's summary, the caption).
+//   [LinkedIn](address)    a link whose visible text is "LinkedIn"
+//   "... profile is <address>"   a link whose visible text is "link": the words before it already
+//                          say what it is (they end with a colon, "is", "at", "here" or "see")
+//   "... code on <address> today"   a link whose visible text is the site's name: "github.com"
+// Everything else stays plain text, exactly as written: this is not a Markdown renderer.
+// The rules that keep it safe:
+//   - nodes are made with createElement and textContent only, never from HTML;
+//   - a link is made only for an address that new URL() reads, with the protocol exactly
+//     http: or https:, and no user name or password in it; anything else stays plain text;
+//   - every link opens in a new tab with rel="noopener noreferrer", and shows its full address
+//     in its title, so the visitor sees where it goes before clicking;
+//   - a label is cut at LINK_LABEL_CHARS; a label that names another site than the one the
+//     link goes to (a [bank.example](evil.example) trick) is replaced by the real site's name.
+// A bare address ends before trailing . , ) ; : ! ? (a ")" that closes a "(" inside the
+// address itself, as in a Wikipedia address, stays part of it).
+
+const LINK_LABEL_CHARS = 60;
+const LINK_PATTERN = /\[([^\[\]\n]+)\]\(([^\s()]*(?:\([^\s()]*\)[^\s()]*)*)\)|\bhttps?:\/\/[^\s<>"`]+/gi;
+const ADDRESS_END = ".,);:!?";
+const SAYS_WHAT_IT_IS = /(?::|\b(?:is|at|here|see))\s*$/i;   // "LinkedIn: ...", "His profile is ..."
+const NAMED_SITE = /(?:\b[a-z][a-z0-9+.-]*:\/\/)?[\p{L}\p{N}-]+(?:\.[\p{L}\p{N}-]+)*\.\p{L}{2,}(?![\p{L}\p{N}-])/giu;
+
+// The address as a URL when the page may link to it, else null.
+function webAddress(raw) {
+  let url;
+  try {
+    url = new URL(asText(raw).trim());
+  } catch (error) {
+    return null;
+  }
+  if (url.protocol !== "http:" && url.protocol !== "https:") return null;
+  if (url.username || url.password) return null;      // "bank.example@evil.example" never becomes a link
+  return url;
+}
+
+const siteName = (url) => url.hostname.replace(/^www\./i, "");
+
+// A bare address without the punctuation that ends the sentence around it.
+function trimAddress(address) {
+  let end = address.length;
+  while (end > 0 && ADDRESS_END.includes(address[end - 1])) {
+    const head = address.slice(0, end);
+    const opened = head.split("(").length - 1, closed = head.split(")").length - 1;
+    if (address[end - 1] === ")" && opened >= closed) break;   // it closes a bracket of the address
+    end -= 1;
+  }
+  return address.slice(0, end);
+}
+
+// The host a piece of text names ("bank.example" in "Log in at bank.example/login"), as a
+// browser writes it, or "" when it names none that a browser would read.
+function hostIn(text) {
+  try {
+    // "http:" and a host is enough for the browser's own reading of the host name (and its
+    // xn-- form for a name in another script, as the link's address has it).
+    return siteName(new URL("http:" + text.replace(/^[a-z][a-z0-9+.-]*:\/\//i, ""))).toLowerCase();
+  } catch (error) {
+    return "";
+  }
+}
+
+// True when the label names a site other than the one the link goes to.
+function namesAnotherSite(label, url) {
+  const target = siteName(url).toLowerCase();
+  return (label.match(NAMED_SITE) || []).some((named) => {
+    const host = hostIn(named);
+    return host !== "" && host !== target;
+  });
+}
+
+// At most LINK_LABEL_CHARS characters, the last one "…", cut after a whole word when one is near.
+function cutLabel(label) {
+  const letters = Array.from(label);
+  if (letters.length <= LINK_LABEL_CHARS) return label;
+  const head = letters.slice(0, LINK_LABEL_CHARS - 1).join("");
+  const space = head.lastIndexOf(" ");
+  return (space > LINK_LABEL_CHARS / 2 ? head.slice(0, space) : head).trimEnd() + "…";
+}
+
+function markdownLabel(raw, url) {
+  const label = raw.replace(/\s+/g, " ").trim();
+  if (!label || namesAnotherSite(label, url)) return siteName(url);
+  return cutLabel(label);
+}
+
+// The text cut into plain parts ({ text, url: null }) and links ({ text, url, label, markdown }).
+// Joined, the parts' text is the text as it came.
+function linkParts(text) {
+  const source = asText(text);
+  const parts = [];
+  let at = 0;
+  for (const match of source.matchAll(LINK_PATTERN)) {
+    const markdown = match[1] !== undefined;
+    const whole = markdown ? match[0] : trimAddress(match[0]);
+    const url = webAddress(markdown ? match[2] : whole);
+    if (url === null) continue;                          // not a link: it stays in the plain text
+    if (match.index > at) parts.push({ text: source.slice(at, match.index), url: null });
+    const label = markdown ? markdownLabel(match[1], url)
+                           : SAYS_WHAT_IT_IS.test(source.slice(at, match.index)) ? "link" : siteName(url);
+    parts.push({ text: whole, url, label, markdown });
+    at = match.index + whole.length;
+  }
+  if (at < source.length) parts.push({ text: source.slice(at), url: null });
+  return parts;
+}
+
+function linkNode(part) {
+  const link = make("a", "answer-link", part.label);
+  link.href = part.url.href;
+  link.title = part.url.href;          // where it goes, before it is clicked
+  link.target = "_blank";
+  link.rel = "noopener noreferrer";
+  return link;
+}
+
+function answerNodes(text) {
+  return linkParts(text).map((part) => (part.url ? linkNode(part) : document.createTextNode(part.text)));
 }
 
 function addAnswer(answer) {
@@ -2096,6 +2289,7 @@ function openDetails(key, from) {
   for (const [thingKey, item] of thingItems) item.firstChild.classList.toggle("is-open", thingKey === key);
   opener = from;
   fitDetails();
+  fitPanelWidth();                      // the handle says how wide the panel is now
   closeButton.focus({ preventScroll: true });
 }
 
@@ -2192,7 +2386,11 @@ function showInfo(info) {
   const name = asText(info.name);
   if (name) detailTitle.textContent = name;
   const nodes = [];
-  if (asText(info.summary)) nodes.push(make("p", "", asText(info.summary)));
+  if (asText(info.summary)) {
+    const summary = make("p");
+    summary.append(...answerNodes(asText(info.summary)));   // its links as short clickable words
+    nodes.push(summary);
+  }
   const specs = asList(info.specs).filter((spec) => spec && typeof spec === "object");
   if (specs.length) {
     const list = make("dl", "specs");
@@ -2256,6 +2454,127 @@ async function describe(id, mine) {
   else showProblem(errorText(data, response, "Please click it again."));
   showFollowUp(id);                      // once the description has arrived, or failed
 }
+
+// ---- the panel's width: a handle on its left edge ----------------------------------
+//
+// Drag the handle (mouse, pen or finger) or press the left and right arrow keys on it: the
+// panel gets wider or narrower and the video takes the rest. A double-click gives back the
+// usual width. The width is one CSS variable on the stage, --details-width, which all three
+// layouts read (beside the video from 1280 px, the sheet over the page below that, the column
+// in the full view); while it is not set, each layout keeps its usual width.
+// Limits: at least PANEL_MIN_PX, at most 60 % of the window, and the video keeps at least
+// VIDEO_MIN_PX beside it (or, under the sheet, uncovered). When a window is too small for all
+// three, the minimum wins.
+// The chosen width is remembered (localStorage, when the browser allows it); whenever the window
+// or the layout changes, it is fitted into the limits again, so a smaller window never loses it.
+// While dragging, the width changes at most once per animation frame and nothing is animated.
+
+const PANEL_MIN_PX = 300;
+const VIDEO_MIN_PX = 320;
+const PANEL_MAX_SHARE = 0.6;
+const PANEL_STEP_PX = 24;      // one press of an arrow key
+const SHEET_MARGIN_PX = 16;    // the sheet's distance from the window's right edge
+const PANEL_WIDTH_KEY = "panelWidth";
+
+let panelChoice = readPanelChoice();   // the visitor's width in pixels, or null for the usual one
+let panelDrag = null;          // { pointerId, startX, startWidth, width } while the handle is dragged
+let panelFrame = 0;            // the waiting animation-frame request while dragging
+
+function readPanelChoice() {
+  const width = Number(readStored(PANEL_WIDTH_KEY));
+  return Number.isFinite(width) && width >= PANEL_MIN_PX && width <= 10000 ? Math.round(width) : null;
+}
+
+// The widest the panel may be in the layout shown now.
+function panelMax() {
+  let room, gap = 0;
+  if (stage.classList.contains("is-full")) {
+    room = stage.clientWidth;                                   // the window
+  } else if (window.matchMedia("(min-width: 1280px)").matches) {
+    room = stage.clientWidth;                                   // the live view's width
+    gap = parseFloat(getComputedStyle(stage).columnGap) || 0;
+  } else {
+    room = window.innerWidth - SHEET_MARGIN_PX;                 // the sheet lies over the page
+  }
+  const most = Math.min(window.innerWidth * PANEL_MAX_SHARE, room - gap - VIDEO_MIN_PX);
+  return Math.floor(Math.max(PANEL_MIN_PX, most));
+}
+
+const fitWidth = (width) => Math.round(Math.min(Math.max(width, PANEL_MIN_PX), panelMax()));
+
+// Set the variable (or take it away), and tell the handle what the width is now.
+function showPanelWidth(width) {
+  if (width === null) stage.style.removeProperty("--details-width");
+  else stage.style.setProperty("--details-width", width + "px");
+  drawGrip();
+}
+
+function drawGrip() {
+  detailsGrip.setAttribute("aria-valuemax", String(panelMax()));
+  if (details.hidden) return;
+  const now = Math.round(details.getBoundingClientRect().width);
+  detailsGrip.setAttribute("aria-valuenow", String(now));
+  detailsGrip.setAttribute("aria-valuetext", now + " pixels wide");
+}
+
+// The visitor's width fitted into the limits of this window and layout; none: the usual width.
+function fitPanelWidth() {
+  if (panelDrag) return;                 // the drag decides until it ends
+  showPanelWidth(panelChoice === null ? null : fitWidth(panelChoice));
+}
+
+function choosePanelWidth(width) {
+  panelChoice = width === null ? null : fitWidth(width);
+  store(PANEL_WIDTH_KEY, panelChoice === null ? null : String(panelChoice));
+  showPanelWidth(panelChoice);
+}
+
+// The panel is on the right, so moving the handle to the left makes it wider.
+function startPanelDrag(event) {
+  if (!event.isPrimary || event.button !== 0) return;
+  event.preventDefault();                       // no text selection, no scrolling
+  detailsGrip.setPointerCapture(event.pointerId);
+  const width = details.getBoundingClientRect().width;
+  panelDrag = { pointerId: event.pointerId, startX: event.clientX, startWidth: width, width: Math.round(width) };
+  document.documentElement.classList.add("is-resizing");
+}
+
+function movePanelDrag(event) {
+  if (!panelDrag || event.pointerId !== panelDrag.pointerId) return;
+  event.preventDefault();
+  panelDrag.width = fitWidth(panelDrag.startWidth + panelDrag.startX - event.clientX);
+  if (panelFrame) return;                       // at most once per screen frame
+  panelFrame = requestAnimationFrame(() => {
+    panelFrame = 0;
+    if (panelDrag) showPanelWidth(panelDrag.width);
+  });
+}
+
+function endPanelDrag(event) {
+  if (!panelDrag || event.pointerId !== panelDrag.pointerId) return;
+  const { width, startWidth } = panelDrag;
+  panelDrag = null;
+  cancelAnimationFrame(panelFrame);
+  panelFrame = 0;
+  document.documentElement.classList.remove("is-resizing");
+  if (width !== Math.round(startWidth)) choosePanelWidth(width);
+  else fitPanelWidth();                         // a press without a move chooses nothing
+}
+
+detailsGrip.addEventListener("pointerdown", startPanelDrag);
+detailsGrip.addEventListener("pointermove", movePanelDrag);
+detailsGrip.addEventListener("pointerup", endPanelDrag);
+detailsGrip.addEventListener("pointercancel", endPanelDrag);
+detailsGrip.addEventListener("lostpointercapture", endPanelDrag);
+detailsGrip.addEventListener("dblclick", () => choosePanelWidth(null));   // the usual width again
+detailsGrip.addEventListener("keydown", (event) => {
+  const step = event.key === "ArrowLeft" ? PANEL_STEP_PX : event.key === "ArrowRight" ? -PANEL_STEP_PX : 0;
+  if (!step) return;
+  event.preventDefault();                       // the arrow keys do not scroll the page
+  choosePanelWidth(details.getBoundingClientRect().width + step);
+});
+window.addEventListener("resize", fitPanelWidth);
+fitPanelWidth();
 
 // ---- the brush: marking a part of the photo --------------------------------
 //
@@ -2484,12 +2803,12 @@ function setFollowBusy(isBusy) {
 }
 
 function scrollPanel() {
-  details.scrollTop = details.scrollHeight;
+  detailsScroll.scrollTop = detailsScroll.scrollHeight;   // the panel's own content, never the page
 }
 
 function addFollowMessage(kind, text) {
   const item = make("li", "msg " + kind);
-  item.append(make("p", "text", text));
+  item.append(messageText(kind, text));
   followMessages.append(item);
   scrollPanel();
   return item;
@@ -2874,7 +3193,8 @@ function enterFullView() {
   if (!stage.contains(document.activeElement)) fullButton.focus({ preventScroll: true });
   labelFullButton();
   fitDetails();                        // in full view the panel has a column of its own
-  timelineChanged();                   // the timeline is not refreshed behind the full view
+  fitPanelWidth();                     // the chosen width, fitted into the window
+  timelineChanged();                  // the timeline is not refreshed behind the full view
   if (canAskScreen && !isScreenFull()) {
     stage.requestFullscreen().catch(() => {});   // refused: the window-filling view stays
   }
@@ -2888,6 +3208,7 @@ function leaveFullView() {
   putPageBehindBack();
   labelFullButton();
   fitDetails();
+  fitPanelWidth();
   timelineChanged();
   if (isScreenFull()) document.exitFullscreen().catch(() => {});
 }
@@ -3028,11 +3349,22 @@ function sentences(...parts) {
     .map((part) => (/[.!?]$/.test(part) ? part : part + ".")).join(" ");
 }
 
+// A link is spoken as the words the page shows for it (linkParts): its label, "link" or the
+// site's name, never its address, so what is heard matches what is seen.
 function earText(text) {
-  const lines = asText(text)
-    .replace(/\[([^\]]*)\]\([^)]*\)/g, "$1")       // a Markdown link: only its words
-    .replace(/\bhttps?:\/\/\S+/gi, " ")             // web addresses are not read out
+  const shown = linkParts(text).map((part) => (part.url ? part.label : part.text)).join("");
+  const lines = readableLines(shown
+    .replace(/\[([^\[\]\n]+)\]\(([^\s()]*(?:\([^\s()]*\)[^\s()]*)*)\)/g, "$1")   // a Markdown link the page does not open: its words
+    .replace(/\bhttps?:\/\/\S+/gi, " ")             // an address the page does not open is not read out either
     .replace(/\bwww\.\S+/gi, " ")
+    .replace(/\s+([.,;:!?])/g, "$1"));               // "is ." where an address was: "is."
+  return cutAtSentence(lines.join(" "), MAX_SPOKEN_CHARS);
+}
+
+// The lines of an answer without "From the web" or Markdown signs, each ending in a pause.
+// The caption shows the same lines (captionNodes), with its links kept.
+function readableLines(text) {
+  return asText(text)
     .replace(/\bFrom the web\b:?/gi, " ")
     .split("\n")
     .map((line) => line.replace(/^\s*(#{1,6}|>|[-*+]|\d+[.)])\s+/, "")   // headings, quotes, bullets
@@ -3040,7 +3372,6 @@ function earText(text) {
                        .replace(/\s+/g, " ").trim())
     .filter(Boolean)
     .map((line) => (/[.!?:;,]$/.test(line) ? line : line + "."));         // a short pause after each line
-  return cutAtSentence(lines.join(" "), MAX_SPOKEN_CHARS);
 }
 
 function cutAtSentence(text, limit) {
@@ -3603,15 +3934,37 @@ function answerArrived(where, text, isProblem, quiet) {
   if (!captionWait || captionWait.where !== where) return;
   const { question } = captionWait;
   captionWait = null;
-  // Read from across the room: the same cleaned words that are spoken, without addresses or Markdown signs.
-  showCaption(question, isProblem ? asText(text) : earText(text), isProblem, CAPTION_MS);
+  // Read from across the room: the answer's lines without Markdown signs, its links as short words.
+  showCaption(question, isProblem ? asText(text) : captionNodes(text), isProblem, CAPTION_MS);
 }
 
+// The caption's nodes for an answer: readableLines, with each link kept as a link. While the
+// lines are cleaned, each link waits as one LINK_MARK character, which no cleaning touches.
+const LINK_MARK = "";
+function captionNodes(text) {
+  const links = [];
+  const marked = linkParts(asText(text).replaceAll(LINK_MARK, "")).map((part) => {
+    if (!part.url) return part.text;
+    links.push(part);
+    return LINK_MARK;
+  }).join("");
+  const pieces = readableLines(marked).join(" ").split(LINK_MARK);
+  if (pieces.length !== links.length + 1) return [earText(text)];   // never expected: the plain words
+  const nodes = [];
+  pieces.forEach((piece, i) => {
+    if (piece) nodes.push(document.createTextNode(piece));
+    if (i < links.length) nodes.push(linkNode(links[i]));
+  });
+  return nodes;
+}
+
+// `answer` is plain text, or the nodes of an answer (captionNodes).
 function showCaption(question, answer, isProblem, ms) {
   setText(captionQuestion, question);
   captionQuestion.hidden = !question;
-  setText(captionAnswer, answer);
-  captionAnswer.hidden = !answer;
+  if (typeof answer === "string") setText(captionAnswer, answer);
+  else captionAnswer.replaceChildren(...answer);
+  captionAnswer.hidden = !captionAnswer.textContent;
   captionAnswer.classList.toggle("problem", isProblem);
   caption.hidden = false;
   captionWait = null;

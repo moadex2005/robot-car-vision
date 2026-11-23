@@ -49,7 +49,7 @@ assistant:
 
 memory:
   file: data/memory.sqlite3 # what the camera saw and when; stays on this laptop
-  keep_days: 7              # older sightings are forgotten
+  keep_days: 1              # sightings and their pictures older than one day are deleted
   min_seconds: 1.0          # a thing must stay in view this long to be remembered
   pictures: true            # keep a small picture of remembered objects (never of people)
 

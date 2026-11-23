@@ -9,6 +9,9 @@ __pycache__/
 
 # People's faces and anything computed from them stay on this laptop
 data/people/*
+# Photos and notes about people dropped at the project root are private too.
+/People/
+/people/
 data/people.json
 data/camera.json
 data/lookout.json
@@ -27,3 +30,6 @@ data/samples/*
 # Run output
 logs/
 runs/
+
+# The real notes hold names of the team; the template next to them is what is published.
+data/knowledge.md

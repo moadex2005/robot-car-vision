@@ -112,7 +112,7 @@ Add `--source phone`, `--source webcam` or `--source file` to any camera command
 ## What only you can provide
 
 - **People.** The easy way is the **People** section of the demo page. By hand: for each person, with their permission, make a folder `data/people/<id>/` (small letters, digits and underscores) holding 3 to 5 clear photos and an `about.md` that describes them. `data/people.example/about.md` shows the layout: a `# Name` heading, a `Role:` line, a few `- ` bullet lines for the card, then anything else you want the assistant to know. Run the enroll command after adding or changing photos. A folder with only an `about.md` is fine for now; the person is recognised once photos are added and enrolled.
-- **Notes.** Write what the assistant should know into `data/knowledge.md`.
+- **Notes.** Copy `data/knowledge.example.md` to `data/knowledge.md` and write into it what the assistant should know about your project and team. The real file is not committed, because it names people.
 - **An API key.** Copy `.env.example` to `.env` and put your own Anthropic API key in it. The key stays on this laptop; never paste it into a chat. For Auto-discover, add a Hugging Face token as `HF_TOKEN` in the same file (optional).
 - **A sample clip.** Record about 2 minutes from the car's camera height and save it as `data/samples/car_clip.mp4`, so the program can be tested without the phone.
 

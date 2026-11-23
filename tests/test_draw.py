@@ -70,6 +70,44 @@ def test_empty_list_leaves_the_frame_untouched():
     assert not frame.any()
 
 
+def test_a_wanted_box_is_drawn_thicker_in_the_wanted_colour():
+    keys = Detection("keys", 0.7, (100, 120, 300, 400), 100_007)
+    plain, wanted = blank(), blank()
+    draw_detections(plain, [keys])
+    draw_detections(wanted, [keys], wanted=[100_007])
+    expected = blank()
+    cv2.rectangle(expected, (100, 120), (300, 400), draw.WANTED_COLOR, draw.WANTED_THICKNESS)
+    assert np.array_equal(wanted[130:], expected[130:])                 # below the caption band
+    assert draw.WANTED_THICKNESS > draw.BOX_THICKNESS
+    assert not np.array_equal(plain, wanted)
+    assert tuple(wanted[118, 101]) == draw.WANTED_COLOR                 # the caption band too (its padding)
+
+
+def test_only_the_wanted_track_numbers_stand_out():
+    chair = Detection("chair", 0.8, (100, 120, 300, 400), 2)
+    keys = Detection("keys", 0.7, (400, 120, 500, 200), 100_007)
+    untracked = Detection("keys", 0.6, (520, 300, 600, 380))
+    frame = blank()
+    draw_detections(frame, [chair, keys, untracked], wanted={100_007, None, 99})
+    assert tuple(frame[300, 100]) == color_for("chair")
+    assert tuple(frame[160, 400]) == draw.WANTED_COLOR
+    assert tuple(frame[340, 520]) == color_for("keys")                  # no track number: never wanted
+
+
+def test_the_wanted_colour_is_no_label_colour():
+    # color_for() never gives a channel below 60, so no label can look like a wanted box.
+    assert min(draw.WANTED_COLOR) < 60
+
+
+def test_a_wanted_box_line_grows_with_the_frame():
+    box = (300, 360, 900, 900)
+    new = blank(1920, 1080)
+    draw_detections(new, [Detection("keys", 0.87, box, 100_003)], wanted=[100_003])
+    expected = blank(1920, 1080)
+    cv2.rectangle(expected, box[:2], box[2:], draw.WANTED_COLOR, draw.WANTED_THICKNESS * 3)
+    assert np.array_equal(new[400:], expected[400:])
+
+
 def test_draw_status_writes_in_the_top_left_corner():
     frame = blank()
     draw_status(frame, "Detect FPS 15.0")

@@ -10,7 +10,8 @@ import pytest
 
 from car_vision import detector as detector_module
 from car_vision.config import ConfigError
-from car_vision.detector import Detector, LabelVotes, LiveStats, clip_box, describe, main, tracker_names
+from car_vision.detector import (Detector, DetectorError, LabelVotes, LiveStats, OpenDetector, clip_box,
+                                 describe, main, tracker_names)
 from car_vision.stream import FpsCounter
 
 SETTINGS = {
@@ -657,3 +658,329 @@ def test_detector_itself_imports_them_only_inside_functions():
     tree = ast.parse((PACKAGE_DIR / "detector.py").read_text(encoding="utf-8"))
     top_level = [node for node in tree.body if isinstance(node, (ast.Import, ast.ImportFrom))]
     assert heavy_imports(ast.unparse(ast.Module(body=top_level, type_ignores=[]))) == []
+
+
+# ---- OpenDetector: finding things by a typed name (M13 part A) -------------
+
+OPEN_SETTINGS = {
+    **SETTINGS,
+    "open_model": "yoloe-26s-seg.pt",
+    "open_confidence": 0.25,
+    "open_every_n_frames": 3,
+}
+
+
+class FakeYoloe(FakeModelWithTracker):
+    """Shaped like ultralytics.YOLOE: get_text_pe() and set_classes() besides track().
+
+    It notes the working directory at each text call, like the real one that
+    looks for its text encoder there.
+    """
+
+    def __init__(self, *results, fail_text=False) -> None:
+        super().__init__(*results)
+        self.classes = []
+        self.text_calls = []
+        self.fail_text = fail_text
+
+    def get_text_pe(self, names):
+        self.text_calls.append((list(names), Path.cwd()))
+        if self.fail_text:
+            raise ConnectionError("no internet")
+        return f"embeddings for {names}"
+
+    def set_classes(self, names, embeddings):
+        assert embeddings == f"embeddings for {names}"
+        self.classes.append(list(names))
+
+
+def open_result(cls, ids=None, names=None):
+    """One box per class number in cls; names is what result.names says."""
+    count = len(cls)
+    result = FakeResult(FakeBoxes(xyxy=[[10, 10, 50, 50]] * count, conf=[0.6] * count, cls=cls, ids=ids))
+    result.names = names if names is not None else {}
+    return result
+
+
+@pytest.fixture
+def no_real_yoloe(monkeypatch):
+    """Make sure nothing in a test reaches the real Ultralytics loader."""
+    def must_not_run(weights):
+        raise AssertionError(f"the real model was loaded from {weights}")
+
+    monkeypatch.setattr(detector_module, "load_yoloe", must_not_run)
+
+
+# settings and construction
+
+
+def test_open_detector_reads_its_settings(no_real_yoloe):
+    detector = OpenDetector(OPEN_SETTINGS)
+    assert detector.model_name == "yoloe-26s-seg.pt"
+    assert detector.confidence == pytest.approx(0.25)
+    assert detector.models_dir == "models"
+
+
+@pytest.mark.parametrize("key", ["open_model", "open_confidence", "models_dir", "image_size", "device", "tracker"])
+def test_open_detector_missing_setting_is_reported(key):
+    settings = dict(OPEN_SETTINGS)
+    del settings[key]
+    with pytest.raises(ConfigError, match=key):
+        OpenDetector(settings)
+
+
+@pytest.mark.parametrize("confidence", [0, -0.1, 1.01])
+def test_open_confidence_outside_zero_to_one_is_rejected(confidence):
+    with pytest.raises(ConfigError, match="open_confidence"):
+        OpenDetector({**OPEN_SETTINGS, "open_confidence": confidence})
+
+
+@pytest.mark.parametrize("change", [{"image_size": 100}, {"tracker": "sorty.yaml"}, {"device": "gpu"},
+                                    {"open_model": "  "}, {"open_confidence": True}])
+def test_open_detector_bad_settings_are_rejected(change):
+    with pytest.raises(ConfigError):
+        OpenDetector({**OPEN_SETTINGS, **change})
+
+
+def test_nothing_is_loaded_at_construction(monkeypatch, no_real_yoloe):
+    def must_not_run():
+        raise AssertionError("cuda_available() was called at construction")
+
+    monkeypatch.setattr(detector_module, "cuda_available", must_not_run)
+    detector = OpenDetector({**OPEN_SETTINGS, "device": "cuda"})
+    assert detector.loaded is False
+    assert detector.names == ()
+
+
+def test_constructing_the_open_detector_imports_nothing_heavy():
+    code = (
+        "import sys, numpy as np\n"
+        "from car_vision.detector import OpenDetector\n"
+        "settings = dict(open_model='m.pt', models_dir='models', open_confidence=0.25, image_size=640,\n"
+        "                device='auto', tracker='bytetrack.yaml')\n"
+        "d = OpenDetector(settings)\n"
+        "d.set_names([])\n"
+        "print(d.loaded, d.detect(np.zeros((4, 4, 3), np.uint8)),\n"
+        "      sorted(m for m in ('torch', 'ultralytics', 'clip') if m in sys.modules))\n"
+    )
+    output = subprocess.run([sys.executable, "-c", code], cwd=PACKAGE_DIR.parent, capture_output=True,
+                            text=True, timeout=60, check=True).stdout
+    assert output.strip() == "False [] []"
+
+
+# load()
+
+
+def test_load_uses_the_weights_in_models_dir_and_keeps_the_working_directory(monkeypatch, tmp_path, graphics_card):
+    seen = []
+    model = FakeYoloe()
+
+    def fake_load(weights):
+        seen.append((weights, Path.cwd()))
+        return model
+
+    monkeypatch.setattr(detector_module, "load_yoloe", fake_load)
+    monkeypatch.chdir(tmp_path)
+    detector = OpenDetector({**OPEN_SETTINGS, "models_dir": str(tmp_path / "weights"), "device": "auto"})
+    detector.load()
+
+    assert detector.loaded
+    assert seen == [(tmp_path / "weights" / "yoloe-26s-seg.pt", tmp_path)]
+    assert (tmp_path / "weights").is_dir()
+    detector.load()                                    # already loaded: nothing happens
+    assert len(seen) == 1
+
+    detector.set_names(["keys"])
+    detector.detect(frame())
+    assert model.calls[0]["device"] == "cuda"
+
+
+def test_relative_models_dir_starts_at_the_project_folder(monkeypatch, tmp_path):
+    seen = []
+    monkeypatch.setattr(detector_module, "load_yoloe", lambda weights: seen.append(weights) or FakeYoloe())
+    monkeypatch.chdir(tmp_path)
+    OpenDetector(OPEN_SETTINGS).load()
+    assert seen == [PACKAGE_DIR.parent / "models" / "yoloe-26s-seg.pt"]
+
+
+def test_load_failure_gives_a_detector_error(monkeypatch, tmp_path):
+    def no_internet(weights):
+        raise ConnectionError("download failed")
+
+    monkeypatch.setattr(detector_module, "load_yoloe", no_internet)
+    monkeypatch.chdir(tmp_path)
+    detector = OpenDetector({**OPEN_SETTINGS, "models_dir": str(tmp_path)})
+    with pytest.raises(DetectorError, match="internet") as caught:
+        detector.load()
+    assert "yoloe-26s-seg.pt" in str(caught.value)
+    assert not detector.loaded
+    assert Path.cwd() == tmp_path
+
+
+def test_cuda_without_a_card_gives_a_detector_error_at_load(no_graphics_card, no_real_yoloe):
+    detector = OpenDetector({**OPEN_SETTINGS, "device": "cuda"})
+    with pytest.raises(DetectorError, match="graphics card"):
+        detector.load()
+
+
+# set_names()
+
+
+def test_set_names_loads_the_encoder_inside_models_dir_and_switches_back(monkeypatch, tmp_path):
+    model = FakeYoloe()
+    folder = tmp_path / "weights"
+    monkeypatch.chdir(tmp_path)
+    detector = OpenDetector({**OPEN_SETTINGS, "models_dir": str(folder)}, model=model)
+    detector.set_names(["power bank", "keys"])
+
+    assert model.text_calls == [(["power bank", "keys"], folder)]
+    assert model.classes == [["power bank", "keys"]]
+    assert detector.names == ("power bank", "keys")
+    assert Path.cwd() == tmp_path
+
+
+def test_set_names_failure_gives_a_detector_error_and_switches_back(monkeypatch, tmp_path):
+    model = FakeYoloe(fail_text=True)
+    monkeypatch.chdir(tmp_path)
+    detector = OpenDetector({**OPEN_SETTINGS, "models_dir": str(tmp_path / "weights")}, model=model)
+    with pytest.raises(DetectorError, match="internet"):
+        detector.set_names(["keys"])
+    assert Path.cwd() == tmp_path
+    assert detector.names == ()                        # the old names stay
+
+
+def test_set_names_loads_the_model_when_needed(monkeypatch):
+    model = FakeYoloe()
+    monkeypatch.setattr(detector_module, "load_yoloe", lambda weights: model)
+    detector = OpenDetector(OPEN_SETTINGS)
+    detector.set_names(["keys"])
+    assert detector.loaded and model.classes == [["keys"]]
+
+
+def test_same_names_change_nothing():
+    model = FakeYoloe()
+    detector = OpenDetector(OPEN_SETTINGS, model=model)
+    detector.set_names(["keys", "cup"])
+    detector.set_names(("keys", "cup"))
+    assert model.classes == [["keys", "cup"]]
+    assert model.resets == 1
+
+
+def test_new_names_are_set_and_start_the_tracks_again():
+    model = FakeYoloe()
+    detector = OpenDetector(OPEN_SETTINGS, model=model)
+    detector.set_names(["keys"])
+    detector.set_names(["wifi router"])
+    assert model.classes == [["keys"], ["wifi router"]]
+    assert detector.names == ("wifi router",)
+    assert model.resets == 2
+
+
+def test_empty_list_clears_the_names_without_the_encoder():
+    model = FakeYoloe()
+    detector = OpenDetector(OPEN_SETTINGS, model=model)
+    detector.set_names(["keys"])
+    detector.set_names([])
+    assert detector.names == ()
+    assert len(model.text_calls) == 1
+    assert detector.detect(frame()) == []
+    assert model.calls == []
+
+
+def test_clearing_names_before_load_loads_nothing(no_real_yoloe):
+    detector = OpenDetector(OPEN_SETTINGS)
+    detector.set_names([])
+    assert not detector.loaded
+
+
+@pytest.mark.parametrize("names", [["keys", "  "], ["keys", 3]])
+def test_blank_or_non_text_names_are_refused(names):
+    with pytest.raises(ValueError):
+        OpenDetector(OPEN_SETTINGS, model=FakeYoloe()).set_names(names)
+
+
+def test_one_string_instead_of_a_list_is_refused():
+    with pytest.raises(TypeError):
+        OpenDetector(OPEN_SETTINGS, model=FakeYoloe()).set_names("keys")
+
+
+# detect()
+
+
+def test_detect_with_no_names_does_not_touch_the_model():
+    model = FakeYoloe(open_result([0], ids=[1]))
+    detector = OpenDetector(OPEN_SETTINGS, model=model)
+    assert detector.detect(frame()) == []
+    assert model.calls == []
+
+
+def test_detect_before_load_with_no_names_returns_nothing(no_real_yoloe):
+    assert OpenDetector(OPEN_SETTINGS).detect(frame()) == []
+
+
+def test_labels_are_the_typed_names_and_track_ids_pass_through():
+    stale = {0: "something old", 1: "other"}            # what the model says must not win
+    model = FakeYoloe(open_result([1, 0], ids=[4, 9], names=stale))
+    detector = OpenDetector(OPEN_SETTINGS, model=model)
+    detector.set_names(["power bank", "wifi router"])
+    found = detector.detect(frame())
+
+    assert [d.label for d in found] == ["wifi router", "power bank"]
+    assert [d.track_id for d in found] == [4, 9]
+    assert found[0].box == (10, 10, 50, 50)
+    assert found[0].confidence == pytest.approx(0.6)
+
+
+def test_untracked_named_boxes_get_no_track_id():
+    model = FakeYoloe(open_result([0], ids=None))
+    detector = OpenDetector(OPEN_SETTINGS, model=model)
+    detector.set_names(["keys"])
+    assert detector.detect(frame())[0].track_id is None
+
+
+def test_detect_passes_the_open_settings_and_never_half_precision():
+    model = FakeYoloe(open_result([0], ids=[1]))
+    detector = OpenDetector({**OPEN_SETTINGS, "image_size": 320}, model=model)
+    detector.set_names(["keys"])
+    detector.detect(frame())
+
+    call = model.calls[0]
+    assert call["persist"] is True
+    assert call["tracker"] == "bytetrack.yaml"
+    assert call["conf"] == pytest.approx(0.25)
+    assert call["imgsz"] == 320
+    assert call["device"] == "cpu"
+    assert call["verbose"] is False
+    assert "half" not in call and "quantize" not in call
+
+
+def test_masks_in_the_result_are_ignored():
+    result = open_result([0], ids=[1])
+    result.masks = object()                            # a segmentation model returns these
+    detector = OpenDetector(OPEN_SETTINGS, model=FakeYoloe(result))
+    detector.set_names(["keys"])
+    assert [d.label for d in detector.detect(frame())] == ["keys"]
+
+
+def test_empty_frame_with_names_raises_value_error():
+    detector = OpenDetector(OPEN_SETTINGS, model=FakeYoloe())
+    detector.set_names(["keys"])
+    with pytest.raises(ValueError):
+        detector.detect(np.zeros((0, 0, 3), dtype=np.uint8))
+
+
+def test_reset_tracks_and_a_new_frame_size_start_the_tracks_again():
+    model = FakeYoloe()
+    detector = OpenDetector(OPEN_SETTINGS, model=model)
+    detector.set_names(["keys"])                       # 1 reset
+    detector.detect(frame(640, 480))
+    detector.detect(frame(640, 480))
+    assert model.resets == 1
+    detector.detect(frame(640, 360))
+    assert model.resets == 2
+    detector.reset_tracks()
+    assert model.resets == 3
+
+
+def test_reset_tracks_before_load_is_fine(no_real_yoloe):
+    OpenDetector(OPEN_SETTINGS).reset_tracks()

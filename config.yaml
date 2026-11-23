@@ -20,6 +20,9 @@ detector:
   image_size: 640
   device: auto              # auto, cuda or cpu
   tracker: bytetrack.yaml   # gives each object a number that follows it
+  open_model: yoloe-26s-seg.pt   # finds things by a typed name ("Look for" on the page); loaded on first use
+  open_confidence: 0.35     # lower finds more but also more wrong things (at 0.25 one router was "found" four times)
+  open_every_n_frames: 3    # the named search is slower, so it runs on every 3rd frame
 
 recognizer:
   model_pack: buffalo_l     # InsightFace face detector and face encoder
@@ -43,6 +46,12 @@ assistant:
   web_search_max_uses: 3
   history_turns: 10         # how many earlier question-answer pairs are sent along
   seen_within_seconds: 3.0  # a person counts as "in front of the camera" this long after the last sighting
+
+memory:
+  file: data/memory.sqlite3 # what the camera saw and when; stays on this laptop
+  keep_days: 7              # older sightings are forgotten
+  min_seconds: 1.0          # a thing must stay in view this long to be remembered
+  pictures: true            # keep a small picture of remembered objects (never of people)
 
 reactions:
   greet_cooldown_seconds: 60        # greet the same person at most this often

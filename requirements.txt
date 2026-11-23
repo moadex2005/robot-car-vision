@@ -22,6 +22,13 @@ numpy>=2.0,<3
 ultralytics==8.4.216
 lapx==0.13.1
 
+# Finding things by a typed name (YOLOE). Its text encoder needs Ultralytics' own fork
+# of OpenAI's CLIP, which Ultralytics would otherwise pip-install by itself on first use
+# (it asks for git+https://github.com/ultralytics/CLIP.git in ultralytics/nn/text_model.py).
+# Pinned to the commit installed here; pip needs git on the PATH to fetch it.
+clip @ git+https://github.com/ultralytics/CLIP.git@7ffa84b3bfa40c42ecc1c77147a855e69cb2dd40
+ftfy==6.3.1
+
 # Face recognition. onnxruntime-gpu runs the face models on the graphics card.
 onnxruntime-gpu==1.32.0
 insightface==2.1

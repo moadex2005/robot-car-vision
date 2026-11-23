@@ -45,6 +45,27 @@ People can be added from the page without a restart:
   waits at most for one photo to be read.
 - scene_photo() gives the newest clean frame for "Describe the scene".
 
+Looking for things by a typed name (search()):
+- A second, slower detector (detector.OpenDetector) finds things by the names
+  the visitor typed. It is built and loaded on the first search, never at
+  start-up. Loading it and setting the names happen in a thread of its own,
+  in "rounds" like the phone's picture size: a newer search replaces an older
+  one, and an older round that is still busy gives up as soon as it notices.
+- The open detector is used by that thread (load, set_names) and by the loop
+  (detect), never by both at once: whoever uses it holds self._open_lock. The
+  background thread waits for the lock; the loop only tries it, and when the
+  background thread has it the loop simply skips the named detection.
+- While names are set, the loop runs the open detector on every few frames
+  and keeps its finds on screen in between, for at most a second. merge_named()
+  adds them to the everyday detections; what it returns is what the whole page
+  sees (the list, the clicks, the photos, the assistant and the memory).
+
+The memory (memory.SightingLog): every tracked thing of every processed frame
+is told to the sighting log, which decides what is worth keeping. A small
+picture is cut for an object only now and then (PictureTimer), never for a
+person. Every few seconds the log's summary goes into the WorldState, where
+the assistant reads it.
+
 Every part can be handed in from outside, so the tests run the loop with
 fakes and need no camera, model or graphics card.
 """
@@ -55,10 +76,11 @@ import logging
 import re
 import threading
 import time
-from collections.abc import Callable, Sequence
+import unicodedata
+from collections.abc import Callable, Hashable, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import cv2
 import numpy as np
@@ -75,6 +97,9 @@ from car_vision.reactions import Reaction, ReactionEngine
 from car_vision.recognizer import Recognizer, load_known_faces
 from car_vision.state import Box, Detection, RecognizedFace, WorldSnapshot, WorldState
 from car_vision.stream import FpsCounter, FrameSource, fitted_size
+
+if TYPE_CHECKING:                       # only for the type hints: memory.py is imported when it is used
+    from car_vision.memory import SightingLog
 
 log = logging.getLogger(__name__)
 
@@ -124,6 +149,19 @@ HINT_CLOSER = "Come closer"
 HINT_STILL = "Hold still"
 HINT_CANCELLED = "Cancelled"
 HINT_SWITCHED = "Cancelled: another camera was chosen"
+
+MOST_NAMES = 6                           # search(): at most this many names at once ...
+LONGEST_NAME = 40                        # ... each at most this many characters
+NAME_MARKS = " -'’"                 # besides letters and digits: space, hyphen, apostrophes (' and ’)
+NAMED_ID_OFFSET = 100_000                # named track numbers are kept apart from the everyday ones
+NAMED_HOLD_SECONDS = 1.0                 # a named find stays on screen this long without being seen again
+REPLACE_OVERLAP = 0.6                    # a named find replaces an everyday box it overlaps more than this
+PLACES = ("left", "middle", "right")     # the thirds of the picture
+
+MEMORY_SHARE_SECONDS = 5.0               # the memory's summary goes into the WorldState this often
+PICTURE_EVERY_SECONDS = 5.0              # the sighting log is given a new picture of a thing at most this often
+PICTURE_FORGET_SECONDS = 10.0            # ... and a thing not seen for this long is forgotten by the timer
+PICTURE_MAX_SIDE = 160                   # the picture's longer side, in pixels
 
 
 @dataclass(frozen=True)
@@ -192,6 +230,65 @@ class PhotoSession:
                 "state": self.state, "hint": self.hint, "notes": list(self.notes)}
 
 
+@dataclass(frozen=True)
+class Search:
+    """The visitor's newest search. Replaced as a whole, under the pipeline's lock."""
+
+    names: tuple[str, ...] = ()
+    state: str = "off"                 # "off", "loading", "ready" or "failed"
+    note: str = ""                     # why it failed
+    round: int = 0                     # goes up with every search(); the newest round wins
+
+
+@dataclass(frozen=True)
+class NamedFinds:
+    """What the named search found, kept on screen between its runs (see merge_named)."""
+
+    search_round: int = 0
+    finds: tuple[tuple[Detection, float], ...] = ()     # each find and when it was last seen
+
+    @property
+    def detections(self) -> tuple[Detection, ...]:
+        return tuple(detection for detection, _seen_at in self.finds)
+
+
+class PictureTimer:
+    """Decides when the sighting log is given a small picture of a thing.
+
+    Cutting and encoding a picture costs more than everything else the memory
+    does, so it is not done for every thing on every frame. A thing gets its
+    first picture once it has been in view for `first_after` seconds (when the
+    log starts keeping it), then a new one every PICTURE_EVERY_SECONDS. Only
+    the loop thread uses it.
+    """
+
+    def __init__(self, first_after: float, every: float = PICTURE_EVERY_SECONDS,
+                 forget_after: float = PICTURE_FORGET_SECONDS) -> None:
+        self.first_after = first_after
+        self.every = every
+        self.forget_after = forget_after
+        self._times: dict[Hashable, list[float]] = {}    # key -> [first seen, last seen, last picture]
+
+    def due(self, key: Hashable, now: float) -> bool:
+        """True when this thing should get a picture now; counts it as given."""
+        times = self._times.setdefault(key, [now, now, float("-inf")])
+        first_seen, _last_seen, given_at = times
+        times[1] = now
+        if now - first_seen < self.first_after or now - given_at < self.every:
+            return False
+        times[2] = now
+        return True
+
+    def forget_old(self, now: float) -> None:
+        """Drop the things not seen for forget_after seconds."""
+        old = [key for key, times in self._times.items() if now - times[1] > self.forget_after]
+        for key in old:
+            del self._times[key]
+
+    def __len__(self) -> int:
+        return len(self._times)
+
+
 SourceFactory = Callable[[dict], Any]     # stream settings in, a FrameSource (or a fake) out
 
 
@@ -201,7 +298,8 @@ class Pipeline:
     def __init__(self, config: dict, source=None, detector=None, recognizer=None,
                  reactions=None, state: WorldState | None = None,
                  source_factory: SourceFactory | None = None,
-                 phone_fetch: Fetch | None = None) -> None:
+                 phone_fetch: Fetch | None = None,
+                 open_detector=None, sightings=None) -> None:
         recognizer_settings = section(config, "recognizer")
         self.every_n_frames: int = require(recognizer_settings, "every_n_frames", int)
         if self.every_n_frames < 1:
@@ -213,6 +311,15 @@ class Pipeline:
         self._photos_dir = resolve_path(require(recognizer_settings, "photos_dir", str))
         self._embeddings_path = resolve_path(require(recognizer_settings, "embeddings_file", str))
         self._match_threshold = float(require(recognizer_settings, "match_threshold", (int, float)))
+        self._detector_settings = section(config, "detector")
+        self.open_every_n_frames: int = require(self._detector_settings, "open_every_n_frames", int)
+        if self.open_every_n_frames < 1:
+            raise ConfigError("detector.open_every_n_frames must be 1 or more")
+        memory_settings = section(config, "memory")
+        memory_file = require(memory_settings, "file", (str, type(None)))     # empty: no memory
+        keep_days = float(require(memory_settings, "keep_days", (int, float)))
+        min_seconds = float(require(memory_settings, "min_seconds", (int, float)))
+        keep_pictures = require(memory_settings, "pictures", bool)
 
         self._notes: list[str] = []
         self._recognition_off = RECOGNITION_OFF
@@ -232,6 +339,10 @@ class Pipeline:
         # A detector that cannot load is a real failure: its error is not caught here.
         self._detector = detector if detector is not None else Detector(section(config, "detector"))
         self._recognizer = recognizer if recognizer is not None else self._build_recognizer(recognizer_settings)
+        # The open detector is only built on the first search (see _open_detector_ready).
+        self._open_detector = open_detector
+        self._sightings = (sightings if sightings is not None
+                           else self._build_sightings(memory_file, keep_days, min_seconds))
         for note in self._notes:
             log.warning("%s", note)
 
@@ -248,6 +359,10 @@ class Pipeline:
         self._loop_running = False             # the loop thread runs (it ends after too many failures)
 
         self._epoch = 0                        # goes up whenever track numbers start again
+        # For the memory's keys, the two kinds of track numbers are counted apart, so a new
+        # search does not split an everyday object that stayed in view into two sightings.
+        self._everyday_epoch = 0               # the everyday tracks started again (new camera or frame size)
+        self._named_epoch = 0                  # the named tracks started again (also: new names)
         self._picture: PhonePicture | None = None   # None: not a phone, or it did not say
         self._picture_round = 0                # goes up for every new phone or choice; the newest wins
         self._stream_size: Size | None = None  # what the phone sent when its stream was last opened
@@ -257,6 +372,10 @@ class Pipeline:
         self._photos: PhotoSession | None = None    # the newest photo session, under self._lock
         self._enrol_lock = threading.Lock()    # one enrolment at a time
         self._faces_changed = threading.Event()     # set after enrolling: the loop forgets the faces it keeps
+
+        self._search = Search()                # the newest search, under self._lock
+        self._found: tuple[Detection, ...] = ()     # the named finds of the last frame shown, under self._lock
+        self._open_lock = threading.Lock()     # held by whoever uses the open detector (see the module docstring)
 
         self._switch_lock = threading.Lock()   # one use_phone() at a time
         self._phone_locks: dict[str, threading.Lock] = {}   # one talk with each phone at a time
@@ -268,6 +387,12 @@ class Pipeline:
         self._last_drawn: np.ndarray | None = None
         self._lost_line: str | None = None     # the line already drawn on the last frame, if any
         self._frame_size: tuple[int, int] | None = None   # (width, height) of the last frame worked on
+        self._named = NamedFinds()             # the named finds kept on screen between runs
+        self._named_tick = 0                   # ready frames of this search round so far
+        self._open_tracks_stale = False        # the open detector must start its tracks again first
+        self._pictures = PictureTimer(min_seconds) if keep_pictures else None
+        self._memory_shared_at = float("-inf")  # when the memory's summary last went into the WorldState
+        self._memory_failed = False            # a memory error was logged already
 
     # ---- public ------------------------------------------------------------
 
@@ -378,10 +503,12 @@ class Pipeline:
             phone_url = self._phone_url
             switched_at = self._switched_at        # 0.0 until the first switch
             picture, choice = self._picture, self._picture_choice
+            search, found = self._search, self._found
         # While the stream is down nothing new is seen, so old sightings are left out,
         # and so is everything seen by the camera used before the last switch.
         seen_at = snapshot.detections_at
         fresh = seen_at > switched_at and time.monotonic() - seen_at <= STALE_SECONDS
+        found = found if fresh else ()
         return {
             "source": source.source,
             "connected": bool(source.connected) and error is None,   # a stopped loop is not live
@@ -393,10 +520,35 @@ class Pipeline:
             "recognition": self._recognizer is not None,
             "notes": list(self._notes),
             "people": self._people(snapshot) if fresh else [],
-            "objects": objects_in_view(snapshot, self._person_card) if fresh else [],
+            "objects": objects_in_view(snapshot, self._person_card, found) if fresh else [],
             "reactions": [{"kind": r.kind, "text": r.text} for r in on_screen] if fresh else [],
             "error": error,
+            "search": search_status(search, found, snapshot.frame_size[0]),
         }
+
+    def search(self, names: Sequence[str]) -> None:
+        """Look for these things by name from now on; [] stops looking.
+
+        1 to 6 names, each 1 to 40 letters, digits, spaces, hyphens or
+        apostrophes; the same name twice (in any case) counts once. Anything
+        else raises ValueError with a plain message. Returns at once: loading
+        the open detector and setting the names happen in a thread of its own
+        (status()["search"]["state"] says how far it is), and a newer search
+        replaces an older one that has not finished.
+        """
+        wanted = clean_names(names)
+        with self._lock:
+            work = self._search.round + 1
+            self._search = Search(wanted, "loading" if wanted else "off", "", work)
+            self._found = ()
+        log.info("Looking for %d thing(s)", len(wanted))     # the names themselves stay off the log
+        if wanted:
+            threading.Thread(target=self._prepare_search, args=(wanted, work),
+                             name="open-detector", daemon=True).start()
+
+    def sightings(self) -> SightingLog | None:
+        """The camera's memory, for the web routes; None when the memory is off."""
+        return self._sightings
 
     def target(self, x: float | None = None, y: float | None = None,
                track_id: int | None = None, label: str | None = None) -> Target | None:
@@ -517,6 +669,73 @@ class Pipeline:
         elif not people:
             self._notes.append(NO_INFO_CARDS)
         return recognizer
+
+    def _build_sightings(self, file: str | None, keep_days: float, min_seconds: float) -> SightingLog | None:
+        """The camera's memory, or None when memory.file is empty or the log cannot start.
+
+        The sighting log carries on by itself when its file breaks later; this
+        only covers a log that cannot even be made. The video runs either way.
+        """
+        if not file:
+            return None
+        try:
+            from car_vision.memory import SightingLog     # standard library only: cheap to import
+            return SightingLog(resolve_path(file), keep_days=keep_days, min_seconds=min_seconds)
+        except Exception as error:          # a locked or broken file must not stop the video
+            log.warning("The camera's memory is off: %s", first_line(error))
+            self._notes.append(f"The camera's memory is off: {first_line(error)}")
+            return None
+
+    # ---- looking for things by name (a thread of its own) ----------------------
+    #
+    # Each search() starts a new round. Its thread waits for the open detector
+    # (self._open_lock), checks that its round is still the newest before each
+    # slow step, and gives up as soon as it is not. Only the newest round may
+    # mark the search ready or failed.
+
+    def _prepare_search(self, names: tuple[str, ...], work: int) -> None:
+        """Load the open detector if needed and give it the names; then the search is ready."""
+        with self._open_lock:
+            if not self._is_newest_search(work):
+                return
+            try:
+                detector = self._open_detector_ready()
+                if not self._is_newest_search(work):
+                    return
+                before = tuple(detector.names)
+                detector.set_names(list(names))
+                changed = tuple(detector.names) != before
+            except Exception as error:      # no internet on the first use, a broken model, ...
+                log.warning("Looking for things failed (%s: %s)", type(error).__name__, first_line(error))
+                self._search_failed(work, first_line(error))
+                return
+            with self._lock:
+                if changed:
+                    self._epoch += 1        # its track numbers started again
+                    self._named_epoch += 1  # ... only the named ones
+                if self._search.round == work:
+                    self._search = replace(self._search, state="ready")
+        log.info("Looking for things: ready")
+
+    def _open_detector_ready(self) -> Any:
+        """The open detector, built and loaded. Call with self._open_lock held: it is slow the first time."""
+        if self._open_detector is None:
+            from car_vision.detector import OpenDetector     # built on the first search, never at start-up
+            self._open_detector = OpenDetector(self._detector_settings)
+        if not self._open_detector.loaded:
+            self._open_detector.load()
+        return self._open_detector
+
+    def _is_newest_search(self, work: int) -> bool:
+        with self._lock:
+            return self._search.round == work
+
+    def _search_failed(self, work: int, note: str) -> None:
+        """Mark the search as failed with this plain reason, if it is still the newest round."""
+        with self._lock:
+            if self._search.round == work:
+                self._search = replace(self._search, state="failed", note=note)
+                self._found = ()
 
     # ---- the phone's picture size (a short thread of its own) ------------------
     #
@@ -819,7 +1038,9 @@ class Pipeline:
         self._stream_size = None                # the new stream's size is learned from the new phone
         self._forget_asks()
         self._epoch += 1                        # track numbers of the new camera start again
+        self._everyday_epoch += 1
         self._view = None
+        self._found = ()
         self._error = None
         self._on_screen = []
         frame_size = self._state.snapshot().frame_size
@@ -831,8 +1052,9 @@ class Pipeline:
         last_sequence = 0
         while not self._stop.is_set():
             self._end_photos_if_late(time.monotonic())   # also while no frames come
-            with self._lock:                    # the source and its generation, read together
-                source, current = self._source, self._generation
+            self._share_memory_if_due(time.monotonic())  # so are the memory's "3 minutes ago"
+            with self._lock:                    # the source, its generation and the search, read together
+                source, current, search = self._source, self._generation, self._search
             if current != generation:
                 switched = generation is not None
                 generation, last_sequence = current, 0
@@ -845,7 +1067,7 @@ class Pipeline:
                 continue
             last_sequence = sequence
             try:
-                self._process(frame, generation)
+                self._process(frame, generation, search)
             except Exception as error:      # one bad frame must not end the demo
                 if self._too_many_failures(error, generation):
                     return
@@ -866,13 +1088,15 @@ class Pipeline:
         self._fps = FpsCounter()
         self._lost_line = None
         self._frame_size = None
+        self._forget_named_finds()
         if switched and self._last_drawn is not None:
             self._last_drawn = np.full_like(self._last_drawn, DARK_LEVEL)
             self._show_stream_lost(source)          # no frame yet, so: "Connecting to the phone ..."
 
-    def _process(self, frame: np.ndarray, generation: int) -> None:
+    def _process(self, frame: np.ndarray, generation: int, search: Search) -> None:
         """See, decide and show for one frame. Nothing is written until the models are done,
-        and nothing at all when the camera was switched while the models worked."""
+        and nothing at all when the camera was switched while the models worked, or when
+        the names searched for changed while this frame's named finds were worked out."""
         now = time.monotonic()
         index = self._frames
         self._frames += 1
@@ -883,28 +1107,36 @@ class Pipeline:
             self._faces_changed.clear()
             self._memory = FaceMemory()
         detections = self._detector.detect(frame)
+        # The faces are matched to the everyday person boxes, as before.
         if self._recognizer is not None and (index % self.every_n_frames == 0 or resized or enrolled_again):
             check = self._recognizer.check_faces(frame, detections)
             self._memory.remember(check.faces, detections, now)
             self._take_photo_if_ready(frame, check.boxes, now, generation)
         faces = self._memory.current(detections, now)
+        shown, named = self._add_named_finds(frame, detections, search, now)
 
         # The boxes are drawn on a copy: the camera's own frame goes into the view untouched.
         drawn = frame.copy()
-        draw.draw_detections(drawn, detections)
+        draw.draw_detections(drawn, shown, wanted=[d.track_id for d in named if d.track_id is not None])
         draw.draw_faces(drawn, faces)
         jpeg = self._encode(drawn)
         height, width = frame.shape[:2]
         with self._lock:                        # state, picture, view and reactions change together
             if self._generation != generation:
                 return                          # this frame came from the camera used before the switch
-            self._state.update_detections(detections, (width, height), now)
+            if named and self._search.round != search.round:
+                return                          # these finds belong to names the visitor replaced meanwhile
+            self._state.update_detections(shown, (width, height), now)
             self._state.update_faces(faces, now)
             on_screen = self._reactions.update(self._state.snapshot(), now)
             self._jpeg = jpeg
-            self._view = View(frame, tuple(detections), tuple(faces), self._epoch)
+            epoch = self._epoch
+            memory_epochs = (self._everyday_epoch, self._named_epoch)
+            self._view = View(frame, tuple(shown), tuple(faces), epoch)
+            self._found = named
             self._on_screen = list(on_screen)
             phone_not_heard = self._picture is None
+        self._remember(frame, shown, faces, named, memory_epochs)
         self._last_drawn = drawn
         came_back = self._lost_line is not None and index > 0    # this camera had dropped out and returned
         self._lost_line = None
@@ -940,9 +1172,120 @@ class Pipeline:
         self._frame_size = (width, height)
         if resized:
             self._memory = FaceMemory()
+            self._forget_named_finds()              # their boxes are in the old size's pixels too
             with self._lock:
                 self._epoch += 1
+                self._everyday_epoch += 1
         return resized
+
+    # ---- the named finds (the loop thread) -------------------------------------
+
+    def _add_named_finds(self, frame: np.ndarray, detections: list[Detection], search: Search,
+                         now: float) -> tuple[list[Detection], tuple[Detection, ...]]:
+        """The frame's detections with the named finds added, and the named finds alone.
+
+        With no search on, the detections themselves and no finds: nothing is copied.
+        """
+        if not search.names:
+            if self._named.finds:
+                self._named = NamedFinds()
+            return detections, ()
+        if self._named.search_round != search.round:
+            self._named_tick = 0                    # a new search runs on its first ready frame
+        fresh = self._detect_named(frame, search)
+        shown, self._named = merge_named(detections, self._named, fresh, search.round, now)
+        return shown, self._named.detections
+
+    def _detect_named(self, frame: np.ndarray, search: Search) -> list[Detection] | None:
+        """What the open detector finds on this frame; None when it is not due or is busy.
+
+        Runs on every open_every_n_frames-th ready frame. When the background
+        thread holds the open detector (loading it or setting names), the loop
+        does not wait: it skips, and tries again on the next frame.
+        """
+        if search.state != "ready":
+            return None
+        if self._named_tick % self.open_every_n_frames != 0:
+            self._named_tick += 1
+            return None
+        if not self._open_lock.acquire(blocking=False):
+            return None
+        try:
+            if self._open_tracks_stale:             # a new camera or frame size: track numbers start again
+                self._open_detector.reset_tracks()
+                self._open_tracks_stale = False
+            found = self._open_detector.detect(frame)
+        except Exception as error:                  # a broken search must not stop the video
+            log.warning("Looking for things failed on a frame (%s: %s)", type(error).__name__, first_line(error))
+            self._search_failed(search.round, first_line(error))
+            return None
+        finally:
+            self._open_lock.release()
+        self._named_tick += 1
+        return found
+
+    def _forget_named_finds(self) -> None:
+        """A new camera or frame size: the finds kept on screen and the open detector's tracks are old."""
+        self._named = NamedFinds()
+        self._named_tick = 0
+        self._open_tracks_stale = True
+
+    # ---- the memory (the loop thread) --------------------------------------------
+
+    def _remember(self, frame: np.ndarray, detections: Sequence[Detection],
+                  faces: Sequence[RecognizedFace], named: Sequence[Detection],
+                  epochs: tuple[int, int]) -> None:
+        """Tell the sighting log about every tracked detection of this frame.
+
+        `named` are the named finds among the detections; `epochs` is
+        (everyday epoch, named epoch). See memory_key for why they are kept apart.
+        A memory error is logged once and the video goes on.
+        """
+        sightings = self._sightings
+        if sightings is None or not detections:
+            return
+        wall_clock, now = time.time(), time.monotonic()
+        width = frame.shape[1]
+        try:
+            owners = face_owners(detections, faces)
+            for index, detection in enumerate(detections):
+                if detection.track_id is None:
+                    continue                        # untracked: it cannot be followed, so not remembered
+                key = memory_key(detection, any(detection is find for find in named), *epochs)
+                person = detection.label == "person"
+                face = owners.get(index)
+                sightings.seen(key, "person" if person else "object", detection.label,
+                               self._person_card(face).name if face is not None else None,
+                               place_of(detection.box, width), float(detection.confidence), wall_clock,
+                               None if person else self._picture_for(key, detection.box, frame, now))
+            if self._pictures is not None:
+                self._pictures.forget_old(now)
+        except Exception:
+            self._memory_error("Telling the memory what was seen failed")
+
+    def _picture_for(self, key: Hashable, box: Box, frame: np.ndarray, now: float) -> bytes | None:
+        """A small JPEG of the thing for the sighting log, when one is due (see PictureTimer); else None."""
+        if self._pictures is None or box_area(box) == 0 or not self._pictures.due(key, now):
+            return None
+        return self._encode(shrunk(cut_out(frame, box), PICTURE_MAX_SIDE))
+
+    def _share_memory_if_due(self, now: float) -> None:
+        """Every MEMORY_SHARE_SECONDS: put the memory's summary into the WorldState for the assistant."""
+        if self._sightings is None or now - self._memory_shared_at < MEMORY_SHARE_SECONDS:
+            return
+        self._memory_shared_at = now
+        try:
+            self._state.set_memory(self._sightings.summary(time.time()))
+        except Exception:
+            self._memory_error("Sharing the memory's summary failed")
+
+    def _memory_error(self, what: str) -> None:
+        """Log a memory problem in full the first time, then only briefly."""
+        if self._memory_failed:
+            log.debug("%s again", what)
+            return
+        self._memory_failed = True
+        log.exception("%s; the video goes on", what)
 
     def _too_many_failures(self, error: Exception, generation: int) -> bool:
         """Log a skipped frame. True when too many failed in a row and the loop must stop."""
@@ -1110,11 +1453,23 @@ CardOf = Callable[[RecognizedFace], Person]     # the person a known face belong
 # ---- the objects list on the page --------------------------------------------------
 
 
-def objects_in_view(snapshot: WorldSnapshot, card_of: CardOf) -> list[dict[str, Any]]:
-    """One entry per detection: people first, then by label, then by track number."""
+def objects_in_view(snapshot: WorldSnapshot, card_of: CardOf,
+                    found: Sequence[Detection] = ()) -> list[dict[str, Any]]:
+    """One entry per detection: people first, then by label, then by track number.
+
+    The entries of the detections in `found` (the named search's finds) also
+    get "found": true.
+    """
     owners = face_owners(snapshot.detections, snapshot.faces)
     order = sorted(range(len(snapshot.detections)), key=lambda i: list_order(snapshot.detections[i]))
-    return [object_entry(snapshot.detections[i], owners.get(i), snapshot.frame_size, card_of) for i in order]
+    entries = []
+    for i in order:
+        detection = snapshot.detections[i]
+        entry = object_entry(detection, owners.get(i), snapshot.frame_size, card_of)
+        if any(detection is find for find in found):
+            entry["found"] = True
+        entries.append(entry)
+    return entries
 
 
 def list_order(detection: Detection) -> tuple[bool, str, bool, int]:
@@ -1145,6 +1500,139 @@ def box_fractions(box: Box, size: tuple[int, int]) -> list[float]:
     x1, y1, x2, y2 = box
     return [round(min(max(value / whole, 0.0), 1.0), 3)
             for value, whole in ((x1, width), (y1, height), (x2, width), (y2, height))]
+
+
+# ---- looking for things by name --------------------------------------------------------
+
+
+def clean_names(names: Sequence[str]) -> tuple[str, ...]:
+    """The names to look for, trimmed, with repeats dropped (in any case); () stops looking.
+
+    Raises ValueError with a plain message for anything but a list of 1 to 6
+    names, each 1 to 40 letters (any script), digits, spaces, hyphens or apostrophes.
+    """
+    if isinstance(names, str) or not isinstance(names, Sequence):
+        raise ValueError("Give the names as a list, like [\"power bank\", \"keys\"].")
+    kept: list[str] = []
+    for name in names:
+        name = clean_name(name)
+        if all(name.casefold() != other.casefold() for other in kept):
+            kept.append(name)
+    if len(kept) > MOST_NAMES:
+        raise ValueError(f"Look for at most {MOST_NAMES} things at once.")
+    return tuple(kept)
+
+
+def clean_name(name: Any) -> str:
+    """One name, trimmed and with single spaces. ValueError when it breaks a rule."""
+    if not isinstance(name, str):
+        raise ValueError("Each name must be text.")
+    name = re.sub(" +", " ", name.strip())
+    if not 1 <= len(name) <= LONGEST_NAME:
+        raise ValueError(f"Each name must be 1 to {LONGEST_NAME} characters long.")
+    if not all(allowed_in_name(letter) for letter in name):
+        raise ValueError("A name may only have letters, digits, spaces, hyphens and apostrophes.")
+    return name
+
+
+def allowed_in_name(letter: str) -> bool:
+    """Letters and their accents in any script, digits, and the few marks in NAME_MARKS."""
+    kind = unicodedata.category(letter)
+    return kind[0] in "LM" or kind == "Nd" or letter in NAME_MARKS
+
+
+def merge_named(everyday: Sequence[Detection], kept: NamedFinds, fresh: Sequence[Detection] | None,
+                search_round: int, now: float) -> tuple[list[Detection], NamedFinds]:
+    """Add the named finds to the frame's everyday detections. What it returns is what
+    the whole page sees: the list, the clicks, the photos, the assistant and the memory.
+
+    `fresh` is what the open detector found on this frame, or None when it did
+    not run. The rules:
+    - named track numbers are kept apart from the everyday ones (NAMED_ID_OFFSET is added);
+    - a find stays on screen until it has not been seen for NAMED_HOLD_SECONDS;
+    - nothing is kept from another search round (other names);
+    - a find replaces an everyday box it overlaps by more than REPLACE_OVERLAP.
+
+    Returns the detections to show and the finds to keep for the next frame.
+    """
+    finds = kept.finds if kept.search_round == search_round else ()
+    if fresh is not None:
+        finds = renewed_finds(finds, [named_apart(detection) for detection in fresh], now)
+    finds = tuple((detection, seen_at) for detection, seen_at in finds if now - seen_at <= NAMED_HOLD_SECONDS)
+    named = [detection for detection, _seen_at in finds]
+    shown = [detection for detection in everyday
+             if all(overlap(detection.box, find.box) <= REPLACE_OVERLAP for find in named)]
+    return shown + named, NamedFinds(search_round, finds)
+
+
+def renewed_finds(earlier: Sequence[tuple[Detection, float]], fresh: Sequence[Detection],
+                  now: float) -> tuple[tuple[Detection, float], ...]:
+    """The finds after a run: all fresh ones, plus the earlier tracked ones it missed this time.
+
+    An earlier find is dropped when its track was found again, when it has no
+    track number (it cannot be told apart from a fresh one), or when a fresh
+    find covers it (its track got a new number).
+    """
+    fresh_tracks = {detection.track_id for detection in fresh}
+    missed = tuple((detection, seen_at) for detection, seen_at in earlier
+                   if detection.track_id is not None and detection.track_id not in fresh_tracks
+                   and all(overlap(detection.box, find.box) <= REPLACE_OVERLAP for find in fresh))
+    return tuple((detection, now) for detection in fresh) + missed
+
+
+def named_apart(detection: Detection) -> Detection:
+    """A named find with NAMED_ID_OFFSET added to its track number, so it never meets an everyday one."""
+    if detection.track_id is None:
+        return detection
+    return replace(detection, track_id=detection.track_id + NAMED_ID_OFFSET)
+
+
+def memory_key(detection: Detection, is_named: bool, everyday_epoch: int, named_epoch: int) -> tuple:
+    """The sighting log's key for a tracked detection: it changes exactly when its track restarts.
+
+    Everyday tracks start again only with a new camera or frame size; named
+    tracks also start again when the names change. So an everyday object that
+    stays in view keeps its key however often the visitor searches:
+    (everyday epoch, track number, label), and for a named find
+    (everyday epoch, named epoch, track number, label).
+    """
+    if is_named:
+        return everyday_epoch, named_epoch, detection.track_id, detection.label
+    return everyday_epoch, detection.track_id, detection.label
+
+
+def overlap(a: Box, b: Box) -> float:
+    """Intersection over union of two boxes: 0.0 apart, 1.0 the same box."""
+    inside = box_area((max(a[0], b[0]), max(a[1], b[1]), min(a[2], b[2]), min(a[3], b[3])))
+    union = box_area(a) + box_area(b) - inside
+    return inside / union if union > 0 else 0.0
+
+
+def place_of(box: Box, width: int) -> str:
+    """Which third of the picture the box centre is in: "left", "middle" or "right"."""
+    if width <= 0:
+        return "middle"
+    third = min(int(3 * centre(box)[0] / width), 2)
+    return PLACES[max(third, 0)]
+
+
+def search_status(search: Search, found: Sequence[Detection], width: int) -> dict[str, Any]:
+    """status()["search"]: the names, the state, and which names are in view and where.
+
+    found/missing are only filled in while the search is ready. For several
+    finds of one name the place is that of the most confident one.
+    """
+    in_view, missing = [], []
+    if search.state == "ready":
+        for name in search.names:
+            mine = [find for find in found if find.label.casefold() == name.casefold()]
+            if not mine:
+                missing.append(name)
+                continue
+            best = max(mine, key=lambda find: find.confidence)
+            in_view.append({"name": name, "count": len(mine), "place": place_of(best.box, width)})
+    return {"names": list(search.names), "state": search.state, "note": search.note,
+            "found": in_view, "missing": missing}
 
 
 # ---- what a click points at ----------------------------------------------------------

@@ -453,10 +453,10 @@ def test_the_page_has_no_notes_editor(page):
                  "notesResult", "notesPlaceholder", "loadNotes", "/api/notes", "notes-card", "notes-warning",
                  "[REPLACE]"):
         assert gone not in page, gone
-    # The People section is the last one before the footer, and its link stays.
+    # After People comes only the Timeline (added later), then the footer; the People link stays.
     assert '<a href="#people" id="peopleLink">People</a>' in page
     tail = page[page.index('<section class="section" id="people"'):page.index('<footer class="footer">')]
-    assert "<section" not in tail[1:]
+    assert re.findall(r'<section[^>]*\bid="([a-z]+)"', tail) == ["people", "timeline"]
     # The "Note:" lines under the video (the status notes) stay.
     assert '<span class="notes" id="notes"></span>' in page
 
@@ -485,7 +485,7 @@ def test_the_new_sections_are_outside_the_stage_so_the_full_view_makes_them_iner
 
 def test_the_navigation_bar_links_the_sections_and_folds_its_links_when_narrow(page):
     links = page[page.index('<nav class="nav-links"'):page.index("</nav>")]
-    assert re.findall(r'href="(#[a-z]+)"', links) == ["#watch", "#ask", "#people"]
+    assert re.findall(r'href="(#[a-z]+)"', links) == ["#watch", "#ask", "#people", "#timeline"]
     match = re.search(r"@media \(max-width: (\d+)\.98px\) \{\s*\.nav-links \{ display: none; \}", page)
     assert match, "the links fold below some width"
 

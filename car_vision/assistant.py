@@ -4,7 +4,8 @@ Every question becomes one Messages API call to Claude. The whole notes file
 and what the team wrote about each person (data/people/<id>/about.md) sit in
 the system prompt, which stays the same until `Assistant.reload` reads the
 files again, so it is cached. Who the camera recognises right now, and which
-objects the detector reports, are added as lines in front of the question.
+objects the detector reports, are added as lines in front of the question,
+followed by what the camera remembers seeing, when the state holds memory lines.
 When the notes do not cover a question, Claude may use Anthropic's web search
 tool, which runs on Anthropic's servers.
 
@@ -242,6 +243,9 @@ notes nor a search gives the answer, say that you do not know.
 - Each message may begin with lines from the camera: who the face recognizer \
 recognises right now, and which objects the object detector reports. These lines \
 come from the camera, not from the visitor.
+- The lines under "What the camera remembers" come from the camera's own log: use \
+them to answer questions about what was seen and when, and treat anything not in \
+them as not recorded.
 - When the camera line names a person, use that person's entry under <people> to \
 answer questions such as "who is this?". Never guess who someone is from a picture.
 - Keep answers to two or three sentences unless the visitor asks for more.
@@ -324,6 +328,21 @@ def people_line(names: list[str]) -> str:
     if not names:
         return "Nobody recognised is in front of the camera right now."
     return f"In front of the camera right now: {', '.join(names)}."
+
+
+MEMORY_HEADING = "What the camera remembers (newest first):"
+MAX_MEMORY_LINES = 30
+
+
+def memory_lines(state: WorldState) -> list[str]:
+    """The camera's memory lines, newest first, at most MAX_MEMORY_LINES.
+
+    Empty when the state holds no memory (or has no memory to give).
+    """
+    read_memory = getattr(state, "memory", None)
+    if read_memory is None:
+        return []
+    return list(read_memory())[:MAX_MEMORY_LINES]
 
 
 def labels_in_view(state: WorldState, max_age_seconds: float) -> list[str]:
@@ -659,7 +678,8 @@ class Assistant:
             # of cutting old turns out (that would change earlier turns).
             fresh = self._exchanges >= self.history_turns
             earlier = [] if fresh else self._history
-            turns = earlier + [{"role": "user", "content": self._user_content(text)}]
+            content = self._user_content(text, with_memory=True)
+            turns = earlier + [{"role": "user", "content": content}]
             reply = self._client.complete(self._system, turns, self.web_search)
             # Only a finished answer is kept; a failed question leaves the history as it was.
             self._history = turns + list(reply.new_turns)
@@ -747,14 +767,18 @@ class Assistant:
         if not self._lock.acquire(timeout=LOCK_WAIT_SECONDS):
             raise AssistantError(BUSY_MESSAGE)
 
-    def _user_content(self, question: str) -> str:
-        """The question after the camera lines: who is recognised, then which objects."""
+    def _user_content(self, question: str, with_memory: bool = False) -> str:
+        """The question after the camera lines: who is recognised, which objects,
+        then (for the chat only) what the camera remembers."""
         if self._state is None:
             return question
         lines = [people_line(self._state.current_people(self.seen_within_seconds))]
         labels = labels_in_view(self._state, self.seen_within_seconds)
         if labels:
             lines.append(objects_line(labels))
+        remembered = memory_lines(self._state) if with_memory else []
+        if remembered:
+            lines += [MEMORY_HEADING] + remembered
         return "\n".join(lines + [question])
 
 

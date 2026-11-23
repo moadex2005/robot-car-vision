@@ -9,6 +9,7 @@ import logging
 import sys
 import threading
 import time
+from dataclasses import replace
 from pathlib import Path
 
 import cv2
@@ -36,12 +37,15 @@ CONFIG = {
                "file_path": "data/does-not-exist/clip.mp4", "width": 640, "height": 480,
                "reconnect_seconds": 0.01, "loop_file": True},
     "detector": {"model": "fake.pt", "models_dir": "models", "confidence": 0.4, "image_size": 640,
-                 "device": "cpu", "tracker": "bytetrack.yaml"},
+                 "device": "cpu", "tracker": "bytetrack.yaml",
+                 "open_model": "fake-open.pt", "open_confidence": 0.25, "open_every_n_frames": 3},
     "recognizer": {"model_pack": "buffalo_l", "models_dir": "models", "detection_size": 640,
                    "device": "cpu", "match_threshold": 0.42, "every_n_frames": 3, "min_face_pixels": 40,
                    "people_file": "data/does-not-exist/people.json",
                    "photos_dir": "data/does-not-exist/people",
                    "embeddings_file": "data/does-not-exist/embeddings.npz"},
+    # No memory file: the tests that need the memory hand in a fake or a file in tmp_path.
+    "memory": {"file": None, "keep_days": 7, "min_seconds": 1.0, "pictures": True},
     "reactions": {"greet_cooldown_seconds": 60, "message_seconds": 4.0},
     "app": {"host": "127.0.0.1", "port": 5000, "jpeg_quality": 80, "log_file": "logs/test.log"},
 }
@@ -2163,3 +2167,944 @@ def test_scene_photo_is_the_clean_frame_and_none_while_the_view_is_cleared(make)
 def test_scene_photo_refuses_a_wrong_size(make, max_side):
     with pytest.raises(ValueError):
         make().scene_photo(max_side)
+
+
+# ---- looking for things by name (M13) ------------------------------------------------------
+#
+# A fake open detector stands in for detector.OpenDetector, so no model, network or graphics
+# card is needed. It notes every call and whether two calls ever overlapped.
+
+KEYS = Detection("keys", 0.7, (20, 300, 60, 340), 7)                    # on the left
+ROUTERS = [Detection("wifi router", 0.5, (500, 20, 560, 60), 3),         # on the right ...
+           Detection("wifi router", 0.8, (300, 20, 340, 60), 4)]         # ... and, more sure, in the middle
+OFFSET = pipeline_module.NAMED_ID_OFFSET
+
+
+class FakeOpenDetector:
+    """Shaped like detector.OpenDetector: finds those of `finds` whose label is one of its names.
+
+    `load_gate` / `names_gate` hold load() / set_names() until they are set. `load_error`
+    and `detect_error` are raised by those calls.
+    """
+
+    def __init__(self, finds=(KEYS, *ROUTERS), load_gate=None, names_gate=None,
+                 load_error=None, detect_error=None):
+        self.finds = list(finds)
+        self.load_gate, self.names_gate = load_gate, names_gate
+        self.load_error, self.detect_error = load_error, detect_error
+        self._loaded = False
+        self._names = ()
+        self.calls = []
+        self.overlaps = []                  # calls made while another call was still running
+        self._busy = threading.Lock()
+        self.inside = threading.Event()     # set while load() or set_names() waits on its gate
+
+    @property
+    def loaded(self):
+        return self._loaded
+
+    @property
+    def names(self):
+        return self._names
+
+    def _enter(self, what):
+        if not self._busy.acquire(blocking=False):
+            self.overlaps.append(what)
+            return False
+        self.calls.append(what)
+        return True
+
+    def _leave(self, entered):
+        if entered:
+            self._busy.release()
+
+    def load(self):
+        entered = self._enter("load")
+        try:
+            if self.load_gate is not None:
+                self.inside.set()
+                assert self.load_gate.wait(5)
+            if self.load_error is not None:
+                raise self.load_error
+            self._loaded = True
+        finally:
+            self._leave(entered)
+
+    def set_names(self, names):
+        entered = self._enter(("set_names", tuple(names)))
+        try:
+            if self.names_gate is not None:
+                self.inside.set()
+                assert self.names_gate.wait(5)
+            self._names = tuple(names)
+        finally:
+            self._leave(entered)
+
+    def detect(self, frame):
+        entered = self._enter("detect")
+        try:
+            if self.detect_error is not None:
+                raise self.detect_error
+            return [find for find in self.finds if find.label in self._names]
+        finally:
+            self._leave(entered)
+
+    def reset_tracks(self):
+        self._leave(self._enter("reset_tracks"))
+
+    def count(self, what):
+        return self.calls.count(what)
+
+
+def search_of(pipeline):
+    return pipeline.status()["search"]
+
+
+def ready(pipeline):
+    return lambda: search_of(pipeline)["state"] == "ready"
+
+
+def searching(make, names=("keys", "wifi router"), open_detector=None, frames=10_000, **kwargs):
+    """A running pipeline whose search for `names` was ready before the first frame."""
+    open_detector = open_detector if open_detector is not None else FakeOpenDetector()
+    pipeline = make(source=kwargs.pop("source", None) or FakeSource(frames=frames),
+                    open_detector=open_detector, **kwargs)
+    pipeline.search(list(names))
+    assert wait_until(ready(pipeline))
+    pipeline.start()
+    return pipeline, open_detector
+
+
+def relabelled(detection, label):
+    return Detection(label, detection.confidence, detection.box, detection.track_id)
+
+
+NO_TARGET = pipeline_module.Target("area", "", 0.0, None, b"", epoch=-1)
+
+
+# ---- the name rules ---------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("names, cleaned", [
+    (["power bank"], ("power bank",)),
+    (["  Power   Bank  ", "keys"], ("Power Bank", "keys")),          # trimmed, single spaces
+    (["Keys", "keys", "KEYS"], ("Keys",)),                            # case does not matter; the first stays
+    (["wi-fi router", "O'Brien's mug", "Sara’s phone"], ("wi-fi router", "O'Brien's mug", "Sara’s phone")),
+    (["مفاتيح", "चाबी", "clé", "USB 3"], ("مفاتيح", "चाबी", "clé", "USB 3")),   # any script, digits
+    (["a" * 40], ("a" * 40,)),
+    (["a", "b", "c", "d", "e", "f"], ("a", "b", "c", "d", "e", "f")),
+    (["a", "b", "c", "d", "e", "f", "F"], ("a", "b", "c", "d", "e", "f")),      # 7 with a repeat is 6
+    ([], ()),                                                         # stops looking
+    (("keys",), ("keys",)),                                           # any sequence of text
+])
+def test_clean_names_keeps_good_names(names, cleaned):
+    assert pipeline_module.clean_names(names) == cleaned
+
+
+@pytest.mark.parametrize("names, words", [
+    (["a", "b", "c", "d", "e", "f", "g"], "at most 6"),
+    ([""], "1 to 40"),
+    (["   "], "1 to 40"),
+    (["a" * 41], "1 to 40"),
+    (["keys!"], "letters, digits"),
+    (["keys; drop"], "letters, digits"),
+    (["<script>"], "letters, digits"),
+    (["tab\there"], "letters, digits"),
+    (["new\nline"], "letters, digits"),
+    (["½ cup"], "letters, digits"),                                  # a number, but not a digit
+    (["keys", 5], "text"),
+    ([None], "text"),
+    ("keys", "list"),                                                 # a bare string is not a list of names
+    (None, "list"),
+    ({"names": ["keys"]}, "list"),
+])
+def test_clean_names_refuses_bad_names_plainly(names, words):
+    with pytest.raises(ValueError, match=words):
+        pipeline_module.clean_names(names)
+
+
+def test_search_refuses_bad_names_and_changes_nothing(make):
+    open_detector = FakeOpenDetector()
+    pipeline = make(open_detector=open_detector)
+    with pytest.raises(ValueError):
+        pipeline.search(["keys?"])
+    assert search_of(pipeline)["state"] == "off"
+    time.sleep(0.05)
+    assert open_detector.calls == []
+
+
+# ---- the search states ------------------------------------------------------------------
+
+
+def test_status_search_is_off_before_any_search_and_json_ready(make):
+    status = make().status()
+    assert status["search"] == {"names": [], "state": "off", "note": "", "found": [], "missing": []}
+    json.dumps(status)
+
+
+def test_search_returns_at_once_then_loads_in_the_background(make):
+    gate = threading.Event()
+    open_detector = FakeOpenDetector(load_gate=gate)
+    pipeline = make(open_detector=open_detector)
+    began = time.monotonic()
+    pipeline.search(["keys"])
+    assert time.monotonic() - began < 0.2
+    assert open_detector.inside.wait(2)                     # load() is under way ...
+    assert search_of(pipeline) == {"names": ["keys"], "state": "loading", "note": "", "found": [], "missing": []}
+    gate.set()                                              # ... and done
+    assert wait_until(ready(pipeline))
+    assert open_detector.calls == ["load", ("set_names", ("keys",))]
+
+
+def test_a_loaded_open_detector_is_not_loaded_again(make):
+    pipeline, open_detector = searching(make, names=["keys"])
+    pipeline.search(["wallet"])
+    assert wait_until(ready(pipeline))
+    assert open_detector.count("load") == 1
+    assert ("set_names", ("wallet",)) in open_detector.calls
+
+
+def test_an_empty_search_stops_looking_at_once(make):
+    pipeline, open_detector = searching(make)
+    assert wait_until(lambda: search_of(pipeline)["found"])
+    pipeline.search([])
+    assert search_of(pipeline) == {"names": [], "state": "off", "note": "", "found": [], "missing": []}
+    assert wait_until(lambda: not any(o.get("found") for o in pipeline.status()["objects"]))
+    time.sleep(0.05)                                        # a frame already under way may still run it once
+    calls = open_detector.count("detect")
+    time.sleep(0.1)
+    assert open_detector.count("detect") == calls          # the open detector is not used any more
+    assert all(o["track_id"] < OFFSET for o in pipeline.status()["objects"])
+
+
+def test_the_newest_search_wins(make):
+    gate = threading.Event()
+    open_detector = FakeOpenDetector(load_gate=gate)
+    pipeline = make(open_detector=open_detector)
+    pipeline.search(["keys"])
+    assert open_detector.inside.wait(2)                     # the first round is loading the model ...
+    pipeline.search(["wallet"])
+    pipeline.search(["wifi router", "phone"])               # ... while two newer searches come in
+    assert search_of(pipeline)["names"] == ["wifi router", "phone"]
+    assert search_of(pipeline)["state"] == "loading"
+    gate.set()
+    assert wait_until(ready(pipeline))
+    time.sleep(0.05)
+    # The older rounds gave up: only the newest names were ever set, and the model was loaded once.
+    assert open_detector.calls == ["load", ("set_names", ("wifi router", "phone"))]
+    assert search_of(pipeline)["names"] == ["wifi router", "phone"]
+    assert open_detector.overlaps == []
+
+
+def test_a_failed_load_says_why_in_the_status_and_the_video_goes_on(make):
+    message = "Could not load the open detector yoloe-26s-seg.pt; its first use needs the internet."
+    open_detector = FakeOpenDetector(load_error=RuntimeError(message + "\nmore detail"))
+    detector = FakeDetector()
+    pipeline = make(source=FakeSource(frames=10_000), detector=detector, open_detector=open_detector).start()
+    pipeline.search(["keys"])
+    assert wait_until(lambda: search_of(pipeline)["state"] == "failed")
+    assert search_of(pipeline) == {"names": ["keys"], "state": "failed", "note": message,
+                                   "found": [], "missing": []}
+    calls = detector.calls
+    assert wait_until(lambda: detector.calls > calls + 3)  # the video goes on
+    assert pipeline.status()["error"] is None
+    open_detector.load_error = None                         # e.g. the internet is back
+    pipeline.search(["keys"])
+    assert wait_until(ready(pipeline))
+    assert search_of(pipeline)["note"] == ""
+
+
+def test_an_open_detector_that_cannot_be_built_fails_the_search_only(make, monkeypatch):
+    from car_vision import detector as detector_module
+
+    def broken(settings):
+        raise ConfigError("detector.open_confidence must be above 0 and at most 1, got 5")
+
+    monkeypatch.setattr(detector_module, "OpenDetector", broken, raising=False)
+    pipeline = make()
+    pipeline.search(["keys"])
+    assert wait_until(lambda: search_of(pipeline)["state"] == "failed")
+    assert "open_confidence" in search_of(pipeline)["note"]
+
+
+def test_a_detect_that_raises_fails_the_search_but_not_the_video(make):
+    open_detector = FakeOpenDetector(detect_error=RuntimeError("CUDA out of memory"))
+    pipeline, _ = searching(make, open_detector=open_detector)
+    assert wait_until(lambda: search_of(pipeline)["state"] == "failed")
+    assert search_of(pipeline)["note"] == "CUDA out of memory"
+    time.sleep(0.1)
+    assert open_detector.count("detect") == 1               # not tried again on every frame
+    assert pipeline.status()["error"] is None and pipeline.status()["objects"]
+
+
+# ---- the loop and the open detector ------------------------------------------------------
+
+
+def test_the_loop_skips_the_named_search_while_the_background_thread_works(make):
+    gate = threading.Event()
+    open_detector = FakeOpenDetector(names_gate=gate)
+    detector = FakeDetector()
+    pipeline = make(source=FakeSource(frames=10_000), detector=detector, open_detector=open_detector).start()
+    pipeline.search(["keys"])
+    assert open_detector.inside.wait(2)                     # set_names() is under way
+    calls = detector.calls
+    assert wait_until(lambda: detector.calls > calls + 5)   # the video goes on meanwhile ...
+    assert open_detector.count("detect") == 0               # ... without the named search
+    assert search_of(pipeline)["state"] == "loading"
+    gate.set()
+    assert wait_until(lambda: open_detector.count("detect") > 0)
+    assert open_detector.overlaps == []
+
+
+def test_the_loop_never_waits_for_the_open_detector(make):
+    pipeline, open_detector = searching(make)
+    assert wait_until(lambda: open_detector.count("detect") > 0)
+    detector = pipeline._detector
+    with pipeline._open_lock:                               # as if the background thread held it
+        detects = open_detector.count("detect")
+        calls = detector.calls
+        assert wait_until(lambda: detector.calls > calls + 10)
+        assert open_detector.count("detect") == detects
+    assert wait_until(lambda: open_detector.count("detect") > detects)
+
+
+def test_the_open_detector_is_never_used_by_two_threads_at_once(make):
+    pipeline, open_detector = searching(make)
+    for names in (["wallet"], ["keys"], ["keys", "wifi router"], ["phone"], ["keys"]):
+        pipeline.search(names)
+        time.sleep(0.02)
+    assert wait_until(ready(pipeline))
+    assert wait_until(lambda: open_detector.calls[-1] == "detect")
+    assert open_detector.overlaps == []
+
+
+def test_the_named_search_runs_on_every_nth_frame(make):
+    detector = FakeDetector()
+    pipeline, open_detector = searching(make, frames=10, detector=detector)   # open_every_n_frames is 3
+    assert wait_until(lambda: detector.calls == 10)
+    time.sleep(0.05)
+    assert open_detector.count("detect") == 4               # frames 1, 4, 7 and 10
+
+
+def test_a_new_search_runs_on_its_first_ready_frame(make):
+    detector = FakeDetector(delay=0.005)
+    pipeline, open_detector = searching(make, detector=detector)
+    assert wait_until(lambda: open_detector.count("detect") >= 1)
+    pipeline.search(["wallet"])
+    assert wait_until(ready(pipeline))
+    position = len(open_detector.calls)
+    calls = detector.calls
+    assert wait_until(lambda: detector.calls >= calls + 7)
+    assert open_detector.calls[position:].count("detect") >= 2
+
+
+def test_the_finds_stay_on_screen_between_runs_and_are_highlighted(make, monkeypatch):
+    wanted_per_frame = []
+    real_draw = pipeline_module.draw.draw_detections
+
+    def recording_draw(frame, detections, wanted=()):
+        wanted_per_frame.append(sorted(wanted))
+        real_draw(frame, detections, wanted)
+
+    monkeypatch.setattr(pipeline_module.draw, "draw_detections", recording_draw)
+    detector = FakeDetector()
+    pipeline, open_detector = searching(make, frames=7, detector=detector)
+    assert wait_until(lambda: detector.calls == 7)
+    time.sleep(0.05)
+    assert open_detector.count("detect") == 3               # frames 1, 4 and 7 ...
+    assert wanted_per_frame == [[OFFSET + 3, OFFSET + 4, OFFSET + 7]] * 7    # ... shown on all seven
+    drawn = decoded(pipeline.latest_jpeg())
+    yellow = np.array(pipeline_module.draw.WANTED_COLOR)
+    assert np.abs(drawn[300:341, 20] - yellow).sum(axis=1).min() < 60       # the keys' box is yellow
+
+
+def test_without_a_search_draw_gets_no_highlights_and_nothing_is_found(make, monkeypatch):
+    wanted_per_frame = []
+    monkeypatch.setattr(pipeline_module.draw, "draw_detections",
+                        lambda frame, detections, wanted=(): wanted_per_frame.append(list(wanted)))
+    detector = FakeDetector()
+    open_detector = FakeOpenDetector()
+    pipeline = make(source=FakeSource(frames=5), detector=detector, open_detector=open_detector).start()
+    assert wait_until(lambda: detector.calls == 5)
+    time.sleep(0.05)
+    assert wanted_per_frame == [[]] * 5
+    assert open_detector.calls == []
+    assert not any("found" in entry for entry in pipeline.status()["objects"])
+
+
+# ---- what the page sees -----------------------------------------------------------------------
+
+
+def test_status_says_what_was_found_where_and_what_is_missing(make):
+    finds = [KEYS, *[relabelled(router, "Wifi Router") for router in ROUTERS]]
+    pipeline, _ = searching(make, names=["Wifi Router", "keys", "power bank"],
+                            open_detector=FakeOpenDetector(finds=finds))
+    assert wait_until(lambda: search_of(pipeline)["found"])
+    assert search_of(pipeline) == {"names": ["Wifi Router", "keys", "power bank"], "state": "ready", "note": "",
+                                   "found": [{"name": "Wifi Router", "count": 2, "place": "middle"},  # the surer one
+                                             {"name": "keys", "count": 1, "place": "left"}],
+                                   "missing": ["power bank"]}
+    json.dumps(pipeline.status())
+
+
+def test_found_objects_are_marked_in_the_list_and_can_be_clicked(make):
+    pipeline, _ = searching(make, names=["keys"])
+    assert wait_until(lambda: any(o["label"] == "keys" for o in pipeline.status()["objects"]))
+    objects = pipeline.status()["objects"]
+    keys = next(o for o in objects if o["label"] == "keys")
+    assert keys["track_id"] == OFFSET + 7 and keys["found"] is True
+    assert all("found" not in o for o in objects if o["label"] != "keys")
+    target = pipeline.target(track_id=OFFSET + 7)
+    assert (target.kind, target.label, target.track_id) == ("object", "keys", OFFSET + 7)
+    assert pipeline.target(**at(40, 320)).label == "keys"    # a click on it
+    assert "keys" in [d.label for d in pipeline.state.snapshot().detections]   # what the assistant is told
+
+
+def test_a_find_replaces_the_everyday_box_it_overlaps(make):
+    office_chair = Detection("office chair", 0.6, (402, 198, 500, 342), 1)    # over chair #2
+    pipeline, _ = searching(make, names=["office chair"], open_detector=FakeOpenDetector(finds=[office_chair]))
+    assert wait_until(lambda: any(o["label"] == "office chair" for o in pipeline.status()["objects"]))
+    pairs = [(o["label"], o["track_id"]) for o in pipeline.status()["objects"]]
+    assert pairs == [("person", 1), ("chair", 3), ("office chair", OFFSET + 1)]
+    assert pipeline.target(track_id=2) is None              # the chair it replaced cannot be clicked either
+
+
+def test_the_search_status_finds_nothing_while_the_stream_is_down(make, monkeypatch):
+    monkeypatch.setattr(pipeline_module, "STALE_SECONDS", 0.2)
+    pipeline, _ = searching(make, names=["keys"], frames=3)
+    assert wait_until(lambda: search_of(pipeline)["found"])
+    pipeline._source.connected = False
+    assert wait_until(lambda: search_of(pipeline)["found"] == [])
+    assert search_of(pipeline)["missing"] == ["keys"]
+
+
+def test_finds_of_replaced_names_never_reach_the_page(make):
+    """Other names are asked for while a frame's named finds are being worked out:
+    that frame is dropped, so the old names' finds never show after search() returned."""
+    class HoldingOpenDetector(FakeOpenDetector):
+        def __init__(self):
+            super().__init__()
+            self.holding, self.go_on = threading.Event(), threading.Event()
+
+        def detect(self, frame):
+            found = super().detect(frame)
+            if "keys" in self.names and not self.go_on.is_set():
+                self.holding.set()
+                assert self.go_on.wait(5)
+            return found
+
+    open_detector = HoldingOpenDetector()
+    pipeline, _ = searching(make, names=["keys"], open_detector=open_detector)
+    assert open_detector.holding.wait(3)                    # the first named run is under way
+    pipeline.search(["wallet"])
+    open_detector.go_on.set()
+    deadline = time.monotonic() + 0.3
+    while time.monotonic() < deadline:
+        assert not any(o["label"] == "keys" for o in pipeline.status()["objects"])
+        assert pipeline.target(track_id=OFFSET + 7) is None
+        time.sleep(0.005)
+
+
+# ---- the track epoch ---------------------------------------------------------------------------
+
+
+def test_the_epoch_goes_up_when_the_names_change(make):
+    pipeline, _ = searching(make, names=["keys"])
+    assert wait_until(lambda: pipeline.target(track_id=OFFSET + 7) is not None)
+    first = pipeline.target(track_id=OFFSET + 7).epoch
+    assert first == 1                                       # setting names the first time started tracks
+    assert pipeline.target(track_id=2).epoch == first       # one epoch for every target of a view
+    pipeline.search(["keys"])                               # the same names: the tracks go on
+    assert wait_until(ready(pipeline))
+    time.sleep(0.05)
+    assert pipeline.target(track_id=OFFSET + 7).epoch == first
+    pipeline.search(["keys", "wifi router"])                # other names: the track numbers start again
+    assert wait_until(ready(pipeline))
+    assert wait_until(lambda: (pipeline.target(track_id=OFFSET + 7) or NO_TARGET).epoch == first + 1)
+
+
+def test_a_new_frame_size_starts_the_open_detectors_tracks_again(make):
+    source = FakeSource(frames=4)
+    pipeline, open_detector = searching(make, names=["keys"], source=source)
+    assert wait_until(lambda: source.sequence == 4)
+    time.sleep(0.05)
+    resets = open_detector.count("reset_tracks")
+    source.picture = np.full((720, 1280, 3), 60, np.uint8)
+    source.frames += 4
+    assert wait_until(lambda: pipeline.state.snapshot().frame_size == (1280, 720))
+    assert wait_until(lambda: open_detector.count("reset_tracks") == resets + 1)
+    last_reset = len(open_detector.calls) - 1 - open_detector.calls[::-1].index("reset_tracks")
+    assert open_detector.calls[last_reset + 1] == "detect"  # before the first detect at the new size
+
+
+def test_a_camera_switch_drops_the_finds_and_keeps_looking(make):
+    pipeline, _ = searching(make, names=["keys"],
+                            source_factory=SourceFactory(phone_source(frames=0, connected=False)))
+    assert wait_until(lambda: search_of(pipeline)["found"])
+    pipeline.use_phone(PHONE)
+    assert pipeline.status()["objects"] == []
+    assert search_of(pipeline)["found"] == [] and search_of(pipeline)["state"] == "ready"
+
+
+# ---- merge_named: the rules on their own --------------------------------------------------------
+
+CHAIR = Detection("chair", 0.8, (400, 200, 500, 340), 2)
+CUP = Detection("cup", 0.6, (100, 100, 140, 150), 5)
+NOTHING_KEPT = pipeline_module.NamedFinds(1)
+
+
+def merge(everyday, kept, fresh, search_round=1, now=10.0):
+    return pipeline_module.merge_named(everyday, kept, fresh, search_round, now)
+
+
+def test_merge_adds_the_named_finds_with_their_ids_kept_apart():
+    shown, kept = merge([CHAIR, CUP], NOTHING_KEPT, [Detection("keys", 0.7, (0, 0, 9, 9), 2)])
+    assert shown == [CHAIR, CUP, Detection("keys", 0.7, (0, 0, 9, 9), OFFSET + 2)]   # not a second #2
+    assert kept.search_round == 1 and kept.finds == ((shown[-1], 10.0),)
+    untracked, _ = merge([], NOTHING_KEPT, [Detection("keys", 0.7, (0, 0, 9, 9))])
+    assert untracked[0].track_id is None
+
+
+def test_merge_with_nothing_named_gives_the_everyday_detections():
+    shown, kept = merge([CHAIR, CUP], NOTHING_KEPT, None)
+    assert shown == [CHAIR, CUP] and kept.finds == ()
+    shown, _ = merge([CHAIR, CUP], NOTHING_KEPT, [])
+    assert shown == [CHAIR, CUP]
+
+
+@pytest.mark.parametrize("box, replaced", [
+    ((400, 200, 500, 340), True),           # the same box: 1.0
+    ((410, 210, 500, 340), True),           # 0.84
+    ((400, 200, 500, 285), True),           # 0.61
+    ((400, 200, 500, 284), False),          # 0.60: not more than 0.6
+    ((450, 200, 550, 340), False),          # 0.33
+    ((0, 0, 50, 50), False),                # apart
+])
+def test_merge_replaces_an_everyday_box_only_when_it_overlaps_more_than_06(box, replaced):
+    shown, _ = merge([CHAIR, CUP], NOTHING_KEPT, [Detection("office chair", 0.5, box, 1)])
+    assert (CHAIR not in shown) is replaced
+    assert CUP in shown and shown[-1].label == "office chair"
+
+
+def test_overlap():
+    assert pipeline_module.overlap((0, 0, 10, 10), (0, 0, 10, 10)) == 1.0
+    assert pipeline_module.overlap((0, 0, 10, 10), (5, 0, 15, 10)) == pytest.approx(50 / 150)
+    assert pipeline_module.overlap((0, 0, 10, 10), (20, 20, 30, 30)) == 0.0
+    assert pipeline_module.overlap((0, 0, 0, 0), (0, 0, 0, 0)) == 0.0
+    assert pipeline_module.overlap(CHAIR.box, (400, 200, 500, 284)) == pytest.approx(0.6)
+
+
+def test_merge_keeps_finds_up_to_a_second_between_runs_then_drops_them():
+    keys = Detection("keys", 0.7, (0, 0, 9, 9), 7)
+    _, kept = merge([], NOTHING_KEPT, [keys], now=10.0)
+    shown, kept = merge([], kept, None, now=10.5)
+    assert [d.track_id for d in shown] == [OFFSET + 7]
+    shown, kept = merge([], kept, None, now=11.0)           # exactly a second: still there
+    assert [d.track_id for d in shown] == [OFFSET + 7]
+    shown, kept = merge([], kept, None, now=11.01)          # longer: gone
+    assert shown == [] and kept.finds == ()
+
+
+def test_a_run_that_misses_a_tracked_find_keeps_it_for_its_second():
+    keys = Detection("keys", 0.7, (0, 0, 9, 9), 7)
+    wallet = Detection("wallet", 0.6, (100, 100, 150, 150), 8)
+    _, kept = merge([], NOTHING_KEPT, [keys, wallet], now=10.0)
+    shown, kept = merge([], kept, [replace(keys, confidence=0.9)], now=10.4)     # the wallet was missed
+    assert [(d.label, d.confidence) for d in shown] == [("keys", 0.9), ("wallet", 0.6)]
+    shown, kept = merge([], kept, [keys], now=11.2)          # missed again, last seen 1.2 s ago
+    assert [d.label for d in shown] == ["keys"]
+
+
+def test_a_run_drops_an_old_find_a_fresh_one_covers_and_old_untracked_ones():
+    old = Detection("keys", 0.7, (0, 0, 100, 100), 7)
+    untracked = Detection("keys", 0.5, (300, 300, 340, 340), None)
+    _, kept = merge([], NOTHING_KEPT, [old, untracked], now=10.0)
+    renumbered = Detection("keys", 0.7, (2, 0, 100, 100), 9)                   # the same thing, a new track
+    shown, _ = merge([], kept, [renumbered], now=10.2)
+    assert [d.track_id for d in shown] == [OFFSET + 9]
+
+
+def test_merge_keeps_nothing_across_a_change_of_names():
+    keys = Detection("keys", 0.7, (0, 0, 9, 9), 7)
+    _, kept = merge([], NOTHING_KEPT, [keys], search_round=1, now=10.0)
+    shown, kept = merge([CHAIR], kept, None, search_round=2, now=10.1)
+    assert shown == [CHAIR] and kept == pipeline_module.NamedFinds(2)
+
+
+@pytest.mark.parametrize("x1, x2, place", [(0, 10, "left"), (200, 220, "left"), (210, 220, "middle"),
+                                           (300, 340, "middle"), (420, 440, "right"), (630, 639, "right")])
+def test_place_of_is_the_third_of_the_picture_the_centre_is_in(x1, x2, place):
+    assert pipeline_module.place_of((x1, 0, x2, 10), 640) == place
+
+
+def test_search_status_lists_found_and_missing_only_when_ready():
+    finds = [Detection("keys", 0.5, (500, 0, 520, 10), 1), Detection("keys", 0.9, (0, 0, 20, 10), 2)]
+    loading = pipeline_module.Search(("keys", "wallet"), "loading", "", 3)
+    assert pipeline_module.search_status(loading, finds, 640) == {
+        "names": ["keys", "wallet"], "state": "loading", "note": "", "found": [], "missing": []}
+    ready_search = replace(loading, state="ready")
+    assert pipeline_module.search_status(ready_search, finds, 640)["found"] == [
+        {"name": "keys", "count": 2, "place": "left"}]
+    assert pipeline_module.search_status(ready_search, finds, 640)["missing"] == ["wallet"]
+
+
+# ---- start-up ------------------------------------------------------------------------------------
+
+
+def test_start_up_builds_no_open_detector_and_the_first_search_does(make, monkeypatch):
+    from car_vision import detector as detector_module
+    built = []
+
+    def recording(settings):
+        built.append(settings)
+        return FakeOpenDetector()
+
+    monkeypatch.setattr(detector_module, "OpenDetector", recording, raising=False)
+    detector = FakeDetector()
+    pipeline = make(source=FakeSource(frames=5), detector=detector).start()
+    assert wait_until(lambda: detector.calls == 5)
+    assert built == [] and pipeline._open_detector is None
+    pipeline.search(["keys"])
+    assert wait_until(ready(pipeline))
+    pipeline.search(["wallet"])
+    assert wait_until(ready(pipeline))
+    assert built == [CONFIG["detector"]]                    # built once, from the detector settings
+
+
+@pytest.mark.parametrize("value", [0, -1, "3", 2.5, True])
+def test_a_bad_open_every_n_frames_is_rejected(value):
+    config = {**CONFIG, "detector": {**CONFIG["detector"], "open_every_n_frames": value}}
+    with pytest.raises(ConfigError, match="open_every_n_frames"):
+        Pipeline(config, source=FakeSource(), detector=FakeDetector(), recognizer=FakeRecognizer())
+
+
+@pytest.mark.parametrize("key", ["file", "keep_days", "min_seconds", "pictures"])
+def test_every_memory_setting_is_required(key):
+    memory = {name: value for name, value in CONFIG["memory"].items() if name != key}
+    with pytest.raises(ConfigError, match=key):
+        Pipeline({**CONFIG, "memory": memory}, source=FakeSource(), detector=FakeDetector(),
+                 recognizer=FakeRecognizer())
+
+
+# ---- the memory ------------------------------------------------------------------------------------
+
+
+class FakeSightings:
+    """Shaped like memory.SightingLog: keeps every seen() call; summary() gives `lines`."""
+
+    def __init__(self, lines=("laptop: last seen just now on the left, in view for 2 seconds",), fail=False):
+        self.lines = list(lines)
+        self.fail = fail
+        self.seen_calls = []
+        self.summaries = []
+
+    def seen(self, key, kind, label, name, place, confidence, now, picture=None):
+        if self.fail:
+            raise RuntimeError("database is locked")
+        self.seen_calls.append({"key": key, "kind": kind, "label": label, "name": name, "place": place,
+                                "confidence": confidence, "now": now, "picture": picture})
+
+    def summary(self, now, limit=30):
+        self.summaries.append(now)
+        return list(self.lines)
+
+
+class RecordingState(WorldState):
+    """A WorldState that keeps the memory lines it is given (whether or not Part B has landed)."""
+
+    def set_memory(self, lines):
+        self.memory_lines = tuple(lines)
+
+
+def memory_config(min_seconds=0.0, pictures=True, file=None):
+    return {**CONFIG, "memory": {**CONFIG["memory"], "file": file, "min_seconds": min_seconds,
+                                 "pictures": pictures}}
+
+
+def remembering(make, sightings, detections=None, frames=4, config=None, **kwargs):
+    detector = FakeDetector(detections=detections)
+    pipeline = make(source=FakeSource(frames=frames), detector=detector, sightings=sightings,
+                    config=config or memory_config(), state=RecordingState(), **kwargs).start()
+    assert wait_until(lambda: detector.calls == frames)
+    time.sleep(0.05)
+    return pipeline
+
+
+UNTRACKED_CUP = Detection("cup", 0.6, (100, 100, 140, 150), None)
+
+
+def test_every_tracked_detection_is_told_to_the_memory_and_untracked_ones_are_not(make):
+    sightings = FakeSightings()
+    before = time.time()
+    pipeline = remembering(make, sightings, detections=[PERSON, *CHAIRS, UNTRACKED_CUP])
+    assert pipeline.sightings() is sightings
+    calls = sightings.seen_calls
+    assert len(calls) == 4 * 3                              # 3 tracked things on each of 4 frames
+    assert {call["key"] for call in calls} == {(0, 1, "person"), (0, 2, "chair"), (0, 3, "chair")}
+    assert "cup" not in {call["label"] for call in calls}
+    person = next(call for call in calls if call["label"] == "person")
+    assert (person["kind"], person["name"], person["place"]) == ("person", "Sara Ahmed", "left")
+    chair = calls[-1]
+    assert (chair["kind"], chair["label"], chair["name"], chair["place"]) == ("object", "chair", None, "right")
+    assert chair["confidence"] == pytest.approx(0.7)
+    assert before - 1 <= chair["now"] <= time.time()        # seconds since 1970, like time.time()
+
+
+def test_an_unrecognised_person_is_remembered_without_a_name(make):
+    sightings = FakeSightings()
+    remembering(make, sightings, detections=[PERSON],
+                recognizer=FakeRecognizer(faces=[RecognizedFace("Unknown", 0.2, SARA_FACE.box, None, 1)]))
+    assert {call["name"] for call in sightings.seen_calls} == {None}
+
+
+def test_people_never_get_a_picture_and_objects_get_one_now_and_then(make):
+    sightings = FakeSightings()
+    big_chair = Detection("chair", 0.8, (0, 0, 640, 300), 2)
+    remembering(make, sightings, detections=[PERSON, big_chair], frames=6)
+    assert all(call["picture"] is None for call in sightings.seen_calls if call["kind"] == "person")
+    pictures = [call["picture"] for call in sightings.seen_calls if call["picture"] is not None]
+    assert len(pictures) == 1                               # once within PICTURE_EVERY_SECONDS, not 6 times
+    picture = cv2.imdecode(np.frombuffer(pictures[0], np.uint8), cv2.IMREAD_COLOR)
+    assert picture.shape == (75, 160, 3)                    # 640 x 300, its longer side made 160
+    assert len(pictures[0]) <= 40_000
+
+
+def test_the_first_picture_waits_for_min_seconds(make):
+    sightings = FakeSightings()
+    remembering(make, sightings, config=memory_config(min_seconds=30.0))
+    assert sightings.seen_calls and all(call["picture"] is None for call in sightings.seen_calls)
+
+
+def test_no_pictures_when_memory_pictures_is_off(make):
+    sightings = FakeSightings()
+    remembering(make, sightings, config=memory_config(pictures=False))
+    assert sightings.seen_calls and all(call["picture"] is None for call in sightings.seen_calls)
+
+
+def test_named_finds_are_remembered_with_the_typed_name(make):
+    sightings = FakeSightings()
+    searching(make, names=["keys"], sightings=sightings, config=memory_config(), state=RecordingState())
+    assert wait_until(lambda: any(call["label"] == "keys" for call in sightings.seen_calls))
+    keys = next(call for call in sightings.seen_calls if call["label"] == "keys")
+    assert keys["key"] == (0, 1, OFFSET + 7, "keys")        # everyday epoch, named epoch, track, label
+    assert keys["kind"] == "object" and keys["place"] == "left"
+    assert keys["picture"] is not None
+
+
+def test_a_new_frame_size_gives_new_memory_keys(make):
+    sightings = FakeSightings()
+    source = FakeSource(frames=2)
+    pipeline = make(source=source, sightings=sightings, config=memory_config(), state=RecordingState()).start()
+    assert wait_until(lambda: source.sequence == 2)
+    time.sleep(0.05)
+    source.picture = np.full((720, 1280, 3), 60, np.uint8)
+    source.frames += 2
+    assert wait_until(lambda: pipeline.state.snapshot().frame_size == (1280, 720))
+    time.sleep(0.05)
+    assert {call["key"][0] for call in sightings.seen_calls} == {0, 1}
+
+
+def test_the_memory_summary_reaches_the_world_state(make, monkeypatch):
+    monkeypatch.setattr(pipeline_module, "MEMORY_SHARE_SECONDS", 0.05)
+    lines = ["laptop: last seen just now on the left, in view for 2 seconds",
+             "an unrecognised person (person): last seen 1 minute ago in the middle, in view for 5 seconds"]
+    sightings = FakeSightings(lines)
+    state = RecordingState()
+    source = FakeSource(frames=0)
+    source.connected = False                                # also while no frames come
+    make(source=source, sightings=sightings, config=memory_config(), state=state).start()
+    assert wait_until(lambda: getattr(state, "memory_lines", None) == tuple(lines))
+    count = len(sightings.summaries)
+    time.sleep(0.25)
+    assert 2 <= len(sightings.summaries) - count <= 8       # about every 0.05 s, not on every turn
+    assert abs(sightings.summaries[-1] - time.time()) < 60  # asked with the wall clock
+
+
+def test_the_summary_is_shared_every_5_seconds_by_default():
+    assert pipeline_module.MEMORY_SHARE_SECONDS == 5.0
+
+
+def test_a_broken_memory_never_stops_the_video(make, caplog):
+    caplog.set_level(logging.WARNING, logger="car_vision.pipeline")
+    pipeline = remembering(make, FakeSightings(fail=True), frames=30)
+    assert pipeline.status()["error"] is None and pipeline.status()["objects"]
+    logged = [record for record in caplog.records if "memory" in record.getMessage()]
+    assert len(logged) == 1                                 # once, not on every frame
+
+
+def fake_memory_module(monkeypatch, sighting_log):
+    import types
+    module = types.ModuleType("car_vision.memory")
+    module.SightingLog = sighting_log
+    monkeypatch.setitem(sys.modules, "car_vision.memory", module)
+
+
+def test_a_memory_that_cannot_start_leaves_a_note_and_the_video_runs(make, monkeypatch, tmp_path):
+    def cannot_open(path, keep_days=7, min_seconds=1.0):
+        raise OSError("unable to open database file")
+
+    fake_memory_module(monkeypatch, cannot_open)
+    detector = FakeDetector()
+    pipeline = make(source=FakeSource(frames=3), detector=detector,
+                    config=memory_config(file=str(tmp_path / "memory.sqlite3"))).start()
+    assert pipeline.sightings() is None
+    assert pipeline.status()["notes"] == ["The camera's memory is off: unable to open database file"]
+    assert wait_until(lambda: detector.calls == 3)
+
+
+def test_the_memory_file_from_the_settings_is_opened_at_start_up(make, monkeypatch, tmp_path):
+    opened = []
+
+    def recording(path, keep_days=7, min_seconds=1.0):
+        opened.append((path, keep_days, min_seconds))
+        return FakeSightings()
+
+    fake_memory_module(monkeypatch, recording)
+    pipeline = make(config=memory_config(min_seconds=1.5, file=str(tmp_path / "memory.sqlite3")))
+    assert opened == [(tmp_path / "memory.sqlite3", 7.0, 1.5)]
+    assert isinstance(pipeline.sightings(), FakeSightings)
+
+
+@pytest.mark.parametrize("file", [None, ""])
+def test_no_memory_file_means_no_memory(make, file):
+    pipeline = make(config=memory_config(file=file))
+    assert pipeline.sightings() is None
+    assert pipeline.status()["notes"] == []
+
+
+def test_with_the_real_sighting_log_things_are_remembered(make, tmp_path):
+    memory = pytest.importorskip("car_vision.memory")
+    if not hasattr(WorldState, "set_memory"):
+        pytest.skip("WorldState.set_memory is not there yet (Part B)")
+    sightings = memory.SightingLog(tmp_path / "memory.sqlite3", keep_days=7, min_seconds=0.0)
+    try:
+        make(source=FakeSource(frames=10_000), detector=FakeDetector(delay=0.01), sightings=sightings,
+             config=memory_config()).start()
+        assert wait_until(lambda: {"chair", "person"} <= {s.label for s in sightings.recent()}, timeout=5)
+        people = [s for s in sightings.recent() if s.kind == "person"]
+        assert not any(s.has_picture for s in people)
+        assert [s.name for s in people] == ["Sara Ahmed"]
+    finally:
+        sightings.close()
+
+
+# ---- the picture timer ----------------------------------------------------------------------------
+
+
+def test_the_picture_timer_waits_for_min_seconds_then_gives_one_every_few_seconds():
+    timer = pipeline_module.PictureTimer(first_after=1.0, every=5.0)
+    assert [timer.due("chair", t) for t in (0.0, 0.5, 0.99)] == [False, False, False]
+    assert timer.due("chair", 1.0) is True                  # in view for min_seconds: the first picture
+    assert [timer.due("chair", t) for t in (1.1, 3.0, 5.9)] == [False, False, False]
+    assert timer.due("chair", 6.0) is True
+    assert timer.due("cup", 6.0) is False                   # each thing has its own times
+
+
+def test_the_picture_timer_forgets_things_not_seen_for_a_while():
+    timer = pipeline_module.PictureTimer(first_after=0.0, every=5.0, forget_after=10.0)
+    assert timer.due("chair", 0.0) is True
+    timer.due("cup", 5.0)
+    timer.forget_old(10.5)
+    assert len(timer) == 1                                  # the chair, last seen at 0.0, is gone
+    assert timer.due("chair", 10.5) is True                 # so it is a new thing again
+
+
+# ---- with the real OpenDetector (Part A) on a fake model --------------------------------------------
+
+
+class YoloeShaped:
+    """Just enough of ultralytics.YOLOE for OpenDetector: text calls, and track() finding
+    the first name at the keys' place with track number 5."""
+
+    def __init__(self):
+        self.classes = []
+
+    def get_text_pe(self, names):
+        return list(names)
+
+    def set_classes(self, names, embeddings):
+        self.classes.append(list(names))
+
+    def track(self, frame, **kwargs):
+        assert "half" not in kwargs
+
+        class Boxes:
+            xyxy, conf, cls, id = [list(KEYS.box)], [0.7], [0], [5]
+
+            def __len__(self):
+                return 1
+
+        class Result:
+            boxes, names = Boxes(), {}
+
+        return [Result()]
+
+
+def test_with_the_real_open_detector_a_typed_name_is_found(make, tmp_path):
+    from car_vision import detector as detector_module
+    if not hasattr(detector_module, "OpenDetector"):
+        pytest.skip("detector.OpenDetector is not there yet (Part A)")
+    settings = {**CONFIG["detector"], "models_dir": str(tmp_path)}    # its encoder folder: not the project's
+    open_detector = detector_module.OpenDetector(settings, model=YoloeShaped())
+    pipeline, _ = searching(make, names=["power bank"], open_detector=open_detector)
+    assert wait_until(lambda: search_of(pipeline)["found"])
+    assert search_of(pipeline)["found"] == [{"name": "power bank", "count": 1, "place": "left"}]
+    found = [o for o in pipeline.status()["objects"] if o.get("found")]
+    assert [(o["label"], o["track_id"]) for o in found] == [("power bank", OFFSET + 5)]
+    pipeline.search(["keys", "power bank"])
+    assert wait_until(ready(pipeline))
+    assert open_detector.names == ("keys", "power bank")
+
+
+# ---- memory keys follow what really restarts ------------------------------------------------------
+
+
+def test_memory_key_keeps_everyday_and_named_tracks_apart():
+    chair = Detection("chair", 0.8, (0, 0, 9, 9), 2)
+    keys = Detection("keys", 0.7, (0, 0, 9, 9), OFFSET + 7)
+    assert pipeline_module.memory_key(chair, False, 3, 5) == (3, 2, "chair")      # the named epoch plays no part
+    assert pipeline_module.memory_key(keys, True, 3, 5) == (3, 5, OFFSET + 7, "keys")
+
+
+def change_the_search_while_in_view(pipeline):
+    """Start a search, change its names, then stop it, while the frames go on."""
+    for names in (["keys"], ["keys", "wifi router"], []):
+        pipeline.search(names)
+        if names:
+            assert wait_until(ready(pipeline))
+        time.sleep(0.15)
+
+
+def test_searching_does_not_change_the_memory_keys_of_everyday_objects(make):
+    sightings = FakeSightings()
+    pipeline = make(source=FakeSource(frames=10_000), detector=FakeDetector(delay=0.005), sightings=sightings,
+                    open_detector=FakeOpenDetector(), config=memory_config(), state=RecordingState()).start()
+    assert wait_until(lambda: sightings.seen_calls)
+    change_the_search_while_in_view(pipeline)
+    chair_keys = {call["key"] for call in sightings.seen_calls if call["label"] == "chair" and call["key"][1] == 2}
+    assert chair_keys == {(0, 2, "chair")}
+    named_epochs = {call["key"][1] for call in sightings.seen_calls if call["label"] == "keys"}
+    assert named_epochs == {1, 2}                           # the named tracks did start again with new names
+    assert pipeline.target(track_id=2).epoch == 2           # Target.epoch still counts every restart
+
+
+def test_a_search_started_changed_and_stopped_gives_one_sighting_of_an_object_in_view(make, tmp_path):
+    memory = pytest.importorskip("car_vision.memory")
+    sightings = memory.SightingLog(tmp_path / "memory.sqlite3", keep_days=7, min_seconds=0.0)
+    try:
+        couch = Detection("couch", 0.8, (300, 150, 600, 340), 4)
+        pipeline = make(source=FakeSource(frames=10_000), detector=FakeDetector(detections=[couch], delay=0.005),
+                        recognizer=FakeRecognizer(faces=[]), sightings=sightings,
+                        open_detector=FakeOpenDetector(), config=memory_config()).start()
+        assert wait_until(lambda: any(s.label == "couch" for s in sightings.recent()), timeout=5)
+        change_the_search_while_in_view(pipeline)
+        time.sleep(2.2)                                     # the log writes at most every 2 seconds
+        pipeline.stop()
+        sightings.close()                                   # writes what is still open
+        reopened = memory.SightingLog(tmp_path / "memory.sqlite3", keep_days=7, min_seconds=0.0)
+        try:
+            assert [s.label for s in reopened.recent()].count("couch") == 1
+        finally:
+            reopened.close()
+    finally:
+        sightings.close()

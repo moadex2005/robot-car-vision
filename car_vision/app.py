@@ -15,6 +15,11 @@ The People section of the page adds, edits and removes the person folders
 live camera (/api/people/<id>/photos, then /api/people/photos for the
 progress); after every such change the assistant reads its notes and briefs
 again. /api/scene asks the assistant to describe the whole picture.
+
+/api/search starts looking for things by a typed name (the "Look for" field on
+the video, or a sentence like "find my keys") and stops it; the page follows the
+search in the status. /api/memory gives what the camera remembers (the Timeline),
+a small picture of a remembered object, and empties the memory.
 Start it with
 
     .venv\\Scripts\\python.exe -m car_vision.app
@@ -31,6 +36,7 @@ import argparse
 import base64
 import logging
 import math
+import re
 import secrets
 import socket
 import sys
@@ -53,7 +59,7 @@ from car_vision.faces import PERSON_ID
 from car_vision.marking import NEARLY_ALL, mark_photo, marked_share
 from car_vision.people import MAX_LINE, MAX_LINES, MAX_NAME, MAX_ROLE, MAX_STORY, PeopleBook
 from car_vision.phone import load_remembered, phone_url, remember, same_phone
-from car_vision.pipeline import Pipeline
+from car_vision.pipeline import Pipeline, clean_names
 from car_vision.stream import SOURCES
 
 log = logging.getLogger(__name__)
@@ -94,6 +100,18 @@ NO_SUCH_PERSON = "There is no such person. Reload the page to see who is there."
 NO_PICTURE = "There is no picture from the camera yet. Please try again in a moment."
 PERSON_SHAPE = ('Send the person as JSON, like {"name": "Sara Ahmed", "role": "Team lead", '
                 '"lines": ["Built the chassis"], "story": ""}.')
+
+MAX_SEARCH_CHARS = 300           # a typed "Look for" text is never longer (6 names of 40 and the commas)
+SEARCH_SHAPE = ('Send what to look for as JSON, like {"names": ["power bank", "keys"]} '
+                'or {"text": "power bank, keys"}.')
+NOTHING_TO_FIND = "Type what to look for, like power bank or keys."
+NAME_SEPARATORS = re.compile(r",|\band\b", re.IGNORECASE)   # "power bank, keys and the remote"
+MEMORY_LIMIT = 50                # sightings the Timeline asks for when it does not say
+MOST_SIGHTINGS = 200             # ... and at most
+MAX_FILTER_CHARS = 100           # the Timeline's filter text is never longer
+SIGHTING_ID = re.compile(r"[0-9]{1,18}")   # an id in an address: digits only, and it fits SQLite's number
+PICTURE_CACHE = "private, max-age=3600"    # a remembered picture never changes much: the browser keeps it
+NO_MEMORY_PICTURE = "There is no picture of that."
 
 
 class UnavailableAssistant:
@@ -470,6 +488,72 @@ class PhotoWatch:
             return state == "done"
 
 
+# ---- looking for things by name, and the camera's memory ---------------------------------
+
+
+def split_names(text: str) -> list[str]:
+    """The names in a typed text, split on commas and the word "and"; empty parts are dropped.
+
+    "power bank, keys and the remote" gives ["power bank", "keys", "the remote"].
+    """
+    return [part.strip() for part in NAME_SEPARATORS.split(text) if part.strip()]
+
+
+def search_names(body: Any) -> list[Any] | str:
+    """The names from a POST /api/search body, not yet checked, or the reason the shape is wrong.
+
+    The body has either "names" (a list) or "text" (what was typed, split here).
+    """
+    if not isinstance(body, dict) or ("names" in body) == ("text" in body):
+        return SEARCH_SHAPE
+    if "names" in body:
+        names = body["names"]
+        return names if isinstance(names, list) else SEARCH_SHAPE
+    text = body["text"]
+    if not isinstance(text, str):
+        return SEARCH_SHAPE
+    if len(text) > MAX_SEARCH_CHARS:
+        return f"That is too long to look for. Please keep it under {MAX_SEARCH_CHARS} characters."
+    return split_names(text)
+
+
+def memory_of(pipeline: Any) -> Any:
+    """The pipeline's memory (a SightingLog), or None when the memory is off."""
+    sightings = getattr(pipeline, "sightings", None)   # older pipelines (and most fakes) have none
+    return sightings() if callable(sightings) else None
+
+
+def memory_query(args: Any) -> tuple[int, str | None] | str:
+    """(limit, text) from the GET /api/memory address, or the reason it is wrong.
+
+    The limit is held between 1 and MOST_SIGHTINGS; the filter text has a length limit.
+    """
+    limit_text = args.get("limit", str(MEMORY_LIMIT))
+    if not re.fullmatch(r"[0-9]{1,6}", limit_text):
+        return f"limit must be a whole number from 1 to {MOST_SIGHTINGS}."
+    limit = min(max(int(limit_text), 1), MOST_SIGHTINGS)
+    text = args.get("text", "").strip()
+    if len(text) > MAX_FILTER_CHARS:
+        return f"The filter can have at most {MAX_FILTER_CHARS} characters."
+    return limit, text or None
+
+
+def sighting_json(sighting: Any) -> dict[str, Any]:
+    """One remembered sighting for the Timeline. A person never has a picture."""
+    is_object = sighting.kind == "object"
+    return {
+        "id": int(sighting.id),
+        "kind": str(sighting.kind),
+        "label": str(sighting.label),
+        "name": str(sighting.name) if sighting.name is not None else None,
+        "first_seen": float(sighting.first_seen),
+        "last_seen": float(sighting.last_seen),
+        "place": str(sighting.place),
+        "confidence": round(float(sighting.confidence), 2),
+        "has_picture": bool(sighting.has_picture) and is_object,
+    }
+
+
 # ---- the web server ------------------------------------------------------------
 
 
@@ -502,7 +586,9 @@ def create_app(pipeline: Any, assistant: Any, camera_file: Path | None = None,
     def page() -> str:
         return render_template("index.html", max_question_chars=MAX_QUESTION_CHARS,
                                has_people=people is not None, max_name=MAX_NAME, max_role=MAX_ROLE,
-                               max_story=MAX_STORY, max_lines=MAX_LINES, max_line=MAX_LINE)
+                               max_story=MAX_STORY, max_lines=MAX_LINES, max_line=MAX_LINE,
+                               has_memory=memory_of(pipeline) is not None,
+                               max_search_chars=MAX_SEARCH_CHARS, max_filter_chars=MAX_FILTER_CHARS)
 
     @app.get("/video")
     def video() -> Response:
@@ -783,6 +869,58 @@ def create_app(pipeline: Any, assistant: Any, camera_file: Path | None = None,
             return jsonify(error=f"Something went wrong while describing the scene ({type(error).__name__}). "
                                  "Please try again."), 500
         return jsonify(text=str(answer.text))
+
+    # ---- looking for things by name ------------------------------------------------------
+
+    @app.post("/api/search")
+    def search_start() -> Any:
+        names = search_names(request.get_json(silent=True))
+        if isinstance(names, str):
+            return jsonify(error=names), 400
+        try:
+            names = list(clean_names(names))          # the pipeline's own rules and messages
+            if not names:
+                return jsonify(error=NOTHING_TO_FIND), 400
+            pipeline.search(names)                    # returns at once; the status says how it goes
+        except ValueError as error:
+            return jsonify(error=str(error)), 400
+        return jsonify(ok=True, names=names)
+
+    @app.delete("/api/search")
+    def search_stop() -> Any:
+        pipeline.search([])
+        return jsonify(ok=True)
+
+    # ---- the camera's memory ---------------------------------------------------------------
+
+    @app.get("/api/memory")
+    def memory_list() -> Any:
+        query = memory_query(request.args)
+        if isinstance(query, str):
+            return jsonify(error=query), 400
+        memory = memory_of(pipeline)
+        found = memory.recent(*query) if memory is not None else []
+        response = jsonify(sightings=[sighting_json(sighting) for sighting in found])
+        response.headers["Cache-Control"] = "no-store"
+        return response
+
+    @app.get("/api/memory/<sighting_id>/picture")
+    def memory_picture(sighting_id: str) -> Any:
+        memory = memory_of(pipeline)
+        if memory is None or not SIGHTING_ID.fullmatch(sighting_id):   # checked before it is used
+            return jsonify(error=NO_MEMORY_PICTURE), 404
+        jpeg = memory.picture(int(sighting_id))       # only objects ever have one, never a person
+        if not jpeg:
+            return jsonify(error=NO_MEMORY_PICTURE), 404
+        return Response(jpeg, mimetype="image/jpeg", headers={"Cache-Control": PICTURE_CACHE})
+
+    @app.delete("/api/memory")
+    def memory_clear() -> Any:
+        memory = memory_of(pipeline)
+        if memory is not None:
+            memory.clear()
+            log.info("The camera's memory was emptied from the page")
+        return jsonify(ok=True)
 
     @app.errorhandler(HTTPException)
     def http_error(error: HTTPException) -> Any:

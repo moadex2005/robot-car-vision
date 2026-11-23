@@ -211,6 +211,7 @@ def test_system_prompt_holds_notes_and_is_the_same_for_every_question(settings: 
     assert NOTES.strip() in first
     assert "Sara" not in first and "Omar" not in first
     assert build_system_prompt(NOTES) == build_system_prompt(NOTES)
+    assert MEMORY_SENTENCE in first
 
 
 def test_system_prompt_with_empty_notes_still_works() -> None:
@@ -1083,6 +1084,115 @@ def test_no_objects_line_with_only_people_in_view(settings: dict) -> None:
     fake = FakeClient()
     Assistant(settings, state=state_seeing(["person", "person"]), client=fake).ask("Anything?")
     assert fake.calls[0][1][-1]["content"] == "In front of the camera right now: Sara.\nAnything?"
+
+
+# ---- M13: what the camera remembers ------------------------------------------------
+
+
+MEMORY_SENTENCE = (
+    'The lines under "What the camera remembers" come from the camera\'s own log: use '
+    "them to answer questions about what was seen and when, and treat anything not in "
+    "them as not recorded.")
+
+REMEMBERED = ["laptop: last seen 3 minutes ago on the left, in view for 2 minutes",
+              "Sara Ahmed (person): last seen 1 hour ago in the middle, in view for 40 seconds"]
+
+
+def remembering(state: WorldState, lines: list[str]) -> WorldState:
+    """Put memory lines into the state, as the pipeline does."""
+    if hasattr(state, "set_memory"):
+        state.set_memory(lines)
+    else:   # until WorldState.set_memory exists: a stand-in on this one object
+        state.memory = lambda: tuple(lines)     # type: ignore[method-assign]
+    return state
+
+
+def test_memory_lines_follow_the_people_and_objects_lines(settings: dict) -> None:
+    fake = FakeClient()
+    state = remembering(state_seeing(["cup"]), REMEMBERED)
+    Assistant(settings, state=state, client=fake).ask("Where did you last see the laptop?")
+    assert fake.calls[0][1][-1]["content"] == (
+        "In front of the camera right now: Sara.\n"
+        "The object detector sees right now: cup.\n"
+        "What the camera remembers (newest first):\n"
+        "laptop: last seen 3 minutes ago on the left, in view for 2 minutes\n"
+        "Sara Ahmed (person): last seen 1 hour ago in the middle, in view for 40 seconds\n"
+        "Where did you last see the laptop?")
+
+
+def test_memory_lines_are_capped_at_thirty_keeping_the_newest(settings: dict) -> None:
+    fake = FakeClient()
+    lines = [f"thing {n}: last seen {n} minutes ago" for n in range(1, 36)]
+    state = remembering(state_with("Sara"), lines)
+    Assistant(settings, state=state, client=fake).ask("Who came by?")
+    content = fake.calls[0][1][-1]["content"].split("\n")
+    heading = content.index(assistant.MEMORY_HEADING)
+    assert content[heading + 1:-1] == lines[:30]
+    assert content[-1] == "Who came by?"
+
+
+def test_no_memory_heading_without_memory_lines(settings: dict) -> None:
+    fake = FakeClient()
+    state = remembering(state_with("Sara"), [])
+    Assistant(settings, state=state, client=fake).ask("Anything?")
+    assert fake.calls[0][1][-1]["content"] == "In front of the camera right now: Sara.\nAnything?"
+
+
+def test_no_memory_heading_in_a_fresh_state(settings: dict) -> None:
+    fake = FakeClient()
+    Assistant(settings, state=state_with("Sara"), client=fake).ask("Anything?")
+    assert "remembers" not in fake.calls[0][1][-1]["content"]
+
+
+def test_memory_lines_without_a_state_are_absent(settings: dict) -> None:
+    fake = FakeClient()
+    Assistant(settings, client=fake).ask("Where is the bottle?")
+    assert fake.calls[0][1] == [{"role": "user", "content": "Where is the bottle?"}]
+
+
+def test_the_system_prompt_stays_the_same_while_the_memory_changes(settings: dict) -> None:
+    fake = FakeClient()
+    state = remembering(state_with("Sara"), REMEMBERED[:1])
+    bot = Assistant(settings, state=state, client=fake)
+    bot.ask("one")
+    remembering(state, REMEMBERED)
+    bot.ask("two")
+    first, second = fake.calls[0][0], fake.calls[1][0]
+    assert first == second == build_system_prompt(NOTES)
+    assert "last seen" not in first
+
+
+def test_memory_lines_stay_in_the_stored_user_turn(settings: dict) -> None:
+    fake = FakeClient()
+    state = remembering(state_with("Sara"), REMEMBERED[:1])
+    bot = Assistant(settings, state=state, client=fake)
+    bot.ask("one")
+    remembering(state, REMEMBERED)
+    bot.ask("two")
+    earlier, answer, newer = fake.calls[1][1]
+    assert earlier == fake.calls[0][1][0]                # sent again exactly as before
+    assert earlier["content"].endswith(f"{assistant.MEMORY_HEADING}\n{REMEMBERED[0]}\none")
+    assert answer["content"] == ["block-1"]
+    assert newer["content"].endswith(f"{REMEMBERED[1]}\ntwo")
+
+
+def test_describe_scene_does_not_get_the_memory(settings: dict) -> None:
+    fake = FakeClient()
+    state = remembering(state_seeing(["cup"]), REMEMBERED)
+    Assistant(settings, state=state, client=fake).describe_scene(PICTURE)
+    assert fake.calls[0][1] == [assistant.user_turn(
+        "In front of the camera right now: Sara.\n"
+        "The object detector sees right now: cup.\n"
+        "Describe the scene.", PICTURE)]
+
+
+def test_describe_and_follow_up_do_not_get_the_memory(settings: dict) -> None:
+    fake = FakeClient([LLMReply(text=GOOD_ANSWER, new_turns=()), LLMReply(text="It is.", new_turns=())])
+    bot = Assistant(settings, state=remembering(state_with("Sara"), REMEMBERED), client=fake)
+    info = bot.describe(PICTURE, "laptop")
+    bot.follow_up(PICTURE, "laptop", info, [], "Is it new?")
+    sent = repr([call[1] for call in fake.calls])
+    assert "remembers" not in sent and "last seen" not in sent
 
 
 # ---- M6: pictures --------------------------------------------------------------

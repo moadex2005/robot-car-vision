@@ -28,6 +28,8 @@ STATUS_POSITION = (10, 24)      # where the status line starts (left, baseline)
 STATUS_SCALE = 0.6
 STATUS_OUTLINE = 4              # thickness of the black edge around the status text
 STATUS_THICKNESS = 1
+WANTED_COLOR = (0, 255, 255)    # bright yellow (blue, green, red): a thing the visitor is looking for
+WANTED_THICKNESS = 5            # its box line, against BOX_THICKNESS for the others
 
 
 def drawing_scale(frame_width: int) -> float:
@@ -63,13 +65,22 @@ def caption_for(detection: Detection) -> str:
     return text
 
 
-def draw_detections(frame: np.ndarray, detections: Iterable[Detection]) -> None:
-    """Draw a rectangle and a caption for each detection."""
-    thickness = scaled(BOX_THICKNESS, drawing_scale(frame.shape[1]))
+def draw_detections(frame: np.ndarray, detections: Iterable[Detection], wanted: Iterable[int] = ()) -> None:
+    """Draw a rectangle and a caption for each detection.
+
+    Boxes whose track number is in `wanted` (the things the visitor is looking
+    for) get a thicker line in one fixed bright colour, so they stand out.
+    """
+    wanted = set(wanted)
+    scale = drawing_scale(frame.shape[1])
+    thickness = scaled(BOX_THICKNESS, scale)
     for detection in detections:
         x1, y1, x2, y2 = detection.box
-        color = color_for(detection.label)
-        cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness)
+        if detection.track_id is not None and detection.track_id in wanted:
+            color, line = WANTED_COLOR, scaled(WANTED_THICKNESS, scale)
+        else:
+            color, line = color_for(detection.label), thickness
+        cv2.rectangle(frame, (x1, y1), (x2, y2), color, line)
         draw_caption(frame, caption_for(detection), x1, y1, color)
 
 

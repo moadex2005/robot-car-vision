@@ -1915,10 +1915,13 @@ def test_template_never_speaks_the_greetings_and_has_no_close_warning():
     # Nothing that comes with a status poll is spoken: say() is called only from these places.
     calls = re.findall(r"(?<!function )\bsay\(([^;]*)\);", page)
     assert sorted(calls) == sorted([
-        'text, "answer"',                                        # answerArrived: chat, follow-up, scene
+        'text, "answer"',                                        # answerArrived: chat, follow-up, scene, a find
         'sentences(name, info.summary), "answer"',               # an object's description after a click
         'sentences(data.person.name, data.person.role), "answer"',   # a person's panel after a click
+        'text, "found"',                                         # M13: "I can see it now", once per name per search
     ]), calls
+    # That one exception is only for this page's own search (tests/test_app_find.py checks it closely).
+    assert 'say(text, "found");' in between(page, "function tellFound(", "\n}\n")
     poll = between(page, "async function poll(", "\n}\n")
     assert "say(" not in poll and "speak(" not in poll
 

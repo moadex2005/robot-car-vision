@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import threading
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 
 Box = tuple[int, int, int, int]
@@ -66,6 +67,7 @@ class WorldState:
 
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     _snapshot: WorldSnapshot = field(default_factory=WorldSnapshot)
+    _memory: tuple[str, ...] = field(default=(), repr=False)
 
     def update_detections(
         self,
@@ -99,6 +101,17 @@ class WorldState:
     def snapshot(self) -> WorldSnapshot:
         with self._lock:
             return self._snapshot
+
+    def set_memory(self, lines: Sequence[str]) -> None:
+        """Replace the lines the camera remembers (newest first), for the assistant."""
+        copied = tuple(lines)
+        with self._lock:
+            self._memory = copied
+
+    def memory(self) -> tuple[str, ...]:
+        """The lines the camera remembers, newest first; empty until the pipeline sets them."""
+        with self._lock:
+            return self._memory
 
     def current_people(self, max_age_seconds: float = 3.0, now: float | None = None) -> list[str]:
         """Names of enrolled people seen within the last few seconds, no repeats.

@@ -484,7 +484,7 @@
      White on near-black in both looks, like the greeting capsules. */
   .caption {
     position: absolute; z-index: 2; left: 50%;
-    bottom: calc(clamp(10px, 1.4vw, 22px) + 2.9rem + 36px);   /* clear of the row of pills */
+    bottom: calc(clamp(10px, 1.4vw, 22px) + 2.9rem + 36px + var(--finder-room));   /* clear of the pills and Look for */
     width: max-content; max-width: min(46rem, calc(100% - 2 * clamp(10px, 1.4vw, 22px)));
     padding: 0.7rem 1.3rem 0.8rem;
     border-radius: 24px;
@@ -495,7 +495,7 @@
     transform: translateX(-50%);
     pointer-events: none;                 /* a click through it still reaches the video */
   }
-  .stage:not(.is-full) .caption { bottom: clamp(12px, 1.4vw, 22px); }   /* the pills are under the frame here */
+  .stage:not(.is-full) .caption { bottom: calc(clamp(12px, 1.4vw, 22px) + var(--finder-room)); }   /* the pills are under the frame here */
   .caption p { margin: 0; }
   .caption-question { color: #a1a1a6; font-size: 0.85rem; }
   .caption-answer {
@@ -503,6 +503,77 @@
     display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 4; overflow: hidden;
   }
   .caption-answer.problem { color: #ff6961; }
+
+  /* Look for: a small row over the bottom-left of the video, on the page and in the full view.
+     Solid, not blurred (it lies over the moving picture). When there are more chips than fit,
+     they wrap upwards; the script then sets --finder-room to the row's real height, so the
+     caption always sits just above it and never under it. Between its parts a click reaches
+     the video. */
+  .frame { --finder-height: 2.5rem; --finder-room: calc(var(--finder-height) + 10px); --frame-edge: clamp(10px, 1.4vw, 22px); }
+  .finder {
+    position: absolute; z-index: 2;
+    left: var(--frame-edge); bottom: var(--frame-edge);
+    max-width: calc(100% - 2 * var(--frame-edge));
+    display: flex; align-items: flex-end; gap: 0.4rem;
+    pointer-events: none;
+  }
+  .finder > * { pointer-events: auto; }
+  .stage.is-full .finder { bottom: calc(var(--frame-edge) + 2.9rem + 36px); }   /* above the row of pills */
+  .finder-form {
+    flex: none; display: flex; align-items: center; gap: 0.25rem;
+    height: var(--finder-height); padding: 0.2rem;
+    border-radius: 999px;
+    background: #1c1c1e;
+    border: 1px solid rgba(255, 255, 255, 0.22);
+    box-shadow: 0 8px 22px rgba(0, 0, 0, 0.3);
+  }
+  .finder-form input {
+    width: clamp(7rem, 20cqw, 11rem); height: 100%; min-width: 0;
+    padding: 0 0.4rem 0 0.8rem;
+    border: 0; border-radius: 999px;
+    background: transparent; color: #f5f5f7;
+    font: inherit; font-size: 0.9rem;
+  }
+  .finder-form input::placeholder { color: #a1a1a6; }
+  .finder-form input:focus-visible { outline: 2px solid #2997ff; outline-offset: 0; }
+  .finder-button {
+    flex: none; height: 100%;
+    padding: 0 0.85rem;
+    border: 0; border-radius: 999px;
+    background: #2997ff; color: #000;
+    font: inherit; font-size: 0.85rem; font-weight: 600;
+    cursor: pointer;
+    transition: transform 0.45s var(--spring);
+  }
+  .finder-button:hover { transform: scale(1.05); }
+  .finder-button:active { transform: scale(0.94); transition-duration: 0.12s; }
+  .finder-button.stop { height: var(--finder-height); background: #3a3a3c; color: #f5f5f7; border: 1px solid rgba(255, 255, 255, 0.22); }
+  .finder-button:focus-visible { outline: 2px solid #fff; outline-offset: 2px; }
+  .find-chips {
+    flex: 0 1 auto; min-width: 0;
+    display: flex; flex-wrap: wrap-reverse; align-items: center; gap: 0.35rem;
+    margin: 0; padding: 0; list-style: none;
+  }
+  .find-chip {
+    flex: none; display: inline-flex; align-items: center; gap: 0.4rem;
+    max-width: 100%; height: var(--finder-height); padding: 0 0.8rem;
+    border-radius: 999px;
+    background: #1c1c1e; border: 1px solid rgba(255, 255, 255, 0.22);
+    color: #f5f5f7; font-size: 0.82rem; white-space: nowrap;
+    animation: pill-in 0.55s var(--spring);
+  }
+  .find-chip-name, .find-chip-state { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+  .find-chip-name { font-weight: 600; }
+  .find-chip-state { color: #a1a1a6; }
+  .find-chip.is-found { border-color: #ffd60a; }
+  .find-chip.is-found .find-chip-state { color: #ffd60a; }
+  .find-chip.is-found::before {
+    content: ""; flex: none; width: 0.5em; height: 0.5em; border-radius: 50%; background: #ffd60a;
+  }
+  .find-chip.is-failed .find-chip-state { color: #ff6961; }
+  @container (max-width: 520px) {
+    .find-chip-state { display: none; }   /* a very narrow video: the names only, the state is in their title */
+  }
   .is-full .frame-button .expand { display: none; }
   .is-full .frame-button .shrink { display: block; }
 
@@ -558,6 +629,12 @@
   .thing.is-known .thing-detail { color: var(--accent); }
   .thing.is-known::before { content: ""; align-self: center; width: 0.5em; height: 0.5em; border-radius: 50%; background: var(--accent); }
   .thing.is-open { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent), var(--pill-shadow); }
+  /* One of the things the visitor is looking for: the same bright yellow as its box on the video. */
+  .thing.is-found { border-color: #e0b400; box-shadow: inset 0 0 0 2px #ffd60a, var(--pill-shadow); }
+  .thing.is-found .thing-name::before {
+    content: ""; display: inline-block; width: 0.55em; height: 0.55em; margin-right: 0.45em;
+    border-radius: 50%; background: #ffd60a; box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.35);
+  }
   .quiet { margin: 0; color: var(--grey); }
   .privacy { margin: 1.1rem auto 0; max-width: 38rem; color: var(--grey); font-size: 0.85rem; line-height: 1.45; }
 
@@ -832,6 +909,51 @@
   .photo-notes { margin: 0; padding: 0; list-style: none; color: var(--grey); font-size: 0.9rem; }
   .photo-notes:empty { display: none; }
 
+  /* ---- the timeline: what the camera remembers, newest first ----
+     Rows look like the people cards (glass without blur: there may be fifty). The list scrolls
+     in its own box, so a new row at the top never moves the page; every row has a fixed
+     picture size and one line of detail, so a time that gets longer never moves the rows. */
+  .timeline { max-width: 920px; margin: 0 auto; display: grid; gap: 1rem; }
+  .timeline-tools { display: flex; flex-wrap: wrap; gap: 0.7rem; align-items: center; }
+  .timeline-tools input {
+    flex: 1 1 14rem; min-width: 0;
+    background: var(--surface); color: var(--text);
+    border: 1px solid var(--hairline); border-radius: 999px;
+    padding: 0.6rem 1.1rem;
+    font: inherit; font-size: 0.95rem;
+  }
+  .timeline-tools input::placeholder { color: var(--grey); }
+  .timeline-tools input:focus-visible { outline: 3px solid var(--accent); outline-offset: 1px; }
+  .timeline .confirm-row { margin: 0; }
+  .timeline > .quiet { text-align: center; }
+  .timeline-list {
+    list-style: none; margin: 0; padding: 0.2rem 0.3rem 0.2rem 0;
+    display: grid; gap: 0.6rem;
+    max-height: min(68svh, 640px); overflow-y: auto; overscroll-behavior: contain;
+  }
+  .timeline-list:empty { display: none; }
+  .moment {
+    display: grid; grid-template-columns: 3.4rem minmax(0, 1fr); gap: 0.95rem; align-items: center;
+    padding: 0.55rem 1.1rem 0.55rem 0.55rem;
+    border-radius: 22px;
+    border: 1px solid var(--glass-edge);
+    background: var(--pill-fill);
+    box-shadow: inset 0 1px 0 var(--glass-shine), var(--pill-shadow);
+    animation: pill-in 0.55s var(--spring);
+  }
+  .moment-picture, .moment-mark { width: 3.4rem; height: 3.4rem; border-radius: 16px; }
+  .moment-picture { display: block; object-fit: cover; background: rgba(0, 0, 0, 0.85); }
+  .moment-mark {
+    display: grid; place-items: center;
+    background: var(--accent-soft); color: var(--accent);
+    font-size: 1.25rem; font-weight: 700;
+  }
+  .moment-name { margin: 0; font-weight: 650; letter-spacing: -0.01em; overflow-wrap: anywhere; }
+  .moment-detail {
+    margin: 0; color: var(--grey); font-size: 0.85rem; font-variant-numeric: tabular-nums;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+
   /* ---- footer ---- */
   .footer {
     max-width: 1240px; margin: 0 auto;
@@ -842,13 +964,13 @@
   }
   .footer p { margin: 0; max-width: 42rem; }
 
-  /* Narrow windows are not the target, but stay usable. The three section links need a window
-     about 1025 px wide next to the status (measured with "Reconnecting", which is wider than
-     "Live"), the Camera, Voice and theme buttons; below 1080 px they fold away, which leaves
+  /* Narrow windows are not the target, but stay usable. The four section links need a window
+     about 1130 px wide next to the status (measured with "Reconnecting", which is wider than
+     "Live"), the Camera, Voice and theme buttons; below 1180 px they fold away, which leaves
      some room for other fonts. The sections are still reached by scrolling and by the hero's
      buttons. */
   .nav-links a { white-space: nowrap; }
-  @media (max-width: 1079.98px) {
+  @media (max-width: 1179.98px) {
     .nav-links { display: none; }
     .brand { margin-right: auto; }
   }
@@ -875,6 +997,7 @@
     <a href="#watch">Live view</a>
     <a href="#ask">Ask</a>
     <a href="#people" id="peopleLink"{% if not has_people %} hidden{% endif %}>People</a>
+    <a href="#timeline">Timeline</a>
   </nav>
   <div class="status-pill" id="status" aria-live="off">
     <span class="dot" aria-hidden="true"></span>
@@ -1021,6 +1144,17 @@
           <div class="caption" id="caption" aria-live="polite" hidden>
             <p class="caption-question" id="captionQuestion"></p>
             <p class="caption-answer" id="captionAnswer"></p>
+          </div>
+          <!-- Look for: a thing by its name. While looking, one chip per name says how it goes. -->
+          <div class="finder" id="finder">
+            <form class="finder-form" id="finderForm" role="search" autocomplete="off">
+              <label class="visually-hidden" for="finderText">Look for something by its name</label>
+              <input id="finderText" type="text" maxlength="{{ max_search_chars }}" spellcheck="false"
+                     placeholder="Look for ...">
+              <button class="finder-button" id="finderFind" type="submit">Find</button>
+            </form>
+            <ul class="find-chips" id="findChips" aria-label="What is being looked for" aria-live="off" hidden></ul>
+            <button class="finder-button stop" id="finderStop" type="button" hidden>Stop</button>
           </div>
           <div class="banners">
             <div class="greetings" id="greetings" aria-live="polite"></div>
@@ -1172,11 +1306,43 @@
       </div>
     </div>
   </section>
+
+  <!-- Timeline: what the camera remembers. Loaded only while it is on screen. -->
+  <section class="section" id="timeline" aria-label="Timeline" data-memory="{{ 'on' if has_memory else 'off' }}">
+    <div class="section-head reveal">
+      <h2>Timeline</h2>
+      <p>What the camera remembers, newest first. It stays on this laptop.</p>
+    </div>
+    <div class="timeline reveal" id="timelineBox">
+      {% if has_memory %}
+      <div class="timeline-tools">
+        <label class="visually-hidden" for="timelineFilter">Show only</label>
+        <input id="timelineFilter" type="text" maxlength="{{ max_filter_chars }}" spellcheck="false"
+               placeholder="Show only, like bottle or Sara">
+        <button class="pill secondary small" id="timelineClear" type="button">Clear memory</button>
+      </div>
+      <!-- Asked once, in the page, never with a browser dialog. -->
+      <div class="confirm-row" id="timelineConfirm" hidden>
+        <p>Forget everything the camera remembers? This cannot be undone.</p>
+        <div class="confirm-buttons">
+          <button class="pill primary small" id="timelineClearYes" type="button">Forget everything</button>
+          <button class="pill secondary small" id="timelineClearNo" type="button">Keep</button>
+        </div>
+      </div>
+      <ol class="timeline-list" id="timelineList" aria-label="What the camera remembers"></ol>
+      <p class="quiet" id="timelineEmpty">Nothing remembered yet. Things that stay in view for a moment appear here.</p>
+      <p class="form-result" id="timelineResult" aria-live="polite"></p>
+      {% else %}
+      <p class="quiet" id="timelineEmpty">The camera's memory is off: memory.file is not set in config.yaml.</p>
+      {% endif %}
+    </div>
+  </section>
 </main>
 
 <footer class="footer">
   <p>A click on an object or on an empty spot sends a small cut-out of the picture to the assistant's API. A click on a person sends nothing. Follow-up questions about an object send the same cut-out again. A marked part is sent as the same cut-out with your outline drawn on it. Describe the scene sends the whole picture.</p>
   <p class="voice-privacy" hidden><span class="privacy-listen" hidden>Asking by voice sends the sound of your question to your browser's speech service (Microsoft or Google) to turn it into text.</span> <span class="privacy-speak" hidden>A "Natural" or online voice sends the text of the answer to that service to be spoken; the other voices stay on this computer.</span></p>
+  <p>The camera's memory (what was seen and when, with small pictures of objects, never of people) stays on this laptop. A chat question sends its text lines, without pictures, to the assistant.</p>
   <p>Runs on this laptop. Nothing is sent to the car.</p>
 </footer>
 
@@ -1192,6 +1358,7 @@ const STATUS_TIMEOUT_MS = 2000;
 const MAX_SOURCES = 3;         // web answers list at most this many links
 const PHOTO_PREFIX = "data:image/jpeg;base64,";   // the only kind of photo address that is shown
 const AREA_TITLE = "Something the detector has no name for";
+const FOUND_TITLE = "One of the things you are looking for";
 const UNKNOWN_HINT = "Add a folder with photos and an about.md for them in data/people to show their details here.";
 
 const byId = (id) => document.getElementById(id);
@@ -1238,6 +1405,63 @@ function changed(part, value) {
 }
 function forgetDrawn() {
   for (const part of Object.keys(drawn)) delete drawn[part];
+}
+
+// ---- find by words: is this sentence nothing but a request to find something? ----
+//
+// findRequest(text) gives what to look for, or null: then the sentence goes to the assistant
+// as before. The chat field, every microphone and conversation mode use it. It is strict on
+// purpose: a find request that is missed still gets an answer from the assistant, but a
+// question taken for a find request would be lost.
+//
+// Taken: the whole sentence is an opening, then 1 to 6 names (commas and "and" between them),
+// with or without "please", a full stop or a question mark:
+//   "find my keys" -> "keys"            "look for the remote" -> "remote"
+//   "where is the power bank?" -> "power bank"   "where are my keys" / "where's the cup"
+//   "can you see a bottle?" / "do you see the cup"   "find my keys and the remote" -> "keys, remote"
+// The little words "the", "my", "a" and "an" are dropped from the names.
+// Left for the assistant:
+//   another opening: "where did you last see the bottle", "when did ...", "is there a cup"
+//   a name with an apostrophe ("where is the project's code") or a capital, then small letters,
+//   which is a person or a place ("where is Sara")
+//   a word that is not part of a thing's name (FIND_NOT_A_NAME): "can you see well in the dark",
+//   "can you see me", "find out who built the car", "look for the keys on the table"
+//   a name of more than 4 words, more than 6 names, or a sentence over 80 characters.
+const FIND_OPENING = /^(?:please\s+)?(?:find|look\s+for|where\s+is|where\s+are|where's|can\s+you\s+see|do\s+you\s+see)\s+(.+)$/i;
+const FIND_LITTLE_WORDS = ["the", "my", "a", "an"];
+const FIND_NOT_A_NAME = [
+  "who", "what", "when", "where", "why", "how", "which", "whose", "that", "this", "these", "those",
+  "there", "here", "it", "its", "i", "me", "you", "your", "we", "us", "our", "he", "him", "his", "she", "her",
+  "they", "them", "their", "anyone", "anybody", "someone", "somebody", "everyone", "everybody",
+  "anything", "something", "everything", "nothing", "any", "some", "all", "every", "much", "many",
+  "and", "out", "about", "in", "on", "at", "of", "with", "without", "from", "to", "for", "by", "into", "under",
+  "over", "behind", "near", "between", "or", "if", "then", "than", "but", "so", "because", "not",
+  "is", "are", "was", "were", "be", "been", "do", "does", "did", "can", "could", "will", "would",
+  "should", "have", "has", "had", "going", "located", "kept", "made", "built", "headed",
+  "well", "clearly", "now", "today", "yesterday", "last", "ever", "still", "again", "very", "please",
+  "way", "answer", "time", "help", "information", "info", "project", "code", "team", "notes", "website",
+];
+const FIND_MAX_CHARS = 80;
+const FIND_MAX_WORDS = 4;      // in one name
+const FIND_MAX_NAMES = 6;      // as the server
+
+function findRequest(text) {
+  const sentence = asText(text).replace(/[‘’]/g, "'").replace(/\s+/g, " ").trim()
+    .replace(/[.!?]+$/, "").replace(/,?\s+please$/i, "").trim();
+  if (!sentence || sentence.length > FIND_MAX_CHARS) return null;
+  const match = FIND_OPENING.exec(sentence);
+  if (!match) return null;
+  const names = [];
+  for (const part of match[1].split(/\s*,\s*|\s+and\s+/i)) {
+    const words = part.split(" ").filter((word) => word && !FIND_LITTLE_WORDS.includes(word.toLowerCase()));
+    if (!words.length || words.length > FIND_MAX_WORDS) return null;
+    for (const word of words) {
+      if (FIND_NOT_A_NAME.includes(word.toLowerCase())) return null;
+      if (!/^[\p{L}\p{N}-]+$/u.test(word) || /^\p{Lu}\p{Ll}/u.test(word)) return null;
+    }
+    names.push(words.join(" "));
+  }
+  return names.length <= FIND_MAX_NAMES ? names.join(", ") : null;
 }
 
 // ---- the page coming alive: compact bar, slow headline, sections that rise in ----
@@ -1434,6 +1658,7 @@ function readObject(raw) {
     confidence: Number(raw.confidence) || 0,
     box: box.length === 4 && box.every(Number.isFinite) ? box : null,
     name: raw.name == null ? "" : asText(raw.name),
+    found: raw.found === true,        // one of the things the visitor is looking for
   };
 }
 
@@ -1453,11 +1678,11 @@ const percent = (confidence) => Math.round(confidence * 100) + "%";
 
 // What one pill says: a recognised person by name and role, anything else by label, track and confidence.
 function thingText(entry, roles) {
-  if (entry.name) return { name: entry.name, detail: roles.get(entry.name) || "", known: true };
+  if (entry.name) return { name: entry.name, detail: roles.get(entry.name) || "", known: true, found: entry.found };
   const parts = [];
   if (entry.track_id !== null) parts.push("#" + entry.track_id);
   parts.push(percent(entry.confidence));
-  return { name: entry.label, detail: parts.join("  "), known: false };
+  return { name: entry.label, detail: parts.join("  "), known: false, found: entry.found };
 }
 
 function thingItem(key) {
@@ -1515,6 +1740,9 @@ function drawObjects(status) {
     setText(button.lastChild, thing.detail);
     button.classList.toggle("is-known", thing.known);
     button.classList.toggle("is-gone", thing.gone);
+    button.classList.toggle("is-found", thing.found);
+    if (thing.found) button.title = FOUND_TITLE;
+    else button.removeAttribute("title");
     return item;
   });
   const same = items.length === things.children.length && items.every((item, i) => things.children[i] === item);
@@ -1570,6 +1798,7 @@ function setOnline(isOnline) {
   const wasOffline = online === false;
   online = isOnline;
   offline.hidden = isOnline;
+  finder.hidden = !isOnline;           // nothing can be looked for while the program is not running
   if (isOnline) {
     if (wasOffline) restartVideo();
     return;
@@ -1580,11 +1809,15 @@ function setOnline(isOnline) {
   greetings.replaceChildren();
   notes.replaceChildren();
   pictureRow.hidden = true;
+  clearSearch();
   setState("is-offline", "Program not running");
 }
 
+let pollCount = 0;             // the number of the newest status request
+
 async function poll() {
   const started = performance.now();
+  const number = ++pollCount;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), STATUS_TIMEOUT_MS);
   try {
@@ -1599,6 +1832,7 @@ async function poll() {
     phoneUrl = asText(status.phone_url);
     drawConnecting(status);
     drawPicture(status);
+    drawSearch(status, number);
   } catch (error) {
     setOnline(false);
   } finally {
@@ -1632,9 +1866,9 @@ function waitingDots() {
   return dots;
 }
 
-function addThinking() {
+function addThinking(label) {
   hint.hidden = true;
-  const item = make("li", "msg thinking", "Thinking");
+  const item = make("li", "msg thinking", label || "Thinking");
   item.append(waitingDots());
   messages.append(item);
   scrollChat();
@@ -1729,10 +1963,13 @@ form.addEventListener("submit", (event) => {
 });
 
 // Send what is in the chat field (typed, or heard by the microphone). False when nothing was sent.
+// A sentence that is only a request to find something starts a search instead (findRequest).
 function sendChat() {
   const question = input.value.trim();
   if (!question || busy) return false;
-  askChat(question);
+  const wanted = findRequest(question);
+  if (wanted !== null) findFromChat(question, wanted);
+  else askChat(question);
   return true;
 }
 
@@ -2236,11 +2473,14 @@ function followProblem(text) {
   answerArrived("follow", text, true);
 }
 
-// Send what is in the follow-up field (typed, or heard by the microphone). False when nothing was sent.
+// Send what is in the follow-up field when its microphone heard it. False when nothing was sent.
+// A sentence that is only a request to find something starts a search instead (findRequest).
 function sendFollowUp() {
   const question = followQuestion.value.trim();
   if (!question || followId === null || followQuestion.disabled) return false;
-  askFollowUp(question, true);
+  const wanted = findRequest(question);
+  if (wanted !== null) findFromPanel(question, wanted);
+  else askFollowUp(question, true);
   return true;
 }
 
@@ -2572,6 +2812,7 @@ function enterFullView() {
   if (!stage.contains(document.activeElement)) fullButton.focus({ preventScroll: true });
   labelFullButton();
   fitDetails();                        // in full view the panel has a column of its own
+  timelineChanged();                   // the timeline is not refreshed behind the full view
   if (canAskScreen && !isScreenFull()) {
     stage.requestFullscreen().catch(() => {});   // refused: the window-filling view stays
   }
@@ -2585,6 +2826,7 @@ function leaveFullView() {
   putPageBehindBack();
   labelFullButton();
   fitDetails();
+  timelineChanged();
   if (isScreenFull()) document.exitFullscreen().catch(() => {});
 }
 
@@ -3618,6 +3860,360 @@ async function describeScene() {
 
 sceneButton.addEventListener("click", describeScene);
 
+// ---- looking for things by name: the Look for field, find by words, what is said ---------
+//
+// The search runs on the server: POST /api/search starts it (with the text as typed, which the
+// server splits into names), DELETE stops it, and every page draws the chips from
+// status.search. The video shows the found things (the server draws them), and their pills in
+// the In view list are marked.
+//
+// What is said follows the owner's rule: the page speaks only in answer to something the
+// visitor just did on this page. For a search that is two things, and only on the page that
+// started it:
+//   1. the answer to the request, made from the status once the finder is ready (or after
+//      FIND_WAIT_MS if it is still loading): "I can see the keys, on the left." /
+//      "I can't see a power bank right now. I'll keep looking.";
+//   2. later, at most once per name and search, "I can see the power bank now, on the left."
+//      for a name that was not in view when the answer was given: the visitor asked to be told.
+// Nothing else about a search is ever said. `finding` is this page's own search and holds that
+// state; `waitingFor` is the names still owed their "now", and a name is taken out of it the
+// moment it is said, so it is said once. A new request replaces `finding`; Stop, or a status
+// that shows another search (stopped or replaced on another page), sets it to null, and from
+// then on nothing is said. Another page never has a `finding` for this search, so it is silent.
+// Each answer goes back where the request came from: the chat, the panel's chat (its
+// microphone) or the caption (the Look for field). A conversation speaks the answer and goes on.
+
+const FIND_WAIT_MS = 20000;    // the answer waits at most this long for the finder (the first load takes about 15 s)
+const FIND_SETTLE_MS = 1500;   // once ready, the finder has this long to see a name before it is called missing
+const PLACE_WORDS = { left: "on the left", middle: "in the middle", right: "on the right" };
+
+const finder = byId("finder"), finderForm = byId("finderForm"), finderText = byId("finderText");
+const findChips = byId("findChips"), finderStop = byId("finderStop");
+const chipItems = new Map();   // a name in small letters -> its chip on the page, reused so it does not pop again
+
+let finding = null;            // this page's own search: { names, where, deliver, tell, waitingFor, ... }, or null
+
+function readSearch(raw) {
+  const search = raw && typeof raw === "object" ? raw : {};
+  return {
+    names: asList(search.names).map(asText).filter(Boolean),
+    state: ["loading", "ready", "failed"].includes(search.state) ? search.state : "off",
+    note: asText(search.note),
+    found: asList(search.found).filter((entry) => entry && typeof entry === "object").map((entry) => ({
+      name: asText(entry.name), count: Math.max(1, Math.floor(Number(entry.count)) || 1), place: asText(entry.place),
+    })),
+  };
+}
+
+const sameName = (a, b) => a.toLowerCase() === b.toLowerCase();
+const sameNames = (a, b) => a.length === b.length && a.every((name, i) => sameName(name, b[i]));
+const placeWords = (place) => PLACE_WORDS[place] || "in the picture";
+const foundEntry = (search, name) => search.found.find((entry) => sameName(entry.name, name)) || null;
+
+// ---- the chips: one per name, saying what the status says ----
+
+function chipState(search, name) {
+  if (search.state === "loading") return { text: "loading the finder ...", found: false };
+  if (search.state === "failed") return { text: "could not start", found: false };
+  const entry = foundEntry(search, name);
+  if (!entry) return { text: "not in view", found: false };
+  return { text: entry.count > 1 ? "found (" + entry.count + ")" : "found " + placeWords(entry.place), found: true };
+}
+
+function chipItem() {
+  const item = make("li", "find-chip");
+  item.append(make("span", "find-chip-name"), make("span", "find-chip-state"));
+  return item;
+}
+
+function drawChips(search) {
+  const looking = search.state !== "off" && search.names.length > 0;
+  const chips = looking ? search.names.map((name) => ({ name, ...chipState(search, name) })) : [];
+  if (!changed("search", { chips, state: search.state, note: search.note })) return;
+  const keys = new Set(chips.map((chip) => chip.name.toLowerCase()));
+  for (const key of [...chipItems.keys()]) if (!keys.has(key)) chipItems.delete(key);
+  const items = chips.map((chip) => {
+    const key = chip.name.toLowerCase();
+    const item = chipItems.get(key) || chipItem();
+    chipItems.set(key, item);
+    setText(item.firstChild, chip.name);
+    setText(item.lastChild, chip.text);
+    item.classList.toggle("is-found", chip.found);
+    item.classList.toggle("is-failed", search.state === "failed");
+    item.title = search.state === "failed" && search.note ? search.note : chip.name + ": " + chip.text;
+    return item;
+  });
+  const same = items.length === findChips.children.length && items.every((item, i) => findChips.children[i] === item);
+  if (!same) findChips.replaceChildren(...items);
+  findChips.hidden = !looking;
+  finderStop.hidden = !looking;
+  fitFinderRoom();
+}
+
+function clearSearch() {
+  findChips.replaceChildren();
+  chipItems.clear();
+  findChips.hidden = true;
+  finderStop.hidden = true;
+  fitFinderRoom();
+}
+
+// The caption sits just above the Look for row, however tall the wrapping chips make it.
+function fitFinderRoom() {
+  const room = (finder.hidden ? 0 : finder.offsetHeight) + 10 + "px";
+  if (frame.style.getPropertyValue("--finder-room") !== room) frame.style.setProperty("--finder-room", room);
+}
+if ("ResizeObserver" in window) new ResizeObserver(fitFinderRoom).observe(finder);
+
+// Every status poll: the chips, then what this page's own search may have to say.
+function drawSearch(status, number) {
+  const search = readSearch(status.search);
+  drawChips(search);
+  followFind(search, number);
+}
+
+// ---- the words: plain English, with "a" or "an" and the plural right ----
+
+// "keys" and "glasses" are plural; "glass", "bus" and "iris" are not.
+function looksPlural(name) {
+  const last = name.split(" ").pop().toLowerCase();
+  return /s$/.test(last) && !/(ss|us|is)$/.test(last);
+}
+
+function startsWithVowelSound(name) {
+  const word = name.toLowerCase();
+  if (/^(hour|honest|heir)/.test(word)) return true;
+  if (/^(uni|use|usu|usb|ura|ure|uro|eu|one|once)/.test(word)) return false;
+  return /^[aeiou]/.test(word);
+}
+
+// "a power bank", "an umbrella", "any keys"
+function anyOf(name) {
+  if (looksPlural(name)) return "any " + name;
+  return (startsWithVowelSound(name) ? "an " : "a ") + name;
+}
+
+// "2 bottles", "3 boxes", "2 batteries", "2 keys"
+function pluralOf(name) {
+  if (looksPlural(name)) return name;
+  if (/(s|x|z|ch|sh)$/i.test(name)) return name + "es";
+  if (/[^aeiou]y$/i.test(name)) return name.slice(0, -1) + "ies";
+  return name + "s";
+}
+
+function joinWith(parts, word) {
+  if (parts.length < 2) return parts.join("");
+  return parts.slice(0, -1).join(", ") + " " + word + " " + parts[parts.length - 1];
+}
+
+// "I can see the wifi router, on the right." / "I can see 2 bottles now, the clearest one on the left."
+function seenSentence(entry, now) {
+  const when = now ? " now" : "";
+  if (entry.count > 1) {
+    return "I can see " + entry.count + " " + pluralOf(entry.name) + when + ", the clearest one " + placeWords(entry.place) + ".";
+  }
+  return "I can see the " + entry.name + when + ", " + placeWords(entry.place) + ".";
+}
+
+// The answer to a request: what is in view, then what is not.
+function findSentences(search, names) {
+  const seen = names.map((name) => foundEntry(search, name)).filter(Boolean);
+  const missing = names.filter((name) => !foundEntry(search, name));
+  const parts = seen.map((entry) => seenSentence(entry, false));
+  if (missing.length) parts.push("I can't see " + joinWith(missing.map(anyOf), "or") + " right now. I'll keep looking.");
+  return parts.join(" ");
+}
+
+// ---- starting a search, and following it ----
+
+// Start looking for `text` (typed, or the names findRequest found). `reply` says where the
+// answers go: deliver(text, isProblem) for the answer, tell(text) for a later "now", and
+// started() once the server took the names.
+async function startFind(text, reply) {
+  if (finding && !finding.answered) findAnswered(finding, "A newer search replaced this one.", true);
+  const mine = { ...reply, names: null, fromPoll: Infinity, readyAt: 0, answered: false, waitingFor: new Set(), timer: 0 };
+  finding = mine;              // an earlier search of this page says nothing more
+  let result = null;
+  try {
+    result = await postJson("/api/search", { text });
+  } catch (error) {
+    result = null;
+  }
+  if (finding !== mine) return;          // replaced or stopped meanwhile
+  if (!result) {
+    findAnswered(mine, "Program not running: the search could not be started.", true);
+    return;
+  }
+  const { response, data } = result;
+  if (!response.ok || !data || data.ok !== true || !Array.isArray(data.names)) {
+    findAnswered(mine, errorText(data, response, "Please try again."), true);
+    return;
+  }
+  mine.names = data.names.map(asText);
+  mine.fromPoll = pollCount + 1;         // only a status asked for after the server started this search
+  mine.timer = setTimeout(() => findTimedOut(mine), FIND_WAIT_MS);
+  if (mine.started) mine.started();
+}
+
+// One status for this page's own search: wait, answer, tell what has come into view, or let go.
+function followFind(search, number) {
+  const mine = finding;
+  if (!mine || mine.names === null || number < mine.fromPoll) return;
+  const ours = sameNames(search.names, mine.names) && search.state !== "off" &&
+               !(mine.readyAt && search.state === "loading");     // loading again: another page asked again
+  if (!ours) {
+    endFind(mine, "The search was stopped or replaced on another page.");
+    return;
+  }
+  if (search.state === "failed") {
+    endFind(mine, "The finder could not start. " + (search.note || "No reason was given."));
+    return;
+  }
+  if (search.state !== "ready") return;  // still loading
+  if (!mine.readyAt) mine.readyAt = performance.now();
+  if (mine.answered) {
+    tellNewlyFound(mine, search);
+    return;
+  }
+  const allSeen = mine.names.every((name) => foundEntry(search, name));
+  if (allSeen || performance.now() - mine.readyAt >= FIND_SETTLE_MS) answerFind(mine, search);
+}
+
+function answerFind(mine, search) {
+  for (const name of mine.names) if (!foundEntry(search, name)) mine.waitingFor.add(name.toLowerCase());
+  findAnswered(mine, findSentences(search, mine.names), false);
+}
+
+// A name that was not in view when the answer was given: said once, the first time it is seen.
+// Taking it out of waitingFor is what makes it once; a new search starts with a new, empty set.
+function tellNewlyFound(mine, search) {
+  for (const name of mine.names) {
+    const entry = foundEntry(search, name);
+    if (!entry || !mine.waitingFor.delete(name.toLowerCase())) continue;
+    tellFound(mine, seenSentence(entry, true));
+  }
+  if (mine.waitingFor.size === 0 && finding === mine) finding = null;   // nothing more to say
+}
+
+function tellFound(mine, text) {
+  mine.tell(text);
+  say(text, "found");                    // the visitor asked to be told; spoken when voice is on
+}
+
+// The finder is still loading after FIND_WAIT_MS: answer now, and say "now" for each name later.
+function findTimedOut(mine) {
+  if (finding !== mine || mine.answered) return;
+  if (online === false) {
+    endFind(mine, "Program not running: the search could not be followed.");
+    return;
+  }
+  for (const name of mine.names) mine.waitingFor.add(name.toLowerCase());
+  const names = joinWith(mine.names.map((name) => "the " + name), "and");
+  findAnswered(mine, "The finder is still loading; the first time takes about 15 seconds. " +
+                     "I'll tell you when I can see " + names + ".", false);
+}
+
+function findAnswered(mine, text, isProblem) {
+  mine.answered = true;
+  clearTimeout(mine.timer);
+  if (isProblem && finding === mine) finding = null;
+  mine.deliver(text, isProblem);
+}
+
+// This page's search is over: an answer still owed is given as a problem (never spoken), and
+// nothing more is said about it.
+function endFind(mine, problem) {
+  if (!mine.answered) findAnswered(mine, problem, true);
+  if (finding === mine) finding = null;
+}
+
+// ---- where a request comes from ----
+
+// The chat field, its microphone, the stage microphone without a panel, and conversation mode.
+function findFromChat(question, wanted) {
+  addMessage("question", question);
+  input.value = "";
+  setBusy(true);
+  const looking = addThinking("Looking");
+  startFind(wanted, {
+    where: "chat",
+    deliver: (text, isProblem) => {
+      looking.remove();
+      setBusy(false);
+      addMessage(isProblem ? "error" : "answer", text);
+      answerArrived("chat", text, isProblem);   // spoken when voice is on; a conversation speaks it and goes on
+      input.focus({ preventScroll: true });
+    },
+    tell: (text) => {
+      addMessage("answer", text);
+      if (fullView && !captionWait) showCaption("", text, false, CAPTION_MS);
+    },
+  });
+}
+
+// The panel's microphone (and the stage microphone while a panel with its chat is open).
+function findFromPanel(question, wanted) {
+  const id = followId, shown = lookup;
+  const samePanel = () => shown === lookup && id === followId;
+  followQuestion.value = "";
+  addFollowMessage("question", question);
+  const looking = addFollowWaiting();
+  setFollowBusy(true);
+  startFind(wanted, {
+    where: "follow",
+    deliver: (text, isProblem) => {
+      if (!samePanel()) {                         // another thing is shown now: written in the chat, not spoken
+        addMessage(isProblem ? "error" : "answer", text);
+        return;
+      }
+      looking.remove();
+      setFollowBusy(false);
+      addFollowMessage(isProblem ? "error" : "answer", text);
+      answerArrived("follow", text, isProblem);
+      followQuestion.focus({ preventScroll: true });
+    },
+    tell: (text) => {
+      if (samePanel() && !details.hidden) addFollowMessage("answer", text);
+      else addMessage("answer", text);
+      if (fullView && !captionWait) showCaption("", text, false, CAPTION_MS);
+    },
+  });
+}
+
+// The Look for field on the video: the answer is shown in the caption.
+finderForm.addEventListener("submit", (event) => {
+  event.preventDefault();
+  const text = finderText.value.trim();
+  if (!text) {
+    finderText.focus({ preventScroll: true });
+    return;
+  }
+  const question = "Look for " + text;
+  showCaption(question, "Looking ...", false, CAPTION_WAIT_MS);
+  captionWait = { where: "stage", question };
+  startFind(text, {
+    where: "stage",
+    started: () => {
+      if (finderText.value.trim() === text) finderText.value = "";   // taken: the chips show it now
+    },
+    deliver: (answer, isProblem) => answerArrived("stage", answer, isProblem),
+    tell: (answer) => {
+      if (!captionWait) showCaption("", answer, false, CAPTION_MS);
+    },
+  });
+});
+
+finderStop.addEventListener("click", async () => {
+  if (finding) endFind(finding, "The search was stopped.");   // nothing more is said about it
+  finderText.focus({ preventScroll: true });                   // Stop hides itself
+  try {
+    const { response, data } = await sendJson("DELETE", "/api/search");
+    if (!response.ok || !data || data.ok !== true) showCaption("", errorText(data, response, "Please try again."), true, CAPTION_MS);
+  } catch (error) {
+    showCaption("", "Program not running: the search could not be stopped.", true, CAPTION_MS);
+  }
+});
+
 // ---- people: add a person, take their photos, change or remove them ---------------------
 //
 // The list comes from /api/people: details and how many photos, never a picture. Saving and
@@ -3929,6 +4525,216 @@ async function followRunningPhotos() {
 }
 
 loadPeople().then(followRunningPhotos);
+
+// ---- the timeline: what the camera remembers ----------------------------------------------
+//
+// The rows come from /api/memory, newest first. They are asked for only while the section is
+// on screen (IntersectionObserver), the page is visible (Page Visibility) and the full view is
+// not open: once when it comes into view, then every TIMELINE_EVERY_MS; never otherwise. The
+// times are written here from the numbers the server sends, each time the rows are drawn. Rows
+// are kept by their id and only their words change, so a refresh never redraws or moves the
+// rows that stay, and the list scrolls in its own box. A picture is shown only for an object,
+// from an address made of the row's numeric id alone.
+
+const TIMELINE_EVERY_MS = 10000;
+const TIMELINE_LIMIT = 50;
+const FILTER_WAIT_MS = 300;    // the filter asks the server this long after the last key
+const NOTHING_REMEMBERED = "Nothing remembered yet. Things that stay in view for a moment appear here.";
+
+const timelineSection = byId("timeline"), timelineBox = byId("timelineBox");
+const timelineList = byId("timelineList"), timelineEmpty = byId("timelineEmpty"), timelineResult = byId("timelineResult");
+const timelineFilter = byId("timelineFilter"), timelineClear = byId("timelineClear");
+const timelineConfirm = byId("timelineConfirm"), timelineClearYes = byId("timelineClearYes");
+const timelineClearNo = byId("timelineClearNo");
+const memoryOn = timelineSection.dataset.memory === "on";   // off: the section only says so
+
+let timelineInView = !("IntersectionObserver" in window);   // without the observer: whenever the page is visible
+let timelineTimer = 0;         // the next refresh; 0 when none waits
+let timelineLoading = false;
+let timelineRound = 0;         // the newest request; an older answer (an older filter) is dropped
+let filterTimer = 0;
+let momentItems = new Map();   // sighting id -> its row on the page
+
+const timelineWanted = () => memoryOn && timelineInView && !fullView && document.visibilityState === "visible";
+
+// The section came into view or left it, the page was hidden or shown, the full view changed.
+function timelineChanged() {
+  if (!timelineWanted()) {
+    clearTimeout(timelineTimer);
+    timelineTimer = 0;
+    return;
+  }
+  if (!timelineTimer && !timelineLoading) loadTimeline();
+}
+
+async function loadTimeline() {
+  clearTimeout(timelineTimer);
+  timelineTimer = 0;
+  const round = ++timelineRound;
+  const text = timelineFilter.value.trim();
+  const address = "/api/memory?limit=" + TIMELINE_LIMIT + (text ? "&text=" + encodeURIComponent(text) : "");
+  timelineLoading = true;
+  let reply = null;
+  try {
+    reply = await getJson(address);
+  } catch (error) {
+    reply = null;
+  }
+  if (round !== timelineRound) return;   // the filter changed meanwhile: the newer request draws
+  timelineLoading = false;
+  if (!reply) {
+    showResult(timelineResult, "Program not running: the timeline could not be loaded.", "", true);
+  } else if (!reply.response.ok || !reply.data || !Array.isArray(reply.data.sightings)) {
+    showResult(timelineResult, errorText(reply.data, reply.response, "Please try again."), "", true);
+  } else {
+    if (timelineResult.classList.contains("problem")) showResult(timelineResult, "", "", false);
+    drawTimeline(reply.data.sightings.map(readMoment).filter(Boolean), text);
+  }
+  if (timelineWanted()) timelineTimer = setTimeout(loadTimeline, TIMELINE_EVERY_MS);
+}
+
+function readMoment(raw) {
+  if (!raw || typeof raw !== "object" || !Number.isSafeInteger(raw.id) || raw.id < 1) return null;
+  const first = Number(raw.first_seen), last = Number(raw.last_seen);
+  if (!Number.isFinite(first) || !Number.isFinite(last)) return null;
+  const kind = raw.kind === "person" ? "person" : "object";
+  return { id: raw.id, kind, label: asText(raw.label), name: raw.name == null ? "" : asText(raw.name),
+           first, last, place: asText(raw.place), picture: kind === "object" && raw.has_picture === true };
+}
+
+// The only address a timeline picture comes from: the route and a whole number, nothing else.
+function pictureAddress(id) {
+  return Number.isSafeInteger(id) && id > 0 ? "/api/memory/" + id + "/picture" : null;
+}
+
+// "3 minutes", "1 hour": rounded down, as the assistant's memory lines are.
+function countOf(amount, unit) {
+  const whole = Math.floor(amount);
+  return whole + " " + unit + (whole === 1 ? "" : "s");
+}
+
+function timeAgo(seconds) {
+  if (seconds < 10) return "just now";
+  if (seconds < 60) return countOf(seconds, "second") + " ago";
+  if (seconds < 3600) return countOf(seconds / 60, "minute") + " ago";
+  if (seconds < 86400) return countOf(seconds / 3600, "hour") + " ago";
+  if (seconds < 172800) return "yesterday";
+  return countOf(seconds / 86400, "day") + " ago";
+}
+
+function howLong(seconds) {
+  if (seconds < 1) return "less than a second";
+  if (seconds < 60) return countOf(seconds, "second");
+  if (seconds < 3600) return countOf(seconds / 60, "minute");
+  return countOf(seconds / 3600, "hour");
+}
+
+// "seen 3 minutes ago · in view for 2 minutes · on the left"
+function momentDetail(moment, now) {
+  return "seen " + timeAgo(now - moment.last) + " · in view for " + howLong(moment.last - moment.first) +
+         " · " + placeWords(moment.place);
+}
+
+const momentName = (moment) => (moment.kind === "person" ? moment.name || "Unrecognised person" : moment.label);
+
+// A row: the small picture (objects only) or a letter in its place, the name and one line of detail.
+function momentItem(moment) {
+  const item = make("li", "moment");
+  const address = moment.picture ? pictureAddress(moment.id) : null;
+  let face;
+  if (address) {
+    face = make("img", "moment-picture");
+    face.alt = "";                     // the name stands beside it
+    face.loading = "lazy";
+    face.decoding = "async";
+    face.src = address;
+  } else {
+    face = make("span", "moment-mark", (Array.from(momentName(moment))[0] || "").toUpperCase());
+    face.setAttribute("aria-hidden", "true");
+  }
+  const words = make("div");
+  words.append(make("p", "moment-name"), make("p", "moment-detail"));
+  item.append(face, words);
+  item.dataset.picture = address ? "yes" : "no";
+  return item;
+}
+
+function drawTimeline(moments, filter) {
+  const now = Date.now() / 1000;
+  const kept = new Map();
+  const items = moments.map((moment) => {
+    let item = momentItems.get(moment.id);
+    if (!item || item.dataset.picture !== (moment.picture ? "yes" : "no")) item = momentItem(moment);
+    const words = item.lastChild;
+    setText(words.firstChild, momentName(moment));
+    setText(words.lastChild, momentDetail(moment, now));
+    kept.set(moment.id, item);
+    return item;
+  });
+  momentItems = kept;
+  placeInOrder(timelineList, items);
+  setText(timelineEmpty, filter ? 'Nothing remembered matches "' + filter + '".' : NOTHING_REMEMBERED);
+  timelineEmpty.hidden = items.length > 0;
+}
+
+// Put the rows in this order, moving only those not in their place yet: a row that stays is
+// never taken out and put back, which would play its entry again.
+function placeInOrder(list, items) {
+  items.forEach((item, i) => {
+    if (list.children[i] !== item) list.insertBefore(item, list.children[i] || null);
+  });
+  while (list.children.length > items.length) list.lastChild.remove();
+}
+
+function setUpTimeline() {
+  if (!memoryOn) return;
+  if ("IntersectionObserver" in window) {
+    new IntersectionObserver((entries) => {
+      timelineInView = entries[entries.length - 1].isIntersecting;
+      timelineChanged();
+    }).observe(timelineBox);
+  }
+  document.addEventListener("visibilitychange", timelineChanged);
+  timelineFilter.addEventListener("input", () => {
+    clearTimeout(filterTimer);
+    filterTimer = setTimeout(() => {
+      if (timelineWanted()) loadTimeline();   // otherwise the next look uses the filter
+    }, FILTER_WAIT_MS);
+  });
+  // Clear memory: asked once, in the page, never with a browser dialog.
+  timelineClear.addEventListener("click", () => {
+    timelineConfirm.hidden = false;
+    timelineClearNo.focus({ preventScroll: true });
+  });
+  timelineClearNo.addEventListener("click", () => {
+    timelineConfirm.hidden = true;
+    timelineClear.focus({ preventScroll: true });
+  });
+  timelineClearYes.addEventListener("click", clearMemory);
+  timelineChanged();
+}
+
+async function clearMemory() {
+  timelineClearYes.disabled = true;
+  try {
+    const { response, data } = await sendJson("DELETE", "/api/memory");
+    if (response.ok && data && data.ok === true) {
+      timelineConfirm.hidden = true;
+      showResult(timelineResult, "The camera's memory was emptied.", "", false);
+      timelineClear.focus({ preventScroll: true });
+      drawTimeline([], "");
+      if (timelineWanted()) loadTimeline();
+    } else {
+      showResult(timelineResult, errorText(data, response, "Please try again."), "", true);
+    }
+  } catch (error) {
+    showResult(timelineResult, "Program not running: the memory could not be emptied.", "", true);
+  } finally {
+    timelineClearYes.disabled = false;
+  }
+}
+
+setUpTimeline();
 
 // ---- keys: Escape closes the topmost thing, F switches the full view -----------------
 

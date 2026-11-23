@@ -16,11 +16,20 @@ Why a short flicker is not remembered: a detector sometimes gives a wrong label
 for a frame or two (a cushion called "cat"). That label never stays for a full
 ``min_seconds``, so it remains a candidate and is forgotten without a trace.
 
-Threads: the video loop calls ``seen`` many times a second; the web server
-calls ``recent``, ``picture``, ``summary`` and ``clear``. They share one SQLite
-connection guarded by one lock. ``seen`` mostly changes things in memory: the
-file is written at most once every 2 seconds, in one short transaction, so the
-video never waits long for the disk.
+Threads: the video loop calls ``seen`` many times a second and ``tick`` on
+every turn, also when nothing is in view; ``tick`` does the periodic work
+(writing, finishing rows whose thing has gone, the hourly delete). ``seen``
+mostly changes things in memory: the file is written at most once every 2
+seconds, in one short transaction, so the video never waits long for the disk.
+
+The web server and the assistant's summary read through a second connection
+of their own, with a lock of their own (``_side_lock``). The file is in WAL
+mode, so a slow filter query there never holds up the video's writes, and
+``clear`` empties the file there too: the video's lock is held only for the
+moment it takes to forget what is followed in memory.
+
+At most MAX_ROWS sightings are kept (the newest); older ones go at start-up
+and at the hourly delete, so the file and its queries stay small.
 
 Failure is quiet: when the file cannot be created, is locked or is broken, the
 problem is logged once, the video goes on and reads give empty results. A
@@ -53,7 +62,9 @@ CANDIDATE_GAP_SECONDS = 1.0     # a candidate not seen for this long is forgotte
 DELETE_OLD_EVERY_SECONDS = 3600.0
 MAX_PICTURE_BYTES = 40_000      # larger pictures are refused quietly
 MAX_FOLLOWED = 200              # things followed in memory at once, at most
-BUSY_TIMEOUT_SECONDS = 0.1      # how long to wait for a file locked by another program
+MAX_ROWS = 20_000               # sightings kept in the file, the newest
+BUSY_TIMEOUT_SECONDS = 0.1      # how long the video waits for a file locked by another program
+SIDE_BUSY_TIMEOUT_SECONDS = 2.0 # ... and how long a web thread waits
 
 MINUTE = 60.0
 HOUR = 3600.0
@@ -130,11 +141,27 @@ class SightingLog:
         self._old_deleted_at: float | None = None
         self._warned: set[str] = set()
         self._closed = False
+        self._clearing = False          # clear() is emptying the file: the video does not write meanwhile
         self._db = self._open()
+        self._db_number = 0             # goes up when the file is replaced; the side connection follows
+        self._side_lock = threading.Lock()
+        self._side: sqlite3.Connection | None = None
+        self._side_number = -1          # the _db_number the side connection was opened for
         start_up = time.time()
         self._use_db("deleting old sightings", lambda db: self._delete_old(db, start_up), None)
 
     # ----- what the video loop calls -----
+
+    def tick(self, now: float) -> None:
+        """The periodic work, called on every turn of the video loop, also with nothing in view.
+
+        Writes what changed (at most every 2 seconds), finishes the rows of
+        things that have gone, and deletes old rows once an hour. Without it a
+        thing that leaves the picture would wait for the next ``seen`` to be written.
+        """
+        with self._lock:
+            if not self._closed and self._write_due(now):
+                self._write_and_tidy(now)
 
     def seen(self, key: Hashable, kind: str, label: str, name: str | None, place: str,
              confidence: float, now: float, picture: bytes | None = None) -> None:
@@ -180,17 +207,15 @@ class SightingLog:
             query += " WHERE instr(folded(s.label), ?) > 0 OR instr(folded(s.name), ?) > 0"
             values = (needle, needle)
         query += " ORDER BY s.last_seen DESC, s.id DESC LIMIT ?"
-        with self._lock:
-            rows = self._use_db("reading the memory",
-                                lambda db: db.execute(query, (*values, limit)).fetchall(), [])
+        rows = self._use_side("reading the memory",
+                              lambda db: db.execute(query, (*values, limit)).fetchall(), [])
         return [_sighting(row) for row in rows]
 
     def picture(self, sighting_id: int) -> bytes | None:
         """The small JPEG of one sighting, or None when there is none."""
         query = "SELECT jpeg FROM pictures WHERE sighting_id = ?"
-        with self._lock:
-            row = self._use_db("reading a picture",
-                               lambda db: db.execute(query, (int(sighting_id),)).fetchone(), None)
+        row = self._use_side("reading a picture",
+                             lambda db: db.execute(query, (int(sighting_id),)).fetchone(), None)
         return bytes(row[0]) if row else None
 
     def summary(self, now: float, limit: int = 30) -> list[str]:
@@ -203,20 +228,28 @@ class SightingLog:
         query = ("SELECT kind, label, name, first_seen, MAX(last_seen) AS latest, place"
                  " FROM sightings GROUP BY kind, label, name"
                  " ORDER BY latest DESC LIMIT ?")
-        with self._lock:
-            rows = self._use_db("reading the memory",
-                                lambda db: db.execute(query, (max(0, int(limit)),)).fetchall(), [])
+        rows = self._use_side("reading the memory",
+                              lambda db: db.execute(query, (max(0, int(limit)),)).fetchall(), [])
         return [_summary_line(*row, now=now) for row in rows]
 
     def clear(self) -> None:
-        """Forget everything: the file is emptied and nothing in view is carried over."""
+        """Forget everything: the file is emptied and nothing in view is carried over.
+
+        The video's lock is held only to forget what is followed and to stop
+        its writes; the slow emptying of the file happens on the side connection.
+        """
         with self._lock:
             self._followed.clear()
             self._finished.clear()
-            self._use_db("emptying the memory", _delete_everything, None)
+            self._clearing = True
+        try:
+            self._use_side("emptying the memory", _delete_everything, None)
             # Also empty the write-ahead file, so the old rows do not linger on disk.
-            self._use_db("emptying the memory",
-                         lambda db: db.execute("PRAGMA wal_checkpoint(TRUNCATE)"), None)
+            self._use_side("emptying the memory",
+                           lambda db: db.execute("PRAGMA wal_checkpoint(TRUNCATE)"), None)
+        finally:
+            with self._lock:
+                self._clearing = False
 
     def close(self) -> None:
         """Write what is still open and close the file. Later calls do nothing."""
@@ -230,6 +263,10 @@ class SightingLog:
             if self._db is not None:
                 _close_quietly(self._db)
                 self._db = None
+        with self._side_lock:
+            if self._side is not None:
+                _close_quietly(self._side)
+                self._side = None
 
     # ----- following things in memory -----
 
@@ -271,6 +308,8 @@ class SightingLog:
     # ----- writing the file -----
 
     def _write_due(self, now: float) -> bool:
+        if self._clearing:
+            return False                # what is in view now is written once the file is empty
         if self._written_at is None or now < self._written_at:
             self._written_at = now
             return False
@@ -302,10 +341,15 @@ class SightingLog:
         self._finished.clear()
 
     def _delete_old(self, db: sqlite3.Connection, now: float) -> None:
+        """Delete the rows older than keep_days, and all but the newest MAX_ROWS."""
         cutoff = now - self.keep_seconds
         db.execute("DELETE FROM pictures WHERE sighting_id IN"
                    " (SELECT id FROM sightings WHERE last_seen < ?)", (cutoff,))
         db.execute("DELETE FROM sightings WHERE last_seen < ?", (cutoff,))
+        beyond = ("SELECT id FROM sightings ORDER BY last_seen DESC, id DESC"
+                  " LIMIT -1 OFFSET ?")       # every row after the newest MAX_ROWS
+        db.execute(f"DELETE FROM pictures WHERE sighting_id IN ({beyond})", (MAX_ROWS,))
+        db.execute(f"DELETE FROM sightings WHERE id IN ({beyond})", (MAX_ROWS,))
 
     # ----- the file itself, and its problems -----
 
@@ -321,6 +365,43 @@ class SightingLog:
             if _is_broken_file(error):
                 self._start_fresh()
             return default
+
+    def _use_side(self, what: str, action: Callable[[sqlite3.Connection], Any], default: Any) -> Any:
+        """Like _use_db, on the side connection the web threads share (never the video's lock).
+
+        Nothing is read when the video's own connection could not open the
+        file. A problem is logged once; a broken file is left to the video's
+        connection to replace.
+        """
+        with self._side_lock:
+            db = self._side_connection()
+            if db is None:
+                return default
+            try:
+                with db:
+                    return action(db)
+            except sqlite3.Error as error:
+                self._warn_once(what, error)
+                _close_quietly(db)
+                self._side = None       # opened afresh next time
+                return default
+
+    def _side_connection(self) -> sqlite3.Connection | None:
+        """The side connection, opened (again) when needed. Call with _side_lock held."""
+        if self._closed or self._db is None:
+            return None
+        if self._side is not None and self._side_number == self._db_number:
+            return self._side
+        if self._side is not None:
+            _close_quietly(self._side)      # the file was replaced: follow it
+            self._side = None
+        try:
+            self._side = self._connect(SIDE_BUSY_TIMEOUT_SECONDS)
+        except (sqlite3.Error, OSError) as error:
+            self._warn_once("reading the memory", error)
+            return None
+        self._side_number = self._db_number
+        return self._side
 
     def _open(self) -> sqlite3.Connection | None:
         """Open the file, creating it and its folder. A broken file is moved aside."""
@@ -341,7 +422,7 @@ class SightingLog:
             self._warn_once("opening the memory file", error)
             return None
 
-    def _connect(self) -> sqlite3.Connection:
+    def _connect(self, busy_seconds: float = BUSY_TIMEOUT_SECONDS) -> sqlite3.Connection:
         db = sqlite3.connect(self.path, timeout=2.0, check_same_thread=False)
         try:
             db.create_function("folded", 1, _folded, deterministic=True)
@@ -349,7 +430,7 @@ class SightingLog:
             db.execute("PRAGMA synchronous = NORMAL")    # no waiting for the disk on each write
             db.execute("PRAGMA secure_delete = ON")      # deleted rows are overwritten
             db.executescript(SCHEMA)
-            db.execute(f"PRAGMA busy_timeout = {int(BUSY_TIMEOUT_SECONDS * 1000)}")
+            db.execute(f"PRAGMA busy_timeout = {int(busy_seconds * 1000)}")
         except BaseException:
             _close_quietly(db)
             raise
@@ -362,6 +443,7 @@ class SightingLog:
         self._db = None
         self._move_aside()
         self._db = self._open()
+        self._db_number += 1            # the side connection opens the new file next time
         for thing in [*self._followed.values(), *self._finished]:
             thing.row_id = None
             thing.changed = True

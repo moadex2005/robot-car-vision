@@ -1,6 +1,7 @@
 """The detector logic, tested with a fake YOLO model. No camera, network or graphics card needed."""
 
 import ast
+import logging
 import subprocess
 import sys
 from pathlib import Path
@@ -984,3 +985,43 @@ def test_reset_tracks_and_a_new_frame_size_start_the_tracks_again():
 
 def test_reset_tracks_before_load_is_fine(no_real_yoloe):
     OpenDetector(OPEN_SETTINGS).reset_tracks()
+
+
+# warm_up() and what a failed set_names() logs (M13 review)
+
+
+def test_warm_up_runs_once_on_a_blank_picture_and_starts_the_tracks_afresh():
+    model = FakeYoloe(open_result([0], ids=[1]))
+    detector = OpenDetector(OPEN_SETTINGS, model=model)
+    detector.set_names(["keys"])
+    resets = model.resets
+    detector.warm_up((640, 360))
+    assert len(model.frames) == 1
+    assert model.frames[0].shape == (360, 640, 3) and not model.frames[0].any()
+    assert model.resets == resets + 1                  # its track is forgotten
+    detector.detect(frame(640, 360))                   # the same size afterwards: no extra reset
+    assert model.resets == resets + 1
+
+
+def test_warm_up_with_no_names_does_nothing():
+    model = FakeYoloe()
+    OpenDetector(OPEN_SETTINGS, model=model).warm_up((640, 360))
+    assert model.calls == []
+
+
+@pytest.mark.parametrize("size", [(0, 360), (640, 0)])
+def test_warm_up_needs_a_real_size(size):
+    detector = OpenDetector(OPEN_SETTINGS, model=FakeYoloe())
+    detector.set_names(["keys"])
+    with pytest.raises(ValueError):
+        detector.warm_up(size)
+
+
+def test_a_failed_set_names_logs_how_many_names_never_the_names(caplog):
+    detector = OpenDetector(OPEN_SETTINGS, model=FakeYoloe(fail_text=True))
+    with caplog.at_level(logging.WARNING, logger="car_vision.detector"):
+        with pytest.raises(DetectorError):
+            detector.set_names(["grandma's ring", "secret diary"])
+    logged = " ".join(record.getMessage() for record in caplog.records)
+    assert "2 name(s)" in logged
+    assert "grandma" not in logged and "secret diary" not in logged

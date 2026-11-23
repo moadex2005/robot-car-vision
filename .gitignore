@@ -11,6 +11,7 @@ __pycache__/
 data/people/*
 data/people.json
 data/camera.json
+data/lookout.json
 data/memory.sqlite3*
 data/people.removed/
 data/knowledge.md.bak

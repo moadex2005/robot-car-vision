@@ -60,11 +60,24 @@ Looking for things by a typed name (search()):
   adds them to the everyday detections; what it returns is what the whole page
   sees (the list, the clicks, the photos, the assistant and the memory).
 
+A named find on a person is always dropped (on_a_person), and words for
+people are refused as names: a person keeps their own box, name and rules.
+
+Auto-discover (discover()): a look thread of its own asks the lookout
+(lookout.Lookout, a small hosted model) every few seconds what is in view,
+using the newest clean frame. The names it gives, minus what the everyday
+detector boxes already and minus words for people, are given to the open
+detector after the visitor's own names, 6 in all, through the same rounds
+as a search. Their finds are marked "discovered", never "found", and are
+drawn like everyday ones.
+
 The memory (memory.SightingLog): every tracked thing of every processed frame
 is told to the sighting log, which decides what is worth keeping. A small
 picture is cut for an object only now and then (PictureTimer), never for a
-person. Every few seconds the log's summary goes into the WorldState, where
-the assistant reads it.
+person. The loop calls the log's tick() on every turn, so a thing that left
+is written although nothing else comes. A thread of its own puts the log's
+summary into the WorldState every few seconds, where the assistant reads it.
+stop() closes the log, which writes what is still open.
 
 Every part can be handed in from outside, so the tests run the loop with
 fakes and need no camera, model or graphics card.
@@ -157,6 +170,44 @@ NAMED_ID_OFFSET = 100_000                # named track numbers are kept apart fr
 NAMED_HOLD_SECONDS = 1.0                 # a named find stays on screen this long without being seen again
 REPLACE_OVERLAP = 0.6                    # a named find replaces an everyday box it overlaps more than this
 PLACES = ("left", "middle", "right")     # the thirds of the picture
+PERSON_OVERLAP = 0.3                     # a named find overlapping a person box more than this is dropped
+NO_PEOPLE = ("Looking for people by name is not supported. "
+             "People the camera knows are recognised by their face.")
+# Words for people and parts of people, one list: a name with one of them is refused, because
+# a find on a person would turn them into an "object" (a picture of them kept, a click sent out).
+PEOPLE_WORDS = frozenset({
+    "person", "persons", "people", "man", "men", "woman", "women", "boy", "boys", "girl", "girls",
+    "child", "children", "kid", "kids", "baby", "babies", "face", "faces", "head", "heads",
+    "hand", "hands", "body", "bodies", "human", "humans", "someone", "somebody", "anybody", "anyone",
+})
+
+# Auto-discover (M14): a hosted model names what is in view now and then.
+DISCOVERED_KEEP_SECONDS = 60.0           # a discovered name stays this long after it was last mentioned
+FAILURES_BEFORE_WAIT = 3                 # after this many failed looks in a row ...
+FAILURE_WAIT_SECONDS = 60.0              # ... the next look waits this long
+LASTING_PROBLEMS = frozenset({"budget", "no_key", "key_refused", "no_credit", "not_available"})
+NOT_A_FAILURE = "still_looking"          # the lookout's previous look is still under way: just skip
+LOOK_FAILED = "Auto-discover could not look at the picture."
+# The everyday detector's 80 labels, and the plain words for some of them that a hosted
+# model tends to use. A discovered name on this list is dropped: that detector boxes it already.
+EVERYDAY_LABELS = frozenset({
+    "person", "bicycle", "car", "motorcycle", "airplane", "bus", "train", "truck", "boat",
+    "traffic light", "fire hydrant", "stop sign", "parking meter", "bench", "bird", "cat", "dog",
+    "horse", "sheep", "cow", "elephant", "bear", "zebra", "giraffe", "backpack", "umbrella",
+    "handbag", "tie", "suitcase", "frisbee", "skis", "snowboard", "sports ball", "kite",
+    "baseball bat", "baseball glove", "skateboard", "surfboard", "tennis racket", "bottle",
+    "wine glass", "cup", "fork", "knife", "spoon", "bowl", "banana", "apple", "sandwich", "orange",
+    "broccoli", "carrot", "hot dog", "pizza", "donut", "cake", "chair", "couch", "potted plant",
+    "bed", "dining table", "toilet", "tv", "laptop", "mouse", "remote", "keyboard", "cell phone",
+    "microwave", "oven", "toaster", "sink", "refrigerator", "book", "clock", "vase", "scissors",
+    "teddy bear", "hair drier", "toothbrush",
+})
+EVERYDAY_VARIANTS = frozenset({
+    "television", "tv screen", "monitor", "computer monitor", "sofa", "phone", "mobile phone",
+    "smartphone", "cellphone", "telephone", "bike", "motorbike", "plane", "aeroplane", "table",
+    "plant", "houseplant", "purse", "bag", "ball", "doughnut", "fridge", "remote control",
+    "computer mouse", "laptop computer", "mug", "hair dryer", "teddy", "glass", "notebook computer",
+})
 
 MEMORY_SHARE_SECONDS = 5.0               # the memory's summary goes into the WorldState this often
 PICTURE_EVERY_SECONDS = 5.0              # the sighting log is given a new picture of a thing at most this often
@@ -232,12 +283,34 @@ class PhotoSession:
 
 @dataclass(frozen=True)
 class Search:
-    """The visitor's newest search. Replaced as a whole, under the pipeline's lock."""
+    """What the open detector is asked to find: the visitor's own names, then discovered ones.
 
-    names: tuple[str, ...] = ()
+    Replaced as a whole, under the pipeline's lock. Every new list of names is
+    a new round; the newest round wins. `state` is that of the open detector
+    for this round's names.
+    """
+
+    names: tuple[str, ...] = ()        # the visitor's own names (status()["search"] reports only these)
     state: str = "off"                 # "off", "loading", "ready" or "failed"
     note: str = ""                     # why it failed
-    round: int = 0                     # goes up with every search(); the newest round wins
+    round: int = 0                     # goes up with every new list of names; the newest round wins
+    discovered: tuple[str, ...] = ()   # discovered names given to the open detector after the own ones
+    own_ready: bool = False            # the own names were ready already (only discovered ones changed)
+
+    @property
+    def finder_names(self) -> tuple[str, ...]:
+        """Every name the open detector is given: the own ones first."""
+        return self.names + self.discovered
+
+
+@dataclass(frozen=True)
+class Discovery:
+    """Auto-discover: on or off, and how its looks go. Replaced as a whole, under the pipeline's lock."""
+
+    on: bool = False
+    state: str = "off"                 # "off", "looking" or "paused"
+    note: str = ""                     # why it is paused, in plain words
+    round: int = 0                     # goes up with every discover(); a look thread of an older round ends
 
 
 @dataclass(frozen=True)
@@ -299,7 +372,7 @@ class Pipeline:
                  reactions=None, state: WorldState | None = None,
                  source_factory: SourceFactory | None = None,
                  phone_fetch: Fetch | None = None,
-                 open_detector=None, sightings=None) -> None:
+                 open_detector=None, sightings=None, lookout=None) -> None:
         recognizer_settings = section(config, "recognizer")
         self.every_n_frames: int = require(recognizer_settings, "every_n_frames", int)
         if self.every_n_frames < 1:
@@ -320,6 +393,15 @@ class Pipeline:
         keep_days = float(require(memory_settings, "keep_days", (int, float)))
         min_seconds = float(require(memory_settings, "min_seconds", (int, float)))
         keep_pictures = require(memory_settings, "pictures", bool)
+        # Auto-discover: the pipeline reads only what it needs itself; Lookout checks the rest.
+        self._lookout_settings = section(config, "lookout")
+        self.look_every_seconds = float(require(self._lookout_settings, "every_seconds", (int, float)))
+        if self.look_every_seconds <= 0:
+            raise ConfigError("lookout.every_seconds must be more than 0")
+        self.look_picture_width: int = require(self._lookout_settings, "picture_width", int)
+        if self.look_picture_width < 32:
+            raise ConfigError("lookout.picture_width must be 32 pixels or more")
+        self.look_budget = float(require(self._lookout_settings, "daily_budget_usd", (int, float)))
 
         self._notes: list[str] = []
         self._recognition_off = RECOGNITION_OFF
@@ -339,8 +421,10 @@ class Pipeline:
         # A detector that cannot load is a real failure: its error is not caught here.
         self._detector = detector if detector is not None else Detector(section(config, "detector"))
         self._recognizer = recognizer if recognizer is not None else self._build_recognizer(recognizer_settings)
-        # The open detector is only built on the first search (see _open_detector_ready).
+        # The open detector is only built on the first search (see _open_detector_ready),
+        # the lookout on the first look (see _lookout_ready).
         self._open_detector = open_detector
+        self._lookout = lookout
         self._sightings = (sightings if sightings is not None
                            else self._build_sightings(memory_file, keep_days, min_seconds))
         for note in self._notes:
@@ -374,8 +458,14 @@ class Pipeline:
         self._faces_changed = threading.Event()     # set after enrolling: the loop forgets the faces it keeps
 
         self._search = Search()                # the newest search, under self._lock
-        self._found: tuple[Detection, ...] = ()     # the named finds of the last frame shown, under self._lock
+        self._found: tuple[Detection, ...] = ()     # finds of the own names in the last frame shown, under self._lock
+        self._discovered: tuple[Detection, ...] = ()    # ... and of discovered names
+        self._looked_for: tuple[str, ...] | None = None  # the own names a named detect last ran for
         self._open_lock = threading.Lock()     # held by whoever uses the open detector (see the module docstring)
+
+        self._discovery = Discovery()          # auto-discover, under self._lock
+        self._discovered_names: dict[str, tuple[float, int]] = {}   # name -> (last mentioned, its place in that look)
+        self._look_lock = threading.Lock()     # one look thread talks to the lookout at a time
 
         self._switch_lock = threading.Lock()   # one use_phone() at a time
         self._phone_locks: dict[str, threading.Lock] = {}   # one talk with each phone at a time
@@ -391,7 +481,6 @@ class Pipeline:
         self._named_tick = 0                   # ready frames of this search round so far
         self._open_tracks_stale = False        # the open detector must start its tracks again first
         self._pictures = PictureTimer(min_seconds) if keep_pictures else None
-        self._memory_shared_at = float("-inf")  # when the memory's summary last went into the WorldState
         self._memory_failed = False            # a memory error was logged already
 
     # ---- public ------------------------------------------------------------
@@ -412,16 +501,24 @@ class Pipeline:
             self._stop.clear()
             source.start()
             self._start_loop()
+            self._start_memory_summary()
             self._check_phone_picture()         # only does something when the source is the phone
         return self
 
     def stop(self) -> None:
-        """End the loop (within two seconds), then let go of the camera."""
+        """End the loop (within two seconds), then let go of the camera and close the memory.
+
+        A search or auto-discover under way ends too: a search still loading is
+        never marked ready afterwards, and no look happens after this.
+        """
         self._stop.set()
         with self._switch_lock:                 # a switch under way finishes first
             with self._lock:
                 self._started = False
                 self._picture_round += 1        # a talk with the phone still under way is ignored
+                self._search = Search(round=self._search.round + 1)        # an older round gives up
+                self._discovery = Discovery(round=self._discovery.round + 1)
+                self._discovered_names = {}
                 source = self._source
             thread, self._thread = self._thread, None
         if thread is not None:
@@ -429,6 +526,7 @@ class Pipeline:
             if thread.is_alive():
                 log.warning("The video loop did not stop within %.0f seconds", STOP_WAIT_SECONDS)
         source.stop()
+        self._close_memory()
 
     def use_phone(self, url: str) -> None:
         """Switch the live source to the phone at this address, now.
@@ -503,12 +601,14 @@ class Pipeline:
             phone_url = self._phone_url
             switched_at = self._switched_at        # 0.0 until the first switch
             picture, choice = self._picture, self._picture_choice
-            search, found = self._search, self._found
+            search, found, discovered = self._search, self._found, self._discovered
+            looked = search.names and self._looked_for == search.names
+            discovery, discovered_names = self._discovery, self._discovered_list_locked()
         # While the stream is down nothing new is seen, so old sightings are left out,
         # and so is everything seen by the camera used before the last switch.
         seen_at = snapshot.detections_at
         fresh = seen_at > switched_at and time.monotonic() - seen_at <= STALE_SECONDS
-        found = found if fresh else ()
+        found, discovered = (found, discovered) if fresh else ((), ())
         return {
             "source": source.source,
             "connected": bool(source.connected) and error is None,   # a stopped loop is not live
@@ -520,31 +620,53 @@ class Pipeline:
             "recognition": self._recognizer is not None,
             "notes": list(self._notes),
             "people": self._people(snapshot) if fresh else [],
-            "objects": objects_in_view(snapshot, self._person_card, found) if fresh else [],
+            "objects": objects_in_view(snapshot, self._person_card, found, discovered) if fresh else [],
             "reactions": [{"kind": r.kind, "text": r.text} for r in on_screen] if fresh else [],
             "error": error,
-            "search": search_status(search, found, snapshot.frame_size[0]),
+            "search": search_status(search, found, snapshot.frame_size[0], bool(looked and fresh)),
+            "discover": self._discover_status(discovery, discovered_names, search),
         }
 
     def search(self, names: Sequence[str]) -> None:
         """Look for these things by name from now on; [] stops looking.
 
         1 to 6 names, each 1 to 40 letters, digits, spaces, hyphens or
-        apostrophes; the same name twice (in any case) counts once. Anything
-        else raises ValueError with a plain message. Returns at once: loading
-        the open detector and setting the names happen in a thread of its own
-        (status()["search"]["state"] says how far it is), and a newer search
-        replaces an older one that has not finished.
+        apostrophes, and not words for people; the same name twice (in any
+        case) counts once. Anything else raises ValueError with a plain
+        message. Returns at once: loading the open detector and setting the
+        names happen in a thread of its own (status()["search"]["state"] says
+        how far it is), and a newer search replaces an older one that has not
+        finished. The finds of names no longer looked for vanish at once.
         """
         wanted = clean_names(names)
         with self._lock:
-            work = self._search.round + 1
-            self._search = Search(wanted, "loading" if wanted else "off", "", work)
-            self._found = ()
+            if wanted != self._search.names:
+                self._looked_for = None         # the page waits until the finder has looked for these
+            work = self._new_finder_round_locked(wanted, self._search.discovered, always=True)
         log.info("Looking for %d thing(s)", len(wanted))     # the names themselves stay off the log
-        if wanted:
-            threading.Thread(target=self._prepare_search, args=(wanted, work),
-                             name="open-detector", daemon=True).start()
+        self._prepare_in_background(work)
+
+    def discover(self, on: bool) -> None:
+        """Switch auto-discover on or off (it is off at start-up).
+
+        On: a thread of its own asks the lookout every lookout.every_seconds
+        what is in view, and the open detector looks for those names too. Off:
+        the looks stop at once, the discovered names are forgotten and the open
+        detector is given only the visitor's own names again.
+        """
+        if not isinstance(on, bool):
+            raise ValueError("Auto-discover is switched with true or false.")
+        with self._lock:
+            if on == self._discovery.on:
+                return
+            work = self._discovery.round + 1
+            self._discovery = Discovery(on, "looking" if on else "off", "", work)
+            self._discovered_names = {}
+            finder = self._new_finder_round_locked(self._search.names, ())
+        log.info("Auto-discover %s", "on" if on else "off")
+        self._prepare_in_background(finder)
+        if on:
+            threading.Thread(target=self._look_now_and_then, args=(work,), name="lookout", daemon=True).start()
 
     def sightings(self) -> SightingLog | None:
         """The camera's memory, for the web routes; None when the memory is off."""
@@ -688,13 +810,61 @@ class Pipeline:
 
     # ---- looking for things by name (a thread of its own) ----------------------
     #
-    # Each search() starts a new round. Its thread waits for the open detector
-    # (self._open_lock), checks that its round is still the newest before each
-    # slow step, and gives up as soon as it is not. Only the newest round may
-    # mark the search ready or failed.
+    # Each new list of names for the open detector (a search(), or a change in
+    # the discovered names) starts a new round. Its thread waits for the open
+    # detector (self._open_lock), checks that its round is still the newest
+    # before each slow step, and gives up as soon as it is not. Only the newest
+    # round may mark the search ready or failed; stop() starts a round of its
+    # own, so nothing is marked ready after it.
+
+    def _new_finder_round_locked(self, own: tuple[str, ...], discovered: Sequence[str],
+                                 always: bool = False) -> int | None:
+        """Start a new round when the open detector's names change (always, for search()).
+
+        Call with self._lock held. The finds of names no longer looked for
+        vanish at once. Returns the round to prepare in the background, or
+        None when there is nothing to prepare.
+        """
+        old = self._search
+        # The order of names already given is kept, so the open detector is not set again
+        # (and its tracks restarted) just because the lookout named things in another order.
+        extra = in_earlier_order(names_after(own, discovered), old.discovered)
+        if not always and (own, extra) == (old.names, old.discovered):
+            return None
+        own_ready = bool(own) and own == old.names and (
+            old.state == "ready" or (old.state == "loading" and old.own_ready))
+        finder = own + extra
+        self._search = Search(own, "loading" if finder else "off", "", old.round + 1, extra, own_ready)
+        self._drop_finds_not_wanted_locked(finder)
+        return self._search.round if finder else None
+
+    def _prepare_in_background(self, work: int | None) -> None:
+        """Start the thread that gives the open detector the names of round `work`."""
+        if work is None:
+            return
+        with self._lock:
+            names = self._search.finder_names if self._search.round == work else ()
+        if names:
+            threading.Thread(target=self._prepare_search, args=(names, work),
+                             name="open-detector", daemon=True).start()
+
+    def _drop_finds_not_wanted_locked(self, names: Sequence[str]) -> None:
+        """Take the finds of names no longer looked for out of the view and the WorldState at once,
+        also when no new frame comes. Call with self._lock held."""
+        unwanted = [find for find in self._found + self._discovered if not label_among(find.label, names)]
+        if not unwanted:
+            return
+        def kept(detections: Sequence[Detection]) -> tuple[Detection, ...]:
+            return tuple(d for d in detections if not any(d is find for find in unwanted))
+        self._found, self._discovered = kept(self._found), kept(self._discovered)
+        if self._view is not None:
+            self._view = replace(self._view, detections=kept(self._view.detections))
+        snapshot = self._state.snapshot()
+        self._state.update_detections(list(kept(snapshot.detections)), snapshot.frame_size,
+                                      snapshot.detections_at)    # the same moment: nothing new was seen
 
     def _prepare_search(self, names: tuple[str, ...], work: int) -> None:
-        """Load the open detector if needed and give it the names; then the search is ready."""
+        """Load the open detector if needed, give it the names and warm it up; then the search is ready."""
         with self._open_lock:
             if not self._is_newest_search(work):
                 return
@@ -705,6 +875,9 @@ class Pipeline:
                 before = tuple(detector.names)
                 detector.set_names(list(names))
                 changed = tuple(detector.names) != before
+                if changed:
+                    # Its first run after new names is slow: done here, not on the video loop.
+                    detector.warm_up(self._warm_up_size())
             except Exception as error:      # no internet on the first use, a broken model, ...
                 log.warning("Looking for things failed (%s: %s)", type(error).__name__, first_line(error))
                 self._search_failed(work, first_line(error))
@@ -716,6 +889,11 @@ class Pipeline:
                 if self._search.round == work:
                     self._search = replace(self._search, state="ready")
         log.info("Looking for things: ready")
+
+    def _warm_up_size(self) -> tuple[int, int]:
+        """The size of the frames the open detector will see: the last one's, else the config box."""
+        width, height = self._state.snapshot().frame_size
+        return (width, height) if width > 0 and height > 0 else self._config_box
 
     def _open_detector_ready(self) -> Any:
         """The open detector, built and loaded. Call with self._open_lock held: it is slow the first time."""
@@ -735,7 +913,134 @@ class Pipeline:
         with self._lock:
             if self._search.round == work:
                 self._search = replace(self._search, state="failed", note=note)
-                self._found = ()
+                self._found = self._discovered = ()
+
+    # ---- auto-discover (a thread of its own) -----------------------------------
+    #
+    # discover(True) starts a look thread for a new discovery round. It wakes
+    # every lookout.every_seconds, asks the lookout about the newest clean
+    # frame, and gives way at once to stop() or a newer round, also while it
+    # waits. The request itself (up to 20 s) runs with no pipeline lock held;
+    # its answer is thrown away when the round or the camera changed meanwhile.
+    # Only one thread talks to the lookout at a time (self._look_lock).
+
+    def _look_now_and_then(self, work: int) -> None:
+        """The look thread of discovery round `work`: one look, then one every every_seconds."""
+        failures = 0
+        with self._look_lock:                   # an older round's request finishes first
+            while self._is_discovering(work):
+                failures = self._look_once(work, failures)
+                if failures is None:
+                    return                      # a lasting problem: paused until off and on again
+                wait = FAILURE_WAIT_SECONDS if failures >= FAILURES_BEFORE_WAIT else self.look_every_seconds
+                if not self._wait_while_discovering(work, wait):
+                    return
+
+    def _look_once(self, work: int, failures: int) -> int | None:
+        """One look. Returns the failures in a row afterwards; None after a lasting problem.
+
+        The open detector gets a new list at most once per look: the new names
+        and the forgotten old ones are passed on together.
+        """
+        picture = self._picture_to_look_at()
+        if picture is None:
+            self._take_discovered(work, None, (), time.monotonic())    # no frame yet: only forget old names
+            return failures
+        jpeg, generation = picture
+        try:
+            names = self._lookout_ready().names(jpeg)
+        except Exception as error:              # a LookoutError has a plain message and a kind
+            failures_now = self._look_failed(work, error, failures)
+            if failures_now is not None:
+                self._take_discovered(work, None, (), time.monotonic())
+            return failures_now
+        self._take_discovered(work, generation, names, time.monotonic())
+        return 0
+
+    def _lookout_ready(self) -> Any:
+        """The lookout, built on the first look (never at start-up)."""
+        if self._lookout is None:
+            from car_vision.lookout import Lookout     # reads .env only when it looks
+            self._lookout = Lookout(self._lookout_settings)
+        return self._lookout
+
+    def _picture_to_look_at(self) -> tuple[bytes, int] | None:
+        """The newest clean frame as a JPEG picture_width wide (no boxes), with its camera generation."""
+        with self._lock:
+            view, generation = self._view, self._generation
+        if view is None:
+            return None
+        return self._encode(shrunk_to_width(view.frame, self.look_picture_width)), generation
+
+    def _look_failed(self, work: int, error: Exception, failures: int) -> int | None:
+        """Pause with the lookout's plain message. Returns the failures in a row; None when it lasts."""
+        kind = getattr(error, "kind", None)
+        if kind == NOT_A_FAILURE:
+            return failures                     # the previous look is still under way: skip this turn
+        note = str(error) if kind is not None else LOOK_FAILED
+        if kind is None:
+            log.warning("Auto-discover: a look failed (%s)", type(error).__name__)
+        lasting = kind in LASTING_PROBLEMS
+        with self._lock:
+            if self._discovery.round != work:
+                return None
+            self._discovery = replace(self._discovery, state="paused", note=note)
+            if lasting:                         # nothing more is looked at: forget what was
+                self._discovered_names = {}
+                finder = self._new_finder_round_locked(self._search.names, ())
+        if lasting:
+            self._prepare_in_background(finder)
+            return None
+        return failures + 1
+
+    def _take_discovered(self, work: int, generation: int | None, names: Sequence[str], now: float) -> None:
+        """After a look: forget the names not mentioned for DISCOVERED_KEEP_SECONDS, keep the new
+        ones, and give the open detector the new list when it changed.
+
+        `generation` is the camera the picture came from (None: no answer this
+        time). The answer about a camera that was replaced meanwhile is dropped.
+        """
+        with self._lock:
+            if self._discovery.round != work:
+                return
+            self._discovered_names = {name: seen for name, seen in self._discovered_names.items()
+                                      if now - seen[0] <= DISCOVERED_KEEP_SECONDS}
+            if generation is not None and generation == self._generation:
+                self._discovery = replace(self._discovery, state="looking", note="")
+                for place, name in enumerate(discoverable(names)):
+                    self._discovered_names[name] = (now, place)
+            finder = self._new_finder_round_locked(self._search.names, self._discovered_list_locked())
+        self._prepare_in_background(finder)
+
+    def _discovered_list_locked(self) -> list[str]:
+        """The discovered names, the most recently mentioned first. Call with self._lock held."""
+        order = sorted(self._discovered_names.items(), key=lambda item: (-item[1][0], item[1][1]))
+        return [name for name, _seen in order]
+
+    def _is_discovering(self, work: int) -> bool:
+        with self._lock:
+            return self._discovery.round == work and not self._stop.is_set()
+
+    def _wait_while_discovering(self, work: int, seconds: float) -> bool:
+        """Wait, but give way at once to stop() or a newer round. True when still discovering."""
+        deadline = time.monotonic() + seconds
+        while self._is_discovering(work):
+            left = deadline - time.monotonic()
+            if left <= 0:
+                return True
+            self._stop.wait(min(left, PAUSE_STEP_SECONDS))
+        return False
+
+    def _discover_status(self, discovery: Discovery, names: list[str], search: Search) -> dict[str, Any]:
+        """status()["discover"]. A failed open detector for discovered names pauses it too."""
+        state, note = discovery.state, discovery.note
+        if discovery.on and state == "looking" and search.state == "failed" and search.discovered:
+            state, note = "paused", search.note
+        lookout = self._lookout
+        return {"on": discovery.on, "state": state, "names": names if discovery.on else [], "note": note,
+                "looks": int(lookout.looks_today) if lookout is not None else 0,
+                "spent_usd": round(float(lookout.spent_today), 6) if lookout is not None else 0.0,
+                "budget_usd": self.look_budget}
 
     # ---- the phone's picture size (a short thread of its own) ------------------
     #
@@ -1040,7 +1345,8 @@ class Pipeline:
         self._epoch += 1                        # track numbers of the new camera start again
         self._everyday_epoch += 1
         self._view = None
-        self._found = ()
+        self._found = self._discovered = ()
+        self._looked_for = None                 # the finder has not looked at the new camera yet
         self._error = None
         self._on_screen = []
         frame_size = self._state.snapshot().frame_size
@@ -1052,7 +1358,7 @@ class Pipeline:
         last_sequence = 0
         while not self._stop.is_set():
             self._end_photos_if_late(time.monotonic())   # also while no frames come
-            self._share_memory_if_due(time.monotonic())  # so are the memory's "3 minutes ago"
+            self._tick_memory()                          # so is the memory's writing
             with self._lock:                    # the source, its generation and the search, read together
                 source, current, search = self._source, self._generation, self._search
             if current != generation:
@@ -1113,19 +1419,24 @@ class Pipeline:
             self._memory.remember(check.faces, detections, now)
             self._take_photo_if_ready(frame, check.boxes, now, generation)
         faces = self._memory.current(detections, now)
-        shown, named = self._add_named_finds(frame, detections, search, now)
+        shown, named, looked = self._add_named_finds(frame, detections, search, now)
+        # The visitor's own finds stand out in yellow; discovered ones are drawn like everyday ones.
+        found = tuple(find for find in named if label_among(find.label, search.names))
+        discovered = tuple(find for find in named if not label_among(find.label, search.names))
 
         # The boxes are drawn on a copy: the camera's own frame goes into the view untouched.
         drawn = frame.copy()
-        draw.draw_detections(drawn, shown, wanted=[d.track_id for d in named if d.track_id is not None])
+        draw.draw_detections(drawn, shown, wanted=[d.track_id for d in found if d.track_id is not None])
         draw.draw_faces(drawn, faces)
         jpeg = self._encode(drawn)
         height, width = frame.shape[:2]
         with self._lock:                        # state, picture, view and reactions change together
             if self._generation != generation:
                 return                          # this frame came from the camera used before the switch
-            if named and self._search.round != search.round:
-                return                          # these finds belong to names the visitor replaced meanwhile
+            current = self._search
+            if any(not label_among(find.label, current.finder_names) for find in named) or (
+                    found and current.names != search.names):
+                return                          # finds of names replaced while this frame was worked on
             self._state.update_detections(shown, (width, height), now)
             self._state.update_faces(faces, now)
             on_screen = self._reactions.update(self._state.snapshot(), now)
@@ -1133,7 +1444,9 @@ class Pipeline:
             epoch = self._epoch
             memory_epochs = (self._everyday_epoch, self._named_epoch)
             self._view = View(frame, tuple(shown), tuple(faces), epoch)
-            self._found = named
+            self._found, self._discovered = found, discovered
+            if looked and current.names == search.names:
+                self._looked_for = search.names     # the page may answer now: the finder has looked
             self._on_screen = list(on_screen)
             phone_not_heard = self._picture is None
         self._remember(frame, shown, faces, named, memory_epochs)
@@ -1181,20 +1494,22 @@ class Pipeline:
     # ---- the named finds (the loop thread) -------------------------------------
 
     def _add_named_finds(self, frame: np.ndarray, detections: list[Detection], search: Search,
-                         now: float) -> tuple[list[Detection], tuple[Detection, ...]]:
-        """The frame's detections with the named finds added, and the named finds alone.
+                         now: float) -> tuple[list[Detection], tuple[Detection, ...], bool]:
+        """The frame's detections with the named finds added, the named finds alone, and
+        whether the open detector ran on this frame.
 
-        With no search on, the detections themselves and no finds: nothing is copied.
+        With no names to look for, the detections themselves and no finds: nothing is copied.
         """
-        if not search.names:
+        names = search.finder_names
+        if not names:
             if self._named.finds:
                 self._named = NamedFinds()
-            return detections, ()
+            return detections, (), False
         if self._named.search_round != search.round:
-            self._named_tick = 0                    # a new search runs on its first ready frame
+            self._named_tick = 0                    # a new list of names runs on its first ready frame
         fresh = self._detect_named(frame, search)
-        shown, self._named = merge_named(detections, self._named, fresh, search.round, now)
-        return shown, self._named.detections
+        shown, self._named = merge_named(detections, self._named, fresh, search.round, now, names)
+        return shown, self._named.detections, fresh is not None
 
     def _detect_named(self, frame: np.ndarray, search: Search) -> list[Detection] | None:
         """What the open detector finds on this frame; None when it is not due or is busy.
@@ -1269,15 +1584,37 @@ class Pipeline:
             return None
         return self._encode(shrunk(cut_out(frame, box), PICTURE_MAX_SIDE))
 
-    def _share_memory_if_due(self, now: float) -> None:
-        """Every MEMORY_SHARE_SECONDS: put the memory's summary into the WorldState for the assistant."""
-        if self._sightings is None or now - self._memory_shared_at < MEMORY_SHARE_SECONDS:
+    def _tick_memory(self) -> None:
+        """On every turn of the loop, also with nothing in view: the log's periodic work (writing)."""
+        if self._sightings is None:
             return
-        self._memory_shared_at = now
         try:
-            self._state.set_memory(self._sightings.summary(time.time()))
+            self._sightings.tick(time.time())
         except Exception:
-            self._memory_error("Sharing the memory's summary failed")
+            self._memory_error("The memory's periodic work failed")
+
+    def _start_memory_summary(self) -> None:
+        """Start the thread that puts the memory's summary into the WorldState (not the loop's work)."""
+        if self._sightings is not None:
+            threading.Thread(target=self._share_memory_now_and_then, name="memory-summary", daemon=True).start()
+
+    def _share_memory_now_and_then(self) -> None:
+        """Every MEMORY_SHARE_SECONDS until stop(): the summary, read off the video loop, for the assistant."""
+        while not self._stop.is_set():
+            try:
+                self._state.set_memory(self._sightings.summary(time.time()))
+            except Exception:
+                self._memory_error("Sharing the memory's summary failed")
+            self._stop.wait(MEMORY_SHARE_SECONDS)
+
+    def _close_memory(self) -> None:
+        """At stop(): write the memory's tail and close its file (also a log that was handed in)."""
+        if self._sightings is None:
+            return
+        try:
+            self._sightings.close()
+        except Exception:
+            self._memory_error("Closing the memory failed")
 
     def _memory_error(self, what: str) -> None:
         """Log a memory problem in full the first time, then only briefly."""
@@ -1453,12 +1790,12 @@ CardOf = Callable[[RecognizedFace], Person]     # the person a known face belong
 # ---- the objects list on the page --------------------------------------------------
 
 
-def objects_in_view(snapshot: WorldSnapshot, card_of: CardOf,
-                    found: Sequence[Detection] = ()) -> list[dict[str, Any]]:
+def objects_in_view(snapshot: WorldSnapshot, card_of: CardOf, found: Sequence[Detection] = (),
+                    discovered: Sequence[Detection] = ()) -> list[dict[str, Any]]:
     """One entry per detection: people first, then by label, then by track number.
 
-    The entries of the detections in `found` (the named search's finds) also
-    get "found": true.
+    The entries of the detections in `found` (the visitor's own search) also
+    get "found": true, those in `discovered` (auto-discover) "discovered": true.
     """
     owners = face_owners(snapshot.detections, snapshot.faces)
     order = sorted(range(len(snapshot.detections)), key=lambda i: list_order(snapshot.detections[i]))
@@ -1468,6 +1805,8 @@ def objects_in_view(snapshot: WorldSnapshot, card_of: CardOf,
         entry = object_entry(detection, owners.get(i), snapshot.frame_size, card_of)
         if any(detection is find for find in found):
             entry["found"] = True
+        elif any(detection is find for find in discovered):
+            entry["discovered"] = True
         entries.append(entry)
     return entries
 
@@ -1509,7 +1848,8 @@ def clean_names(names: Sequence[str]) -> tuple[str, ...]:
     """The names to look for, trimmed, with repeats dropped (in any case); () stops looking.
 
     Raises ValueError with a plain message for anything but a list of 1 to 6
-    names, each 1 to 40 letters (any script), digits, spaces, hyphens or apostrophes.
+    names, each 1 to 40 letters (any script), digits, spaces, hyphens or
+    apostrophes with at least one letter or digit, and none a word for people.
     """
     if isinstance(names, str) or not isinstance(names, Sequence):
         raise ValueError("Give the names as a list, like [\"power bank\", \"keys\"].")
@@ -1524,14 +1864,19 @@ def clean_names(names: Sequence[str]) -> tuple[str, ...]:
 
 
 def clean_name(name: Any) -> str:
-    """One name, trimmed and with single spaces. ValueError when it breaks a rule."""
+    """One name in one Unicode form (NFC), trimmed and with single spaces. ValueError when it breaks a rule."""
     if not isinstance(name, str):
         raise ValueError("Each name must be text.")
-    name = re.sub(" +", " ", name.strip())
+    name = re.sub(" +", " ", unicodedata.normalize("NFC", name).strip())
     if not 1 <= len(name) <= LONGEST_NAME:
         raise ValueError(f"Each name must be 1 to {LONGEST_NAME} characters long.")
     if not all(allowed_in_name(letter) for letter in name):
         raise ValueError("A name may only have letters, digits, spaces, hyphens and apostrophes.")
+    if not any(unicodedata.category(letter)[0] == "L" or unicodedata.category(letter) == "Nd"
+               for letter in name):
+        raise ValueError("A name needs at least one letter or digit.")
+    if about_people(name):
+        raise ValueError(NO_PEOPLE)
     return name
 
 
@@ -1541,25 +1886,89 @@ def allowed_in_name(letter: str) -> bool:
     return kind[0] in "LM" or kind == "Nd" or letter in NAME_MARKS
 
 
+def about_people(name: str) -> bool:
+    """True when a word of the name is a word for people (PEOPLE_WORDS), e.g. "man" or "old man's"."""
+    for word in name.casefold().replace("-", " ").split():
+        if word.removesuffix("'s").removesuffix("’s").strip("'’") in PEOPLE_WORDS:
+            return True
+    return False
+
+
+def label_among(label: str, names: Sequence[str]) -> bool:
+    """True when the label is one of the names, in any case."""
+    folded = label.casefold()
+    return any(folded == name.casefold() for name in names)
+
+
+def names_after(own: Sequence[str], discovered: Sequence[str]) -> tuple[str, ...]:
+    """The discovered names that go to the open detector after the own ones: no repeats, 6 in all."""
+    room = max(0, MOST_NAMES - len(own))
+    extra: list[str] = []
+    for name in discovered:
+        if len(extra) >= room:
+            break
+        if not label_among(name, own) and not label_among(name, extra):
+            extra.append(name)
+    return tuple(extra)
+
+
+def in_earlier_order(names: Sequence[str], earlier: Sequence[str]) -> tuple[str, ...]:
+    """The names, those already in `earlier` first and in its order, then the new ones."""
+    return tuple([name for name in earlier if name in names] + [name for name in names if name not in earlier])
+
+
+def discoverable(names: Sequence[str]) -> list[str]:
+    """The lookout's names worth looking for: plain names, no people, nothing the everyday detector boxes."""
+    kept = []
+    for name in names:
+        try:
+            name = clean_name(name)
+        except ValueError:
+            continue                            # a word for people, or not a plain name
+        if not boxed_every_day(name) and not label_among(name, kept):
+            kept.append(name)
+    return kept
+
+
+def boxed_every_day(name: str) -> bool:
+    """True for a name the everyday detector has a label for (or a plain word for one), also plural."""
+    folded = name.casefold()
+    words = EVERYDAY_LABELS | EVERYDAY_VARIANTS
+    return folded in words or (folded.endswith("s") and folded[:-1] in words) or (
+        folded.endswith("es") and folded[:-2] in words)
+
+
+def on_a_person(find: Detection, people: Sequence[Box]) -> bool:
+    """True when a named find sits on an everyday person box: its centre inside one, or overlapping
+    one by more than PERSON_OVERLAP. Such a find is dropped, so a person keeps their own box,
+    name and rules (no picture kept, nothing sent when clicked)."""
+    middle = centre(find.box)
+    return any(contains(box, *middle) or overlap(find.box, box) > PERSON_OVERLAP for box in people)
+
+
 def merge_named(everyday: Sequence[Detection], kept: NamedFinds, fresh: Sequence[Detection] | None,
-                search_round: int, now: float) -> tuple[list[Detection], NamedFinds]:
+                search_round: int, now: float, names: Sequence[str] = ()) -> tuple[list[Detection], NamedFinds]:
     """Add the named finds to the frame's everyday detections. What it returns is what
     the whole page sees: the list, the clicks, the photos, the assistant and the memory.
 
     `fresh` is what the open detector found on this frame, or None when it did
-    not run. The rules:
+    not run; `names` are the names it is given in this round. The rules:
     - named track numbers are kept apart from the everyday ones (NAMED_ID_OFFSET is added);
     - a find stays on screen until it has not been seen for NAMED_HOLD_SECONDS;
-    - nothing is kept from another search round (other names);
+    - from an earlier round only the finds of names still looked for are kept;
+    - a find on an everyday person box is dropped (see on_a_person);
     - a find replaces an everyday box it overlaps by more than REPLACE_OVERLAP.
 
     Returns the detections to show and the finds to keep for the next frame.
     """
-    finds = kept.finds if kept.search_round == search_round else ()
+    finds = kept.finds if kept.search_round == search_round else tuple(
+        (find, seen_at) for find, seen_at in kept.finds if label_among(find.label, names))
     if fresh is not None:
         finds = renewed_finds(finds, [named_apart(detection) for detection in fresh], now)
-    finds = tuple((detection, seen_at) for detection, seen_at in finds if now - seen_at <= NAMED_HOLD_SECONDS)
-    named = [detection for detection, _seen_at in finds]
+    people = [detection.box for detection in everyday if detection.label == "person"]
+    finds = tuple((find, seen_at) for find, seen_at in finds
+                  if now - seen_at <= NAMED_HOLD_SECONDS and not on_a_person(find, people))
+    named = [find for find, _seen_at in finds]
     shown = [detection for detection in everyday
              if all(overlap(detection.box, find.box) <= REPLACE_OVERLAP for find in named)]
     return shown + named, NamedFinds(search_round, finds)
@@ -1616,14 +2025,18 @@ def place_of(box: Box, width: int) -> str:
     return PLACES[max(third, 0)]
 
 
-def search_status(search: Search, found: Sequence[Detection], width: int) -> dict[str, Any]:
-    """status()["search"]: the names, the state, and which names are in view and where.
+def search_status(search: Search, found: Sequence[Detection], width: int, seen: bool = True) -> dict[str, Any]:
+    """status()["search"]: the visitor's own names, their state, and which are in view and where.
 
-    found/missing are only filled in while the search is ready. For several
-    finds of one name the place is that of the most confident one.
+    Discovered names are not reported here. `seen` is true once the finder
+    has looked at a fresh frame for these names; until then found and missing
+    are both empty, so the page holds its answer. For several finds of one
+    name the place is that of the most confident one.
     """
+    state = own_state(search)
+    looked = seen and state == "ready"
     in_view, missing = [], []
-    if search.state == "ready":
+    if looked:
         for name in search.names:
             mine = [find for find in found if find.label.casefold() == name.casefold()]
             if not mine:
@@ -1631,8 +2044,18 @@ def search_status(search: Search, found: Sequence[Detection], width: int) -> dic
                 continue
             best = max(mine, key=lambda find: find.confidence)
             in_view.append({"name": name, "count": len(mine), "place": place_of(best.box, width)})
-    return {"names": list(search.names), "state": search.state, "note": search.note,
-            "found": in_view, "missing": missing}
+    return {"names": list(search.names), "state": state, "note": search.note if state == "failed" else "",
+            "found": in_view, "missing": missing, "seen": looked}
+
+
+def own_state(search: Search) -> str:
+    """The state of the visitor's own search: "off" without own names; still "ready" while
+    only the discovered names given after them are being changed."""
+    if not search.names:
+        return "off"
+    if search.state == "loading" and search.own_ready:
+        return "ready"
+    return search.state
 
 
 # ---- what a click points at ----------------------------------------------------------
@@ -1826,6 +2249,15 @@ def shrunk(frame: np.ndarray, max_side: int) -> np.ndarray:
         return frame
     scale = max_side / longer
     size = (max(1, round(width * scale)), max(1, round(height * scale)))
+    return cv2.resize(frame, size, interpolation=cv2.INTER_AREA)
+
+
+def shrunk_to_width(frame: np.ndarray, max_width: int) -> np.ndarray:
+    """The frame made at most max_width wide, its shape kept; never enlarged."""
+    height, width = frame.shape[:2]
+    if width <= max_width:
+        return frame
+    size = (max_width, max(1, round(height * max_width / width)))
     return cv2.resize(frame, size, interpolation=cv2.INTER_AREA)
 
 

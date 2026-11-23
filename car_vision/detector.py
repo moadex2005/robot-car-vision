@@ -389,6 +389,21 @@ class OpenDetector:
         reset_trackers(self._model)
         self._frame_size = None
 
+    def warm_up(self, frame_size: tuple[int, int]) -> None:
+        """Run once on a blank picture of this (width, height), and throw the result away.
+
+        The first track() after new names is slow while the library gets ready;
+        doing it here, off the video loop, keeps the video from pausing. The
+        tracks start afresh afterwards. Does nothing with no names set.
+        """
+        if not self._names:
+            return
+        width, height = frame_size
+        if width < 1 or height < 1:
+            raise ValueError(f"warm_up() needs a frame size like (640, 360), got {frame_size!r}")
+        self.detect(np.zeros((height, width, 3), dtype=np.uint8))
+        self.reset_tracks()
+
     # ---- inside --------------------------------------------------------------
 
     def _give_names_to_model(self, names: tuple[str, ...]) -> None:
@@ -407,7 +422,7 @@ class OpenDetector:
             with contextlib.chdir(folder):
                 self._model.set_classes(list(names), self._model.get_text_pe(list(names)))
         except Exception as error:
-            log.warning("Could not set the names %s: %s", list(names), error)
+            log.warning("Could not set %d name(s) to look for: %s", len(names), error)   # never the names
             raise DetectorError(
                 f"Could not load the text encoder for the named search. "
                 f"The first use needs the internet to download it into {folder}."

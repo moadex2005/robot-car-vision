@@ -19,7 +19,12 @@ again. /api/scene asks the assistant to describe the whole picture.
 /api/search starts looking for things by a typed name (the "Look for" field on
 the video, or a sentence like "find my keys") and stops it; the page follows the
 search in the status. /api/memory gives what the camera remembers (the Timeline),
-a small picture of a remembered object, and empties the memory.
+a small picture of a remembered object, and empties the memory. /api/discover
+switches auto-discover on and off (a small hosted model names what is in view).
+
+Only this page may change anything: every POST, PUT and DELETE under /api/ must
+be sent as JSON, which a plain form on another website cannot do, and a request
+that says it comes from another website (its Origin header) is refused.
 Start it with
 
     .venv\\Scripts\\python.exe -m car_vision.app
@@ -110,8 +115,13 @@ MEMORY_LIMIT = 50                # sightings the Timeline asks for when it does 
 MOST_SIGHTINGS = 200             # ... and at most
 MAX_FILTER_CHARS = 100           # the Timeline's filter text is never longer
 SIGHTING_ID = re.compile(r"[0-9]{1,18}")   # an id in an address: digits only, and it fits SQLite's number
-PICTURE_CACHE = "private, max-age=3600"    # a remembered picture never changes much: the browser keeps it
+PICTURE_CACHE = "no-store"       # after Clear memory an id may belong to another row: never kept
 NO_MEMORY_PICTURE = "There is no picture of that."
+DISCOVER_SHAPE = 'Send the switch as JSON, like {"on": true} or {"on": false}.'
+
+CHANGING_METHODS = frozenset({"POST", "PUT", "DELETE"})   # these must come from this page, as JSON
+NOT_JSON = 'Send the request as JSON (Content-Type: application/json), with {} when there is nothing to send.'
+OTHER_WEBSITE = "Requests from other websites are refused."
 
 
 class UnavailableAssistant:
@@ -554,6 +564,47 @@ def sighting_json(sighting: Any) -> dict[str, Any]:
     }
 
 
+# ---- only this page may change anything ----------------------------------------------------
+
+
+def own_origin(host_url: str) -> str:
+    """This server's origin as a browser writes it in the Origin header: "http://127.0.0.1:5000"."""
+    return host_url.rstrip("/")
+
+
+def refusal(method: str, path: str, origin: str | None, mimetype: str, host_url: str) -> tuple[str, int] | None:
+    """Why a request must be refused, as (message, status), or None when it may go on.
+
+    Another website open in the same browser can send a plain form post to this
+    server (a form cannot send JSON), and a browser names that website in the
+    Origin header. So: a request from another origin is 403, and a POST, PUT or
+    DELETE under /api/ that is not JSON is 415.
+    """
+    if not path.startswith("/api/"):
+        return None
+    if origin is not None and origin != own_origin(host_url):
+        return OTHER_WEBSITE, 403
+    if method in CHANGING_METHODS and mimetype != "application/json":
+        return NOT_JSON, 415
+    return None
+
+
+def discover_interval(config: dict[str, Any]) -> float | None:
+    """lookout.every_seconds, for the words beside the Auto-discover switch; None when it is not set."""
+    lookout = config.get("lookout")
+    every = lookout.get("every_seconds") if isinstance(lookout, dict) else None
+    if not is_number(every) or not 0 < every < 86400:
+        return None
+    return float(every)
+
+
+def interval_words(seconds: float | None) -> str:
+    """"10" for 10.0, "2.5" for 2.5, "" when unknown: how the page writes the interval."""
+    if seconds is None:
+        return ""
+    return str(int(seconds)) if float(seconds).is_integer() else f"{seconds:g}"
+
+
 # ---- the web server ------------------------------------------------------------
 
 
@@ -568,13 +619,14 @@ def question_problem(question: str) -> str | None:
 
 
 def create_app(pipeline: Any, assistant: Any, camera_file: Path | None = None,
-               people: PeopleBook | None = None) -> Flask:
+               people: PeopleBook | None = None, discover_every: float | None = None) -> Flask:
     """The Flask app for one pipeline and one assistant (real ones, or fakes in the tests).
 
     `camera_file` is where /api/camera remembers the phone's address; with None
     (as in most tests) the address is used but not remembered. `people` is the
     book of person folders; with None the page hides its People section and those
-    routes answer with a plain error.
+    routes answer with a plain error. `discover_every` is lookout.every_seconds,
+    only for the words beside the Auto-discover switch ("looking every 10 s").
     """
     app = Flask(__name__)
     inspections = InspectionStore()
@@ -582,13 +634,27 @@ def create_app(pipeline: Any, assistant: Any, camera_file: Path | None = None,
     gate = LookupGate()
     photo_watch = PhotoWatch()
 
+    @app.before_request
+    def only_this_page() -> Any:
+        """Refuse what another website could send (see refusal). An unknown address or a wrong
+        method is left to Flask, so it still answers 404 or 405."""
+        if request.routing_exception is not None:
+            return None
+        refused = refusal(request.method, request.path, request.headers.get("Origin"),
+                          request.mimetype, request.host_url)
+        if refused is None:
+            return None
+        message, code = refused
+        return jsonify(error=message), code
+
     @app.get("/")
     def page() -> str:
         return render_template("index.html", max_question_chars=MAX_QUESTION_CHARS,
                                has_people=people is not None, max_name=MAX_NAME, max_role=MAX_ROLE,
                                max_story=MAX_STORY, max_lines=MAX_LINES, max_line=MAX_LINE,
                                has_memory=memory_of(pipeline) is not None,
-                               max_search_chars=MAX_SEARCH_CHARS, max_filter_chars=MAX_FILTER_CHARS)
+                               max_search_chars=MAX_SEARCH_CHARS, max_filter_chars=MAX_FILTER_CHARS,
+                               discover_every=interval_words(discover_every))
 
     @app.get("/video")
     def video() -> Response:
@@ -891,6 +957,18 @@ def create_app(pipeline: Any, assistant: Any, camera_file: Path | None = None,
         pipeline.search([])
         return jsonify(ok=True)
 
+    # ---- auto-discover ----------------------------------------------------------------------
+
+    @app.post("/api/discover")
+    def discover() -> Any:
+        body = request.get_json(silent=True)
+        on = body.get("on") if isinstance(body, dict) and set(body) == {"on"} else None
+        if not isinstance(on, bool):
+            return jsonify(error=DISCOVER_SHAPE), 400
+        pipeline.discover(on)                         # returns at once; the status says how it goes
+        log.info("Auto-discover was switched %s from the page", "on" if on else "off")
+        return jsonify(ok=True, on=on)
+
     # ---- the camera's memory ---------------------------------------------------------------
 
     @app.get("/api/memory")
@@ -1181,7 +1259,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Cannot start: {error}")
         return 1
     assistant = build_assistant(config, pipeline)
-    app = create_app(pipeline, assistant, camera_file, build_people_book(config))
+    app = create_app(pipeline, assistant, camera_file, build_people_book(config),
+                     discover_every=discover_interval(config))
 
     pipeline.start()
     print(f"Demo page: {url}   (Ctrl+C stops the program)")

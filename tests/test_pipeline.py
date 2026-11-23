@@ -9,6 +9,7 @@ import logging
 import sys
 import threading
 import time
+import types
 from dataclasses import replace
 from pathlib import Path
 
@@ -46,6 +47,9 @@ CONFIG = {
                    "embeddings_file": "data/does-not-exist/embeddings.npz"},
     # No memory file: the tests that need the memory hand in a fake or a file in tmp_path.
     "memory": {"file": None, "keep_days": 7, "min_seconds": 1.0, "pictures": True},
+    "lookout": {"model": "fake/model:provider", "every_seconds": 10, "picture_width": 512, "max_names": 6,
+                "daily_budget_usd": 0.5, "input_price_per_million": 0.04,
+                "output_price_per_million": 0.05, "spend_file": "data/does-not-exist/lookout.json"},
     "reactions": {"greet_cooldown_seconds": 60, "message_seconds": 4.0},
     "app": {"host": "127.0.0.1", "port": 5000, "jpeg_quality": 80, "log_file": "logs/test.log"},
 }
@@ -2252,6 +2256,10 @@ class FakeOpenDetector:
     def reset_tracks(self):
         self._leave(self._enter("reset_tracks"))
 
+    def warm_up(self, frame_size):
+        entered = self._enter(("warm_up", tuple(frame_size)))
+        self._leave(entered)
+
     def count(self, what):
         return self.calls.count(what)
 
@@ -2338,7 +2346,8 @@ def test_search_refuses_bad_names_and_changes_nothing(make):
 
 def test_status_search_is_off_before_any_search_and_json_ready(make):
     status = make().status()
-    assert status["search"] == {"names": [], "state": "off", "note": "", "found": [], "missing": []}
+    assert status["search"] == {"names": [], "state": "off", "note": "", "found": [], "missing": [],
+                                 "seen": False}
     json.dumps(status)
 
 
@@ -2350,10 +2359,11 @@ def test_search_returns_at_once_then_loads_in_the_background(make):
     pipeline.search(["keys"])
     assert time.monotonic() - began < 0.2
     assert open_detector.inside.wait(2)                     # load() is under way ...
-    assert search_of(pipeline) == {"names": ["keys"], "state": "loading", "note": "", "found": [], "missing": []}
+    assert search_of(pipeline) == {"names": ["keys"], "state": "loading", "note": "", "found": [], "missing": [],
+                                 "seen": False}
     gate.set()                                              # ... and done
     assert wait_until(ready(pipeline))
-    assert open_detector.calls == ["load", ("set_names", ("keys",))]
+    assert open_detector.calls == ["load", ("set_names", ("keys",)), ("warm_up", (640, 480))]
 
 
 def test_a_loaded_open_detector_is_not_loaded_again(make):
@@ -2368,7 +2378,8 @@ def test_an_empty_search_stops_looking_at_once(make):
     pipeline, open_detector = searching(make)
     assert wait_until(lambda: search_of(pipeline)["found"])
     pipeline.search([])
-    assert search_of(pipeline) == {"names": [], "state": "off", "note": "", "found": [], "missing": []}
+    assert search_of(pipeline) == {"names": [], "state": "off", "note": "", "found": [], "missing": [],
+                                 "seen": False}
     assert wait_until(lambda: not any(o.get("found") for o in pipeline.status()["objects"]))
     time.sleep(0.05)                                        # a frame already under way may still run it once
     calls = open_detector.count("detect")
@@ -2391,7 +2402,7 @@ def test_the_newest_search_wins(make):
     assert wait_until(ready(pipeline))
     time.sleep(0.05)
     # The older rounds gave up: only the newest names were ever set, and the model was loaded once.
-    assert open_detector.calls == ["load", ("set_names", ("wifi router", "phone"))]
+    assert open_detector.calls == ["load", ("set_names", ("wifi router", "phone")), ("warm_up", (640, 480))]
     assert search_of(pipeline)["names"] == ["wifi router", "phone"]
     assert open_detector.overlaps == []
 
@@ -2404,7 +2415,7 @@ def test_a_failed_load_says_why_in_the_status_and_the_video_goes_on(make):
     pipeline.search(["keys"])
     assert wait_until(lambda: search_of(pipeline)["state"] == "failed")
     assert search_of(pipeline) == {"names": ["keys"], "state": "failed", "note": message,
-                                   "found": [], "missing": []}
+                                   "found": [], "missing": [], "seen": False}
     calls = detector.calls
     assert wait_until(lambda: detector.calls > calls + 3)  # the video goes on
     assert pipeline.status()["error"] is None
@@ -2543,7 +2554,7 @@ def test_status_says_what_was_found_where_and_what_is_missing(make):
     assert search_of(pipeline) == {"names": ["Wifi Router", "keys", "power bank"], "state": "ready", "note": "",
                                    "found": [{"name": "Wifi Router", "count": 2, "place": "middle"},  # the surer one
                                              {"name": "keys", "count": 1, "place": "left"}],
-                                   "missing": ["power bank"]}
+                                   "missing": ["power bank"], "seen": True}
     json.dumps(pipeline.status())
 
 
@@ -2575,7 +2586,7 @@ def test_the_search_status_finds_nothing_while_the_stream_is_down(make, monkeypa
     assert wait_until(lambda: search_of(pipeline)["found"])
     pipeline._source.connected = False
     assert wait_until(lambda: search_of(pipeline)["found"] == [])
-    assert search_of(pipeline)["missing"] == ["keys"]
+    assert search_of(pipeline)["missing"] == [] and search_of(pipeline)["seen"] is False   # not "not in view"
 
 
 def test_finds_of_replaced_names_never_reach_the_page(make):
@@ -2741,7 +2752,7 @@ def test_search_status_lists_found_and_missing_only_when_ready():
     finds = [Detection("keys", 0.5, (500, 0, 520, 10), 1), Detection("keys", 0.9, (0, 0, 20, 10), 2)]
     loading = pipeline_module.Search(("keys", "wallet"), "loading", "", 3)
     assert pipeline_module.search_status(loading, finds, 640) == {
-        "names": ["keys", "wallet"], "state": "loading", "note": "", "found": [], "missing": []}
+        "names": ["keys", "wallet"], "state": "loading", "note": "", "found": [], "missing": [], "seen": False}
     ready_search = replace(loading, state="ready")
     assert pipeline_module.search_status(ready_search, finds, 640)["found"] == [
         {"name": "keys", "count": 2, "place": "left"}]
@@ -2807,6 +2818,12 @@ class FakeSightings:
     def summary(self, now, limit=30):
         self.summaries.append(now)
         return list(self.lines)
+
+    def tick(self, now):
+        self.ticks = getattr(self, "ticks", 0) + 1
+
+    def close(self):
+        self.closed = True
 
 
 class RecordingState(WorldState):
@@ -3108,3 +3125,603 @@ def test_a_search_started_changed_and_stopped_gives_one_sighting_of_an_object_in
             reopened.close()
     finally:
         sightings.close()
+
+
+# ---- review fixes (M13) ---------------------------------------------------------------------------
+
+# Fix 1: never a person as an "object"
+
+
+@pytest.mark.parametrize("name", ["man", "Women", "old man", "man's", "faces", "someone", "Baby",
+                                  "red-hand", "PEOPLE", "anybody"])
+def test_clean_names_refuses_words_for_people(name):
+    with pytest.raises(ValueError) as refused:
+        pipeline_module.clean_names([name])
+    assert str(refused.value) == pipeline_module.NO_PEOPLE
+
+
+@pytest.mark.parametrize("name", ["headphones", "mandarin", "keyboard", "facial cream"])
+def test_names_that_only_contain_the_letters_of_a_people_word_are_fine(name):
+    assert pipeline_module.clean_names([name]) == (name,)
+
+
+PERSON_SQUARE = (0, 0, 100, 100)
+
+
+@pytest.mark.parametrize("box, dropped", [
+    ((20, 20, 60, 60), True),          # inside the person
+    ((-10, -10, 110, 110), True),      # around the person: its centre is inside
+    ((40, 0, 170, 100), True),         # centre (105, 50) outside, but overlapping 0.35
+    ((60, 0, 200, 100), False),        # centre (130, 50) outside, overlapping 0.2
+    ((110, 0, 200, 100), False),       # beside the person
+])
+def test_on_a_person(box, dropped):
+    assert pipeline_module.on_a_person(Detection("coat", 0.7, box, OFFSET + 1), [PERSON_SQUARE]) is dropped
+
+
+def test_merge_drops_a_find_on_a_person_and_the_person_keeps_their_box():
+    on_her = Detection("jacket", 0.9, (110, 70, 250, 290), 3)        # nearly the person box
+    shown, kept = merge([PERSON, CUP], NOTHING_KEPT, [on_her])
+    assert shown == [PERSON, CUP] and kept.finds == ()
+
+
+def test_a_named_find_on_a_person_never_turns_them_into_an_object(make):
+    sightings = FakeSightings()
+    on_sara = Detection("jacket", 0.9, (102, 62, 258, 298), 3)
+    pipeline, open_detector = searching(make, names=["jacket"], open_detector=FakeOpenDetector(finds=[on_sara]),
+                                        sightings=sightings, config=memory_config(), state=RecordingState())
+    assert wait_until(lambda: open_detector.count("detect") >= 2)
+    objects = pipeline.status()["objects"]
+    assert [(o["label"], o["track_id"], o["name"]) for o in objects][0] == ("person", 1, "Sara Ahmed")
+    assert not any(o["label"] == "jacket" for o in objects)
+    assert pipeline.target(track_id=1).kind == "person"
+    assert not any(call["label"] == "jacket" for call in sightings.seen_calls)
+    assert search_of(pipeline)["missing"] == ["jacket"]
+
+
+# Fix 2: the memory's periodic work and closing
+
+
+def test_the_memory_is_ticked_also_while_nothing_comes_and_closed_at_stop(make):
+    sightings = FakeSightings()
+    source = FakeSource(frames=0)
+    source.connected = False
+    pipeline = make(source=source, sightings=sightings, config=memory_config(), state=RecordingState()).start()
+    assert wait_until(lambda: getattr(sightings, "ticks", 0) > 20)
+    assert sightings.seen_calls == []
+    pipeline.stop()
+    assert sightings.closed is True                         # handed in, and closed all the same
+
+
+def test_a_thing_seen_briefly_reaches_the_file_without_another_sighting(make, tmp_path):
+    memory = pytest.importorskip("car_vision.memory")
+    sightings = memory.SightingLog(tmp_path / "memory.sqlite3", keep_days=7, min_seconds=0.2)
+    bottle = Detection("bottle", 0.8, (300, 100, 340, 200), 9)
+    source = FakeSource(frames=10_000)
+    detector = FakeDetector(detections=[bottle], delay=0.01)
+    pipeline = make(source=source, detector=detector, recognizer=FakeRecognizer(faces=[]),
+                    sightings=sightings, config=memory_config()).start()
+    time.sleep(0.6)
+    detector.detections = []                                # taken away; nothing else is in view
+    try:
+        assert wait_until(lambda: [s.label for s in sightings.recent()] == ["bottle"], timeout=6)
+        row = sightings.recent()[0]
+        assert row.last_seen - row.first_seen >= 0.4         # its real time in view, not cut short
+    finally:
+        pipeline.stop()
+
+
+# Fix 3: "seen": the finder has looked
+
+
+def test_the_search_is_not_seen_until_the_finder_has_looked_at_a_frame(make):
+    open_detector = FakeOpenDetector()
+    source = FakeSource(frames=0)
+    pipeline = make(source=source, open_detector=open_detector).start()
+    pipeline.search(["power bank"])
+    assert wait_until(ready(pipeline))
+    time.sleep(0.05)
+    search = search_of(pipeline)
+    assert (search["seen"], search["found"], search["missing"]) == (False, [], [])   # no frame yet
+    source.frames = 3
+    assert wait_until(lambda: search_of(pipeline)["seen"])
+    assert search_of(pipeline)["missing"] == ["power bank"]
+
+
+def test_the_search_is_not_seen_while_the_stream_is_down(make, monkeypatch):
+    monkeypatch.setattr(pipeline_module, "STALE_SECONDS", 0.2)
+    pipeline, _ = searching(make, names=["keys"], frames=3)
+    assert wait_until(lambda: search_of(pipeline)["seen"])
+    pipeline._source.connected = False
+    assert wait_until(lambda: search_of(pipeline)["seen"] is False)
+    assert search_of(pipeline)["found"] == search_of(pipeline)["missing"] == []
+
+
+def test_new_own_names_are_not_seen_until_looked_for(make):
+    pipeline, _ = searching(make, names=["keys"], frames=3)
+    assert wait_until(lambda: search_of(pipeline)["seen"] and pipeline._source.sequence == 3)
+    time.sleep(0.05)                                        # the last frame is done: the camera is stalled
+    pipeline.search(["wallet"])                             # the camera is stalled: no new frame
+    assert wait_until(ready(pipeline))
+    time.sleep(0.05)
+    assert search_of(pipeline)["seen"] is False
+
+
+# Fix 4: old finds vanish at once, also with a stalled camera
+
+
+@pytest.mark.parametrize("names", [["wallet"], []])
+def test_old_finds_vanish_at_once_from_the_list_and_the_clicks(make, names):
+    pipeline, _ = searching(make, names=["keys"], frames=3)  # then the camera stalls
+    assert wait_until(lambda: any(o["label"] == "keys" for o in pipeline.status()["objects"]))
+    time.sleep(0.05)
+    pipeline.search(names)
+    assert not any(o["label"] == "keys" for o in pipeline.status()["objects"])
+    assert pipeline.target(track_id=OFFSET + 7) is None
+    assert pipeline.target(**at(40, 320)).label != "keys"
+    assert [(o["label"], o["track_id"]) for o in pipeline.status()["objects"]] == [
+        ("person", 1), ("chair", 2), ("chair", 3)]             # the everyday ones stay
+
+
+def test_finds_of_names_still_looked_for_stay_when_others_are_added(make):
+    pipeline, _ = searching(make, names=["keys"], frames=3)
+    assert wait_until(lambda: any(o["label"] == "keys" for o in pipeline.status()["objects"]))
+    pipeline.search(["keys", "wallet"])
+    assert any(o["label"] == "keys" for o in pipeline.status()["objects"])
+
+
+# Fix 5: the summary is read off the video loop
+
+
+def test_the_summary_is_read_on_a_thread_of_its_own(make, monkeypatch):
+    monkeypatch.setattr(pipeline_module, "MEMORY_SHARE_SECONDS", 0.05)
+    threads = []
+
+    class WhereAsked(FakeSightings):
+        def summary(self, now, limit=30):
+            threads.append(threading.current_thread().name)
+            return super().summary(now, limit)
+
+    make(source=FakeSource(frames=50), sightings=WhereAsked(), config=memory_config(),
+         state=RecordingState()).start()
+    assert wait_until(lambda: len(threads) >= 3)
+    assert set(threads) == {"memory-summary"}
+
+
+# Fix 6: warm-up off the loop
+
+
+def test_the_open_detector_is_warmed_up_before_the_search_is_ready_and_only_for_new_names(make):
+    pipeline, open_detector = searching(make, names=["keys"], frames=3)
+    assert wait_until(lambda: pipeline.state.snapshot().frame_size == (640, 360))
+    assert open_detector.calls[:3] == ["load", ("set_names", ("keys",)), ("warm_up", (640, 480))]
+    pipeline.search(["wallet"])
+    assert wait_until(ready(pipeline))
+    assert open_detector.calls[-1] == ("warm_up", (640, 360))    # the size of the frames now
+    warm_ups = len([c for c in open_detector.calls if c[0] == "warm_up"])
+    pipeline.search(["wallet"])                                  # the same names: nothing to warm up
+    assert wait_until(ready(pipeline))
+    time.sleep(0.05)
+    assert len([c for c in open_detector.calls if c[0] == "warm_up"]) == warm_ups
+
+
+# Fix 7: one Unicode form, and a letter or digit
+
+
+def test_names_are_compared_in_one_unicode_form():
+    composed, decomposed = "café mug", "café mug"
+    assert pipeline_module.clean_names([decomposed, composed]) == (composed,)
+
+
+@pytest.mark.parametrize("name", ["'", "- -", "''-", "’"])
+def test_a_name_without_a_letter_or_digit_is_refused(name):
+    with pytest.raises(ValueError, match="letter or digit"):
+        pipeline_module.clean_names([name])
+
+
+# Fix 8: stop() during a load
+
+
+def test_a_search_loading_at_stop_is_never_marked_ready(make):
+    gate = threading.Event()
+    open_detector = FakeOpenDetector(load_gate=gate)
+    pipeline = make(open_detector=open_detector).start()
+    pipeline.search(["keys"])
+    assert open_detector.inside.wait(2)
+    pipeline.stop()
+    gate.set()
+    time.sleep(0.1)
+    assert search_of(pipeline)["state"] == "off"
+    assert pipeline._search.state == "off"
+    assert ("set_names", ("keys",)) not in open_detector.calls
+
+
+# ---- auto-discover (M14 part B) ------------------------------------------------------------------
+#
+# A fake lookout stands in for lookout.Lookout: no network, no key, no .env.
+
+
+class FakeLookoutError(Exception):
+    """Shaped like lookout.LookoutError: a plain message and a kind."""
+
+    def __init__(self, message, kind="other"):
+        super().__init__(message)
+        self.kind = kind
+
+
+class FakeLookout:
+    """Gives the answers in turn (the last one again and again); an Exception in the list is raised."""
+
+    def __init__(self, *answers, budget=0.5, gate=None):
+        self.answers = list(answers) or [["router"]]
+        self.budget = budget
+        self.gate = gate
+        self.pictures = []
+        self.looks_today = 0
+        self.spent_today = 0.0
+
+    def names(self, jpeg):
+        self.pictures.append(jpeg)
+        if self.gate is not None:
+            assert self.gate.wait(5)
+        answer = self.answers[min(len(self.pictures), len(self.answers)) - 1]
+        self.looks_today += 1
+        self.spent_today += 0.000013
+        if isinstance(answer, Exception):
+            raise answer
+        return list(answer)
+
+    @property
+    def looks(self):
+        return len(self.pictures)
+
+
+ROUTER = Detection("router", 0.6, (480, 40, 560, 90), 11)       # on the right, away from everyone
+CURTAIN = Detection("curtain", 0.5, (560, 0, 639, 200), 12)
+
+
+def discover_config(every=0.02, **changes):
+    return {**CONFIG, "lookout": {**CONFIG["lookout"], "every_seconds": every, **changes}}
+
+
+def discover_of(pipeline):
+    return pipeline.status()["discover"]
+
+
+def discovering(make, lookout, names=(), finds=(KEYS, ROUTER, CURTAIN), every=0.02, frames=10_000, **kwargs):
+    """A running pipeline with auto-discover on (and the visitor's own `names`, if any)."""
+    open_detector = FakeOpenDetector(finds=finds)
+    pipeline = make(source=FakeSource(frames=frames), detector=FakeDetector(delay=0.005),
+                    open_detector=open_detector, lookout=lookout,
+                    config=kwargs.pop("config", None) or discover_config(every), **kwargs).start()
+    if names:
+        pipeline.search(list(names))
+    assert wait_until(lambda: pipeline.latest_jpeg() is not None)
+    pipeline.discover(True)
+    return pipeline, open_detector
+
+
+def set_names_calls(open_detector):
+    return [call[1] for call in open_detector.calls if isinstance(call, tuple) and call[0] == "set_names"]
+
+
+def no_more_detects(open_detector):
+    """True when the open detector is not run any more (after a frame that was under way)."""
+    time.sleep(0.05)
+    detects = open_detector.count("detect")
+    time.sleep(0.1)
+    return open_detector.count("detect") == detects
+
+
+def test_auto_discover_is_off_at_start_up_and_its_status_is_json_ready(make):
+    lookout = FakeLookout()
+    pipeline = make(source=FakeSource(frames=5), lookout=lookout, config=discover_config()).start()
+    time.sleep(0.1)
+    assert discover_of(pipeline) == {"on": False, "state": "off", "names": [], "note": "", "looks": 0,
+                                     "spent_usd": 0.0, "budget_usd": 0.5}
+    assert lookout.looks == 0
+    json.dumps(pipeline.status())
+
+
+def test_the_lookout_is_built_on_the_first_look_not_at_start_up(make, monkeypatch):
+    built = []
+    lookout_module = types.ModuleType("car_vision.lookout")
+    lookout_module.Lookout = lambda settings: built.append(settings) or FakeLookout()
+    monkeypatch.setitem(sys.modules, "car_vision.lookout", lookout_module)
+    pipeline = make(source=FakeSource(frames=10_000), open_detector=FakeOpenDetector(),
+                    config=discover_config()).start()
+    time.sleep(0.05)
+    assert built == []
+    pipeline.discover(True)
+    assert wait_until(lambda: built)
+    assert built == [pipeline._lookout_settings]
+
+
+def test_discover_takes_only_true_or_false(make):
+    with pytest.raises(ValueError):
+        make().discover("yes")
+
+
+def test_looks_come_every_few_seconds_on_a_clean_shrunk_picture(make):
+    lookout = FakeLookout(["router"])
+    pipeline, _ = discovering(make, lookout, every=0.05)
+    assert wait_until(lambda: lookout.looks >= 1)
+    began = lookout.looks
+    time.sleep(0.5)
+    assert 4 <= lookout.looks - began <= 12                 # about every 0.05 s
+    picture = decoded(lookout.pictures[0])
+    assert picture.shape == (288, 512, 3)                   # 640 x 360 shrunk to 512 wide
+    assert np.abs(picture - 60).max() <= 4                  # no boxes drawn on it
+    assert discover_of(pipeline)["state"] == "looking"
+    assert discover_of(pipeline)["looks"] == lookout.looks_today
+
+
+def test_the_look_thread_is_not_the_video_loop(make):
+    threads = []
+
+    class WhereAsked(FakeLookout):
+        def names(self, jpeg):
+            threads.append(threading.current_thread().name)
+            return super().names(jpeg)
+
+    discovering(make, WhereAsked(["router"]))
+    assert wait_until(lambda: threads)
+    assert set(threads) == {"lookout"}
+
+
+def test_discovered_names_reach_the_open_detector_and_its_finds_the_page(make):
+    lookout = FakeLookout(["router", "curtain"])
+    pipeline, open_detector = discovering(make, lookout)
+    assert wait_until(lambda: any(o["label"] == "router" for o in pipeline.status()["objects"]))
+    assert set_names_calls(open_detector)[0] == ("router", "curtain")
+    router = next(o for o in pipeline.status()["objects"] if o["label"] == "router")
+    assert router["discovered"] is True and "found" not in router
+    assert router["track_id"] == OFFSET + 11
+    assert discover_of(pipeline)["names"] == ["router", "curtain"]
+    assert search_of(pipeline) == {"names": [], "state": "off", "note": "", "found": [], "missing": [],
+                                   "seen": False}               # not the visitor's search
+    assert pipeline.target(track_id=OFFSET + 11).label == "router"
+
+
+def test_discovered_finds_are_not_drawn_in_the_search_colour(make, monkeypatch):
+    wanted_per_frame = []
+    real_draw = pipeline_module.draw.draw_detections
+
+    def recording_draw(frame, detections, wanted=()):
+        wanted_per_frame.append((sorted(wanted), sorted(d.label for d in detections)))
+        real_draw(frame, detections, wanted)
+
+    monkeypatch.setattr(pipeline_module.draw, "draw_detections", recording_draw)
+    pipeline, _ = discovering(make, FakeLookout(["router"]), names=["keys"])
+    assert wait_until(lambda: any("router" in labels for _w, labels in wanted_per_frame))
+    wanted, labels = next(item for item in reversed(wanted_per_frame) if "router" in item[1])
+    assert wanted == [OFFSET + 7]                           # only the visitor's keys stand out
+    # A frame is drawn before it is published: wait until the page sees it too.
+    assert wait_until(lambda: {"keys", "router"} <= {o["label"] for o in pipeline.status()["objects"]})
+    objects = {o["label"]: o for o in pipeline.status()["objects"]}
+    assert objects["keys"].get("found") is True and "discovered" not in objects["keys"]
+    assert objects["router"].get("discovered") is True
+    assert search_of(pipeline)["names"] == ["keys"]
+
+
+def test_own_names_come_first_and_six_in_all(make):
+    lookout = FakeLookout(["router", "curtain", "cushion", "lamp", "rug", "plant pot", "cable"])
+    pipeline, open_detector = discovering(make, lookout, names=["keys", "wallet"])
+    assert wait_until(lambda: any(len(names) == 6 for names in set_names_calls(open_detector)))
+    assert set_names_calls(open_detector)[-1] == ("keys", "wallet", "router", "curtain", "cushion", "lamp")
+    assert discover_of(pipeline)["names"][:4] == ["router", "curtain", "cushion", "lamp"]
+
+
+def test_names_the_everyday_detector_knows_and_words_for_people_are_dropped(make):
+    lookout = FakeLookout(["tv", "Television", "chairs", "monitor", "man", "hand", "router", "cell phone"])
+    pipeline, open_detector = discovering(make, lookout)
+    assert wait_until(lambda: discover_of(pipeline)["names"])
+    assert discover_of(pipeline)["names"] == ["router"]
+    assert wait_until(lambda: set_names_calls(open_detector))
+    assert set_names_calls(open_detector) == [("router",)]
+
+
+def test_set_names_only_when_the_list_really_changes(make):
+    lookout = FakeLookout(["router", "curtain"], ["curtain", "router"], ["router", "curtain"])
+    pipeline, open_detector = discovering(make, lookout)
+    assert wait_until(lambda: lookout.looks >= 8)
+    assert set_names_calls(open_detector) == [("router", "curtain")]   # the same two, in any order: once
+
+
+def test_a_discovered_name_stays_a_while_after_it_was_last_mentioned(make, monkeypatch):
+    monkeypatch.setattr(pipeline_module, "DISCOVERED_KEEP_SECONDS", 0.3)
+    lookout = FakeLookout(["router"], [], [])
+    pipeline, open_detector = discovering(make, lookout)
+    assert wait_until(lambda: discover_of(pipeline)["names"] == ["router"])
+    began = time.monotonic()
+    assert wait_until(lambda: discover_of(pipeline)["names"] == [])
+    assert time.monotonic() - began >= 0.2                  # kept, then dropped
+    assert pipeline._search.finder_names == ()              # nothing left to look for
+    assert no_more_detects(open_detector)
+    assert not any(o["label"] == "router" for o in pipeline.status()["objects"])
+
+
+def test_a_discovered_find_on_a_person_is_dropped(make):
+    on_sara = Detection("scarf", 0.8, (120, 80, 240, 280), 13)
+    pipeline, open_detector = discovering(make, FakeLookout(["scarf"]), finds=[on_sara])
+    assert wait_until(lambda: open_detector.count("detect") >= 3)
+    assert not any(o["label"] == "scarf" for o in pipeline.status()["objects"])
+    assert pipeline.target(track_id=1).person == SARA
+
+
+def test_switching_off_stops_the_looks_and_forgets_the_names(make):
+    lookout = FakeLookout(["router"])
+    pipeline, open_detector = discovering(make, lookout, names=["keys"])
+    assert wait_until(lambda: any(o["label"] == "router" for o in pipeline.status()["objects"]))
+    pipeline.discover(False)
+    looks = lookout.looks
+    assert discover_of(pipeline)["on"] is False and discover_of(pipeline)["names"] == []
+    assert not any(o["label"] == "router" for o in pipeline.status()["objects"])   # at once
+    assert wait_until(lambda: open_detector.names == ("keys",))
+    time.sleep(0.15)
+    assert lookout.looks <= looks + 1                       # at most the one already under way
+    assert search_of(pipeline)["state"] == "ready"
+
+
+def test_switching_on_twice_starts_one_thread(make):
+    lookout = FakeLookout(["router"])
+    pipeline, _ = discovering(make, lookout, every=0.1)
+    pipeline.discover(True)
+    time.sleep(0.45)
+    assert lookout.looks <= 7                               # one thread: about 5, not 10
+
+
+@pytest.mark.parametrize("kind", ["budget", "no_key", "key_refused", "no_credit", "not_available"])
+def test_a_lasting_problem_pauses_until_switched_off_and_on(make, kind):
+    message = f"A plain message about {kind}."
+    lookout = FakeLookout(["router"], FakeLookoutError(message, kind), ["router"])
+    pipeline, open_detector = discovering(make, lookout)
+    assert wait_until(lambda: discover_of(pipeline)["state"] == "paused")
+    assert discover_of(pipeline)["note"] == message and discover_of(pipeline)["on"] is True
+    assert discover_of(pipeline)["names"] == []             # nothing more is looked for
+    assert pipeline._search.finder_names == ()
+    assert no_more_detects(open_detector)
+    looks = lookout.looks
+    time.sleep(0.15)
+    assert lookout.looks == looks                           # no more looks ...
+    pipeline.discover(False)
+    pipeline.discover(True)                                 # ... until switched off and on
+    assert wait_until(lambda: lookout.looks > looks)
+    assert wait_until(lambda: discover_of(pipeline)["state"] == "looking")
+
+
+def test_three_passing_failures_in_a_row_wait_a_while(make, monkeypatch):
+    monkeypatch.setattr(pipeline_module, "FAILURE_WAIT_SECONDS", 0.4)
+    busy = FakeLookoutError("Hugging Face is busy right now. Try again later.", "busy")
+    lookout = FakeLookout(busy, busy, busy, ["router"])
+    pipeline, _ = discovering(make, lookout)
+    assert wait_until(lambda: lookout.looks == 3)
+    assert discover_of(pipeline)["state"] == "paused"
+    assert discover_of(pipeline)["note"] == "Hugging Face is busy right now. Try again later."
+    began = time.monotonic()
+    assert wait_until(lambda: lookout.looks == 4, timeout=2)
+    assert time.monotonic() - began >= 0.3                  # waited, not every 0.02 s
+    assert wait_until(lambda: discover_of(pipeline)["state"] == "looking")
+    assert discover_of(pipeline)["names"] == ["router"]
+
+
+def test_one_passing_failure_pauses_with_its_note_and_the_next_look_comes_as_usual(make):
+    lookout = FakeLookout(FakeLookoutError("Could not reach Hugging Face.", "network"), ["router"])
+    pipeline, _ = discovering(make, lookout)
+    assert wait_until(lambda: lookout.looks >= 2, timeout=1)
+    assert wait_until(lambda: discover_of(pipeline)["state"] == "looking")
+
+
+def test_a_look_still_under_way_is_skipped_without_counting(make, monkeypatch):
+    monkeypatch.setattr(pipeline_module, "FAILURE_WAIT_SECONDS", 5.0)
+    still = FakeLookoutError("The previous look has not finished yet.", "still_looking")
+    lookout = FakeLookout(still, still, still, still, ["router"])
+    pipeline, _ = discovering(make, lookout)
+    assert wait_until(lambda: lookout.looks >= 5, timeout=1)  # no 5 s wait after three
+    assert discover_of(pipeline)["state"] == "looking" and discover_of(pipeline)["note"] == ""
+
+
+def test_an_unexpected_error_pauses_with_a_plain_note(make):
+    lookout = FakeLookout(RuntimeError("secret detail from deep inside"))
+    pipeline, _ = discovering(make, lookout)
+    assert wait_until(lambda: discover_of(pipeline)["state"] == "paused")
+    assert discover_of(pipeline)["note"] == pipeline_module.LOOK_FAILED
+
+
+def test_no_look_after_stop(make):
+    lookout = FakeLookout(["router"])
+    pipeline, _ = discovering(make, lookout)
+    assert wait_until(lambda: lookout.looks >= 2)
+    pipeline.stop()
+    looks = lookout.looks
+    time.sleep(0.15)
+    assert lookout.looks == looks
+    assert discover_of(pipeline)["on"] is False
+
+
+def test_stop_does_not_wait_for_a_look_under_way(make):
+    gate = threading.Event()
+    lookout = FakeLookout(["router"], gate=gate)
+    pipeline, _ = discovering(make, lookout)
+    try:
+        assert wait_until(lambda: lookout.looks == 1)       # the request is under way ...
+        began = time.monotonic()
+        pipeline.stop()
+        assert time.monotonic() - began < 1.0               # ... and stop() does not wait for it
+    finally:
+        gate.set()
+    time.sleep(0.05)
+    assert discover_of(pipeline)["names"] == []             # its answer came too late to count
+
+
+def test_an_answer_about_a_replaced_camera_is_dropped(make):
+    gate = threading.Event()
+    lookout = FakeLookout(["router"], gate=gate)
+    pipeline, open_detector = discovering(make, lookout,
+                                          source_factory=SourceFactory(phone_source(frames=0, connected=False)))
+    assert wait_until(lambda: lookout.looks == 1)
+    pipeline.use_phone(PHONE)
+    gate.set()
+    time.sleep(0.1)
+    assert discover_of(pipeline)["names"] == []
+    assert set_names_calls(open_detector) == []
+
+
+def test_the_finder_failing_for_discovered_names_pauses_discover(make):
+    open_detector = FakeOpenDetector(load_error=RuntimeError("Could not load the named search model."))
+    pipeline = make(source=FakeSource(frames=10_000), open_detector=open_detector,
+                    lookout=FakeLookout(["router"]), config=discover_config()).start()
+    pipeline.discover(True)
+    assert wait_until(lambda: discover_of(pipeline)["state"] == "paused")
+    assert discover_of(pipeline)["note"] == "Could not load the named search model."
+    assert search_of(pipeline)["state"] == "off"            # the visitor searched for nothing
+
+
+def test_with_the_real_lookout_and_a_fake_network(make, monkeypatch, tmp_path):
+    lookout_module = pytest.importorskip("car_vision.lookout")
+    monkeypatch.setattr(lookout_module, "read_key", lambda: "hf_" + "x" * 20)   # never the real .env
+    sent = []
+
+    def fake_fetch(url, headers, body, timeout):
+        sent.append(url)
+        answer = {"choices": [{"message": {"content": "TV, Router, a man, Curtains"}}],
+                  "usage": {"prompt_tokens": 312, "completion_tokens": 17}}
+        return 200, json.dumps(answer)
+
+    settings = {**CONFIG["lookout"], "spend_file": str(tmp_path / "lookout.json")}
+    lookout = lookout_module.Lookout(settings, fetch=fake_fetch)
+    pipeline, open_detector = discovering(make, lookout, every=0.1)
+    assert wait_until(lambda: discover_of(pipeline)["names"])
+    assert discover_of(pipeline)["names"] == ["router", "curtains"]
+    assert discover_of(pipeline)["looks"] >= 1 and discover_of(pipeline)["spent_usd"] > 0
+    assert wait_until(lambda: set_names_calls(open_detector))
+    assert set_names_calls(open_detector)[0] == ("router", "curtains")
+    assert all(url.startswith("https://router.huggingface.co/") for url in sent)
+
+
+@pytest.mark.parametrize("names, own, expected", [
+    (["a", "b"], (), ("a", "b")),
+    (["Keys", "b"], ("keys",), ("b",)),                     # not twice
+    (["a", "b", "c", "d", "e", "f", "g"], ("x", "y"), ("a", "b", "c", "d")),
+])
+def test_names_after(names, own, expected):
+    assert pipeline_module.names_after(own, names) == expected
+
+
+def test_in_earlier_order_keeps_the_names_already_given_in_place():
+    assert pipeline_module.in_earlier_order(("b", "a", "c"), ("a", "b")) == ("a", "b", "c")
+    assert pipeline_module.in_earlier_order(("c",), ("a", "b")) == ("c",)
+
+
+@pytest.mark.parametrize("name, boxed", [("tv", True), ("Televisions", True), ("couches", True),
+                                         ("sofa", True), ("router", False), ("curtain", False),
+                                         ("power bank", False)])
+def test_boxed_every_day(name, boxed):
+    assert pipeline_module.boxed_every_day(name) is boxed
+
+
+def test_every_lookout_setting_the_pipeline_reads_is_checked():
+    for key, value in [("every_seconds", 0), ("picture_width", 8), ("every_seconds", "10")]:
+        with pytest.raises(ConfigError, match=key):
+            Pipeline(discover_config(**{key: value}), source=FakeSource(), detector=FakeDetector(),
+                     recognizer=FakeRecognizer())

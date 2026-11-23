@@ -53,6 +53,16 @@ memory:
   min_seconds: 1.0          # a thing must stay in view this long to be remembered
   pictures: true            # keep a small picture of remembered objects (never of people)
 
+lookout:
+  model: "google/gemma-3-4b-it:parasail"   # a small hosted model that names what is in view (auto-discover)
+  every_seconds: 10
+  picture_width: 512            # the picture sent is shrunk to this width
+  max_names: 6
+  daily_budget_usd: 0.50        # looking stops for the day when the estimated cost reaches this
+  input_price_per_million: 0.04   # the model's listed prices in dollars, used for the estimate
+  output_price_per_million: 0.05
+  spend_file: data/lookout.json   # today's count and estimated cost, kept across restarts
+
 reactions:
   greet_cooldown_seconds: 60        # greet the same person at most this often
   message_seconds: 4.0              # how long a greeting stays on screen

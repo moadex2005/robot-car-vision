@@ -603,7 +603,14 @@
   /* In view: a wrapping row of glass pills under the video. They look like glass (a translucent
      gradient, a hairline edge, a light line along the top) but blur nothing: there are many of them. */
   .inview { margin-top: 1.6rem; text-align: center; }
-  .inview h3 { margin: 0 0 0.9rem; font-size: 0.8rem; font-weight: 600; letter-spacing: 0.14em; text-transform: uppercase; color: var(--grey); }
+  .inview h3 { margin: 0; font-size: 0.8rem; font-weight: 600; letter-spacing: 0.14em; text-transform: uppercase; color: var(--grey); }
+  /* The heading with the Auto-discover switch and its small status beside it. */
+  .inview-head { display: flex; flex-wrap: wrap; align-items: center; justify-content: center; gap: 0.45rem 1.3rem; margin: 0 0 0.9rem; }
+  .discover-switch { font-size: 0.85rem; }
+  .discover-state { color: var(--grey); font-size: 0.8rem; font-variant-numeric: tabular-nums; }
+  .discover-state strong { color: var(--text); font-weight: 600; }
+  .discover-state.problem { color: var(--warn); font-weight: 500; }
+  .discover-privacy { margin: -0.3rem auto 0.95rem; max-width: 38rem; color: var(--grey); font-size: 0.85rem; line-height: 1.45; }
   .things { list-style: none; margin: 0; padding: 0; display: flex; flex-wrap: wrap; justify-content: center; gap: 0.6rem; }
   .things li { animation: pill-in 0.55s var(--spring); }
   @keyframes pill-in { from { opacity: 0; transform: translateY(10px) scale(0.9); } to { opacity: 1; transform: none; } }
@@ -634,6 +641,13 @@
   .thing.is-found .thing-name::before {
     content: ""; display: inline-block; width: 0.55em; height: 0.55em; margin-right: 0.45em;
     border-radius: 50%; background: #ffd60a; box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.35);
+  }
+  /* A thing named by auto-discover: a small tag that says so. */
+  .thing-tag {
+    align-self: center;
+    padding: 0.05rem 0.5rem; border-radius: 999px;
+    background: var(--accent-soft); color: var(--accent);
+    font-size: 0.72rem; font-weight: 600; letter-spacing: 0.02em; white-space: nowrap;
   }
   .quiet { margin: 0; color: var(--grey); }
   .privacy { margin: 1.1rem auto 0; max-width: 38rem; color: var(--grey); font-size: 0.85rem; line-height: 1.45; }
@@ -688,7 +702,7 @@
     border-radius: 0; box-shadow: none;
   }
   .stage.is-full .frame img:focus-visible { border-radius: 0; }
-  .stage.is-full .view-meta, .stage.is-full .privacy, .stage.is-full .inview h3,
+  .stage.is-full .view-meta, .stage.is-full .privacy, .stage.is-full .inview-head, .stage.is-full .discover-privacy,
   .stage.is-full #nothing, .stage.is-full .delay-help { display: none; }
   .stage.is-full .inview {
     position: absolute; left: 0; right: 0; bottom: 0; z-index: 2;
@@ -1175,7 +1189,17 @@
         </div>
 
         <div class="inview" aria-label="In view">
-          <h3>In view</h3>
+          <div class="inview-head">
+            <h3>In view</h3>
+            <!-- Auto-discover: off on every page load; shown once the server says it has it. -->
+            <label class="switch discover-switch" id="discoverRow" hidden>
+              <input type="checkbox" id="discoverSwitch" role="switch" aria-describedby="discoverState">
+              <span class="switch-track" aria-hidden="true"></span>
+              <span>Auto-discover</span>
+            </label>
+            <span class="discover-state" id="discoverState" data-every="{{ discover_every }}" hidden></span>
+          </div>
+          <p class="discover-privacy" id="discoverPrivacy" hidden>Auto-discover sends a small picture of the whole view to a Hugging Face model every few seconds. Anyone in view is in that picture.</p>
           <ul class="things" id="things"></ul>
           <p class="quiet" id="nothing">Nothing detected right now</p>
           <p class="privacy" id="privacy">A click on an object or on an empty spot sends a small cut-out of the picture to the assistant's API. A click on a person sends nothing. Follow-up questions about an object send the same cut-out again. A marked part is sent as the same cut-out with your outline drawn on it. Describe the scene sends the whole picture.</p>
@@ -1343,6 +1367,7 @@
   <p>A click on an object or on an empty spot sends a small cut-out of the picture to the assistant's API. A click on a person sends nothing. Follow-up questions about an object send the same cut-out again. A marked part is sent as the same cut-out with your outline drawn on it. Describe the scene sends the whole picture.</p>
   <p class="voice-privacy" hidden><span class="privacy-listen" hidden>Asking by voice sends the sound of your question to your browser's speech service (Microsoft or Google) to turn it into text.</span> <span class="privacy-speak" hidden>A "Natural" or online voice sends the text of the answer to that service to be spoken; the other voices stay on this computer.</span></p>
   <p>The camera's memory (what was seen and when, with small pictures of objects, never of people) stays on this laptop. A chat question sends its text lines, without pictures, to the assistant.</p>
+  <p>Auto-discover sends a small picture of the whole view to a Hugging Face model every few seconds. Anyone in view is in that picture.</p>
   <p>Runs on this laptop. Nothing is sent to the car.</p>
 </footer>
 
@@ -1359,6 +1384,8 @@ const MAX_SOURCES = 3;         // web answers list at most this many links
 const PHOTO_PREFIX = "data:image/jpeg;base64,";   // the only kind of photo address that is shown
 const AREA_TITLE = "Something the detector has no name for";
 const FOUND_TITLE = "One of the things you are looking for";
+const DISCOVERED_TAG = "discovered";
+const DISCOVERED_TITLE = "Named by auto-discover: a hosted model suggested this name";
 const UNKNOWN_HINT = "Add a folder with photos and an about.md for them in data/people to show their details here.";
 
 const byId = (id) => document.getElementById(id);
@@ -1410,24 +1437,31 @@ function forgetDrawn() {
 // ---- find by words: is this sentence nothing but a request to find something? ----
 //
 // findRequest(text) gives what to look for, or null: then the sentence goes to the assistant
-// as before. The chat field, every microphone and conversation mode use it. It is strict on
-// purpose: a find request that is missed still gets an answer from the assistant, but a
-// question taken for a find request would be lost.
+// as before. The chat field, its microphone, the stage microphone without a panel and
+// conversation mode use it; questions in the details panel never do (they are about the
+// clicked thing). It is strict on purpose: a find request that is missed still gets an answer
+// from the assistant, but a question for the web taken for a camera search would be lost.
 //
 // Taken: the whole sentence is an opening, then 1 to 6 names (commas and "and" between them),
 // with or without "please", a full stop or a question mark:
 //   "find my keys" -> "keys"            "look for the remote" -> "remote"
 //   "where is the power bank?" -> "power bank"   "where are my keys" / "where's the cup"
 //   "can you see a bottle?" / "do you see the cup"   "find my keys and the remote" -> "keys, remote"
-// The little words "the", "my", "a" and "an" are dropped from the names.
+// The little words "the", "my", "a" and "an" are dropped from the names. After "where is" and
+// "where are" every name must start with one of them ("where is the cup", never "where is paris").
 // Left for the assistant:
 //   another opening: "where did you last see the bottle", "when did ...", "is there a cup"
 //   a name with an apostrophe ("where is the project's code") or a capital, then small letters,
 //   which is a person or a place ("where is Sara")
 //   a word that is not part of a thing's name (FIND_NOT_A_NAME): "can you see well in the dark",
-//   "can you see me", "find out who built the car", "look for the keys on the table"
+//   "can you see me", "find out who built the car", "look for the keys on the table", and the
+//   words of questions for the web: "find a good restaurant nearby", "find python tutorials",
+//   "where is the nearest hospital", "where is the capital", "where is the robot"
 //   a name of more than 4 words, more than 6 names, or a sentence over 80 characters.
-const FIND_OPENING = /^(?:please\s+)?(?:find|look\s+for|where\s+is|where\s+are|where's|can\s+you\s+see|do\s+you\s+see)\s+(.+)$/i;
+// Words for people ("can you see my face") are left to the server, which says plainly that
+// people are recognised by their face, not looked for by name.
+const FIND_OPENING = /^(?:please\s+)?(find|look\s+for|where\s+is|where\s+are|where's|can\s+you\s+see|do\s+you\s+see)\s+(.+)$/i;
+const FIND_WHERE = /^where/i;  // these openings need a little word before each name
 const FIND_LITTLE_WORDS = ["the", "my", "a", "an"];
 const FIND_NOT_A_NAME = [
   "who", "what", "when", "where", "why", "how", "which", "whose", "that", "this", "these", "those",
@@ -1440,6 +1474,18 @@ const FIND_NOT_A_NAME = [
   "should", "have", "has", "had", "going", "located", "kept", "made", "built", "headed",
   "well", "clearly", "now", "today", "yesterday", "last", "ever", "still", "again", "very", "please",
   "way", "answer", "time", "help", "information", "info", "project", "code", "team", "notes", "website",
+  // Questions for the web, not for the camera:
+  "good", "best", "better", "great", "nice", "top", "cheap", "cheapest", "popular", "famous", "local",
+  "nearest", "nearby", "closest", "around",
+  "tutorial", "tutorials", "course", "courses", "guide", "guides", "lesson", "lessons", "recipe", "recipes",
+  "restaurant", "restaurants", "cafe", "hotel", "hotels", "hospital", "hospitals", "pharmacy", "clinic",
+  "doctor", "dentist", "school", "university", "airport", "museum", "mall",
+  "capital", "city", "cities", "country", "countries", "town", "village", "place", "places", "address",
+  "location", "direction", "directions", "map", "route", "world", "earth", "moon", "sun", "planet",
+  "ways", "answers", "news", "weather", "forecast", "websites", "site", "sites",
+  "page", "link", "links", "article", "articles", "online", "internet", "web", "video", "videos",
+  "meaning", "definition", "example", "examples", "idea", "ideas", "solution", "solutions", "job", "jobs",
+  "price", "prices", "deal", "deals", "robot",
 ];
 const FIND_MAX_CHARS = 80;
 const FIND_MAX_WORDS = 4;      // in one name
@@ -1451,9 +1497,12 @@ function findRequest(text) {
   if (!sentence || sentence.length > FIND_MAX_CHARS) return null;
   const match = FIND_OPENING.exec(sentence);
   if (!match) return null;
+  const needsLittleWord = FIND_WHERE.test(match[1]);
   const names = [];
-  for (const part of match[1].split(/\s*,\s*|\s+and\s+/i)) {
-    const words = part.split(" ").filter((word) => word && !FIND_LITTLE_WORDS.includes(word.toLowerCase()));
+  for (const part of match[2].split(/\s*,\s*|\s+and\s+/i)) {
+    const all = part.split(" ").filter(Boolean);
+    if (needsLittleWord && !(all.length && FIND_LITTLE_WORDS.includes(all[0].toLowerCase()))) return null;
+    const words = all.filter((word) => !FIND_LITTLE_WORDS.includes(word.toLowerCase()));
     if (!words.length || words.length > FIND_MAX_WORDS) return null;
     for (const word of words) {
       if (FIND_NOT_A_NAME.includes(word.toLowerCase())) return null;
@@ -1659,6 +1708,7 @@ function readObject(raw) {
     box: box.length === 4 && box.every(Number.isFinite) ? box : null,
     name: raw.name == null ? "" : asText(raw.name),
     found: raw.found === true,        // one of the things the visitor is looking for
+    discovered: raw.discovered === true && raw.found !== true,   // named by auto-discover
   };
 }
 
@@ -1678,18 +1728,23 @@ const percent = (confidence) => Math.round(confidence * 100) + "%";
 
 // What one pill says: a recognised person by name and role, anything else by label, track and confidence.
 function thingText(entry, roles) {
-  if (entry.name) return { name: entry.name, detail: roles.get(entry.name) || "", known: true, found: entry.found };
+  if (entry.name) {
+    return { name: entry.name, detail: roles.get(entry.name) || "", known: true, found: entry.found, discovered: false };
+  }
   const parts = [];
   if (entry.track_id !== null) parts.push("#" + entry.track_id);
   parts.push(percent(entry.confidence));
-  return { name: entry.label, detail: parts.join("  "), known: false, found: entry.found };
+  return { name: entry.label, detail: parts.join("  "), known: false, found: entry.found, discovered: entry.discovered };
 }
 
+// A pill: the name, the small "discovered" tag (hidden unless auto-discover named it), the detail.
 function thingItem(key) {
   const item = make("li");
   const button = make("button", "thing");
   button.type = "button";
-  button.append(make("span", "thing-name"), make("span", "thing-detail"));
+  const tag = make("span", "thing-tag", DISCOVERED_TAG);
+  tag.hidden = true;
+  button.append(make("span", "thing-name"), tag, make("span", "thing-detail"));
   button.addEventListener("click", () => inspectThing(key));
   item.append(button);
   return item;
@@ -1741,7 +1796,10 @@ function drawObjects(status) {
     button.classList.toggle("is-known", thing.known);
     button.classList.toggle("is-gone", thing.gone);
     button.classList.toggle("is-found", thing.found);
+    button.classList.toggle("is-discovered", thing.discovered);
+    button.querySelector(".thing-tag").hidden = !thing.discovered;
     if (thing.found) button.title = FOUND_TITLE;
+    else if (thing.discovered) button.title = DISCOVERED_TITLE;
     else button.removeAttribute("title");
     return item;
   });
@@ -1810,6 +1868,7 @@ function setOnline(isOnline) {
   notes.replaceChildren();
   pictureRow.hidden = true;
   clearSearch();
+  hideDiscover();
   setState("is-offline", "Program not running");
 }
 
@@ -1833,6 +1892,7 @@ async function poll() {
     drawConnecting(status);
     drawPicture(status);
     drawSearch(status, number);
+    drawDiscover(status, number);
   } catch (error) {
     setOnline(false);
   } finally {
@@ -1942,10 +2002,14 @@ async function postJson(url, body) {
   return { response, data };
 }
 
-// The same for the other methods: GET (no body), PUT and DELETE.
+// The same for the other methods: GET (no body), PUT and DELETE. The server takes a change only
+// as JSON, so a PUT or DELETE with nothing to send sends an empty object.
 async function sendJson(method, url, body) {
-  const options = { method, cache: "no-store", headers: { "Content-Type": "application/json" } };
-  if (body !== undefined) options.body = JSON.stringify(body);
+  const options = { method, cache: "no-store" };
+  if (method !== "GET") {
+    options.headers = { "Content-Type": "application/json" };
+    options.body = JSON.stringify(body === undefined ? {} : body);
+  }
   const response = await fetch(url, options);
   let data = null;
   try {
@@ -2474,13 +2538,12 @@ function followProblem(text) {
 }
 
 // Send what is in the follow-up field when its microphone heard it. False when nothing was sent.
-// A sentence that is only a request to find something starts a search instead (findRequest).
+// Typed or spoken, a question in the panel is about the clicked thing: it never starts a camera
+// search ("where is the battery" asks about this thing's battery), so findRequest is not asked.
 function sendFollowUp() {
   const question = followQuestion.value.trim();
   if (!question || followId === null || followQuestion.disabled) return false;
-  const wanted = findRequest(question);
-  if (wanted !== null) findFromPanel(question, wanted);
-  else askFollowUp(question, true);
+  askFollowUp(question, true);
   return true;
 }
 
@@ -3532,10 +3595,12 @@ function drawVoicePrivacy() {
 // ---- answers: spoken, and shown in the caption when asked from the stage ----
 
 // Called once for each answer (or problem) of the main chat ("chat") and of the panel ("follow").
-function answerArrived(where, text, isProblem) {
+// `quiet` is an answer that is shown like one but never spoken: the server refused what was asked
+// for ("Looking for people by name is not supported ..."); a conversation ends on it, as on a problem.
+function answerArrived(where, text, isProblem, quiet) {
   if (conversationWaitsFor(where)) {
-    conversationNext(conversation, isProblem ? "problem" : "answer", text);   // the conversation speaks it
-  } else if (!isProblem) say(text, "answer");   // errors are not spoken
+    conversationNext(conversation, isProblem || quiet ? "problem" : "answer", text);   // the conversation speaks it
+  } else if (!isProblem && !quiet) say(text, "answer");   // errors are not spoken
   if (!captionWait || captionWait.where !== where) return;
   const { question } = captionWait;
   captionWait = null;
@@ -3629,7 +3694,7 @@ function isStopWords(words) {
 }
 
 function startConversation(button, makeTarget) {
-  const conv = { button, makeTarget, state: "", where: "", misses: 0, talk: null, timer: 0,
+  const conv = { button, makeTarget, state: "", where: "", misses: 0, talk: null, timer: 0, owed: [],
                  label: button.getAttribute("aria-label") || "", title: button.title };
   conversation = conv;
   conversationNext(conv, "start");
@@ -3670,7 +3735,7 @@ function conversationNext(conv, event, detail) {
     case "silence":
       conv.misses += 1;
       if (conv.misses < MAX_MISSES) {
-        toListening(conv);
+        nextTurn(conv);                         // between two turns: an owed "now" first
       } else {
         endConversation(conv);
         detail.target.problem(NOTHING_HEARD);
@@ -3690,7 +3755,7 @@ function conversationNext(conv, event, detail) {
       if (conv.state === "speaking") waitThenListen(conv);
       break;
     case "ready":
-      if (conv.state === "speaking" && !talking) toListening(conv);   // still speaking: its "quiet" comes later
+      if (conv.state === "speaking" && !talking) nextTurn(conv);   // still speaking: its "quiet" comes later
       break;
     default:                                    // "stop"
       endConversation(conv);
@@ -3727,6 +3792,38 @@ function toSpeaking(conv, answer) {
 function waitThenListen(conv) {
   clearTimeout(conv.timer);
   conv.timer = setTimeout(() => conversationNext(conv, "ready"), speech ? AFTER_SPEECH_MS : NO_SPEECH_WAIT_MS);
+}
+
+// Between two turns (the answer has been spoken, or a turn heard nothing): a sentence the
+// conversation owes ("I can see the keys now") is said first, as a turn of its own; then it listens.
+function nextTurn(conv) {
+  const owed = takeOwed(conv);
+  if (owed !== null) toSpeaking(conv, owed);
+  else toListening(conv);
+}
+
+// A search of this page found a name it was waiting for while the conversation ran. The page
+// never speaks while it listens, so the sentence waits here for the moment between turns.
+function conversationOwes(conv, mine, name) {
+  if (!conv.owed.some((owed) => owed.mine === mine && sameName(owed.name, name))) conv.owed.push({ mine, name });
+}
+
+// The first owed sentence that still holds (the search is still this page's, the name still
+// waits for its "now" and is still in view), shown where the search answers; null when none.
+// The name leaves waitingFor here, as it is said: that is what makes it once.
+function takeOwed(conv) {
+  while (conv.owed.length) {
+    const { mine, name } = conv.owed.shift();
+    const key = name.toLowerCase();
+    const entry = mine.search ? foundEntry(mine.search, name) : null;
+    if (finding !== mine || !mine.waitingFor.has(key) || !entry) continue;
+    mine.waitingFor.delete(key);
+    if (mine.waitingFor.size === 0) finding = null;   // nothing more to say
+    const text = seenSentence(entry, true);
+    mine.tell(text);
+    return text;
+  }
+  return null;
 }
 
 // The one way out: the microphone closes, its own answer stops, the button is as it was.
@@ -3870,21 +3967,31 @@ sceneButton.addEventListener("click", describeScene);
 // What is said follows the owner's rule: the page speaks only in answer to something the
 // visitor just did on this page. For a search that is two things, and only on the page that
 // started it:
-//   1. the answer to the request, made from the status once the finder is ready (or after
-//      FIND_WAIT_MS if it is still loading): "I can see the keys, on the left." /
-//      "I can't see a power bank right now. I'll keep looking.";
+//   1. the answer to the request, made from the status once the finder is ready and has looked
+//      at a picture for these names (status.search.seen), or after FIND_WAIT_MS if it is still
+//      loading: "I can see the keys, on the left." / "I can't see a power bank right now. I'll
+//      keep looking."; while the camera sends no pictures the answer waits, and after
+//      CAMERA_WAIT_MS of that it says so instead, and the page follows the search no more;
 //   2. later, at most once per name and search, "I can see the power bank now, on the left."
 //      for a name that was not in view when the answer was given: the visitor asked to be told.
 // Nothing else about a search is ever said. `finding` is this page's own search and holds that
-// state; `waitingFor` is the names still owed their "now", and a name is taken out of it the
-// moment it is said, so it is said once. A new request replaces `finding`; Stop, or a status
+// state; `waitingFor` is the names still owed their "now". A name leaves it only once its
+// sentence was really said or shown where the visitor sees it; until then each status tries
+// again. While the page speaks or listens the sentence waits; a running conversation says it
+// between two turns (conversationOwes). A new request replaces `finding`; Stop, or a status
 // that shows another search (stopped or replaced on another page), sets it to null, and from
 // then on nothing is said. Another page never has a `finding` for this search, so it is silent.
-// Each answer goes back where the request came from: the chat, the panel's chat (its
-// microphone) or the caption (the Look for field). A conversation speaks the answer and goes on.
+// Each answer goes back where the request came from: the chat (also its microphone and the
+// stage microphone) or the caption (the Look for field). A conversation speaks the answer and
+// goes on. Names the server refuses (too long, or words for people) are answered in the page's
+// own words like an answer, but never spoken.
 
 const FIND_WAIT_MS = 20000;    // the answer waits at most this long for the finder (the first load takes about 15 s)
-const FIND_SETTLE_MS = 1500;   // once ready, the finder has this long to see a name before it is called missing
+const FIND_SETTLE_MS = 1500;   // once it has looked, the finder has this long to see a name before it is called missing
+const CAMERA_WAIT_MS = 20000;  // the camera may send no pictures this long before the answer says so
+const CAMERA_DOWN = "The camera is not sending pictures right now, so I can't look.";
+const FIND_LONGEST_NAME = 40;  // as the server
+const TOO_LONG_NAME = "That name is too long for me to look for. Please try a shorter one, like power bank.";
 const PLACE_WORDS = { left: "on the left", middle: "in the middle", right: "on the right" };
 
 const finder = byId("finder"), finderForm = byId("finderForm"), finderText = byId("finderText");
@@ -3899,6 +4006,7 @@ function readSearch(raw) {
     names: asList(search.names).map(asText).filter(Boolean),
     state: ["loading", "ready", "failed"].includes(search.state) ? search.state : "off",
     note: asText(search.note),
+    seen: search.seen === true,        // the finder has looked at a picture for these names
     found: asList(search.found).filter((entry) => entry && typeof entry === "object").map((entry) => ({
       name: asText(entry.name), count: Math.max(1, Math.floor(Number(entry.count)) || 1), place: asText(entry.place),
     })),
@@ -3969,7 +4077,8 @@ if ("ResizeObserver" in window) new ResizeObserver(fitFinderRoom).observe(finder
 function drawSearch(status, number) {
   const search = readSearch(status.search);
   drawChips(search);
-  followFind(search, number);
+  const cameraUp = status.connected === true && !status.ended && !status.error;
+  followFind(search, number, cameraUp);
 }
 
 // ---- the words: plain English, with "a" or "an" and the plural right ----
@@ -4027,11 +4136,12 @@ function findSentences(search, names) {
 // ---- starting a search, and following it ----
 
 // Start looking for `text` (typed, or the names findRequest found). `reply` says where the
-// answers go: deliver(text, isProblem) for the answer, tell(text) for a later "now", and
-// started() once the server took the names.
+// answers go: deliver(text, kind) for the answer (kind "answer", "refused" or "problem"),
+// canTell() and tell(text) for a later "now", and started() once the server took the names.
 async function startFind(text, reply) {
-  if (finding && !finding.answered) findAnswered(finding, "A newer search replaced this one.", true);
-  const mine = { ...reply, names: null, fromPoll: Infinity, readyAt: 0, answered: false, waitingFor: new Set(), timer: 0 };
+  if (finding && !finding.answered) findAnswered(finding, "A newer search replaced this one.", "problem");
+  const mine = { ...reply, names: null, fromPoll: Infinity, readyAt: 0, seenAt: 0, downSince: 0, search: null,
+                 answered: false, waitingFor: new Set(), timer: 0 };
   finding = mine;              // an earlier search of this page says nothing more
   let result = null;
   try {
@@ -4041,12 +4151,16 @@ async function startFind(text, reply) {
   }
   if (finding !== mine) return;          // replaced or stopped meanwhile
   if (!result) {
-    findAnswered(mine, "Program not running: the search could not be started.", true);
+    findAnswered(mine, "Program not running: the search could not be started.", "problem");
     return;
   }
   const { response, data } = result;
+  if (response.status === 400 && data && typeof data.error === "string") {
+    findAnswered(mine, refusedWords(text, data.error), "refused");   // shown like an answer, never spoken
+    return;
+  }
   if (!response.ok || !data || data.ok !== true || !Array.isArray(data.names)) {
-    findAnswered(mine, errorText(data, response, "Please try again."), true);
+    findAnswered(mine, errorText(data, response, "Please try again."), "problem");
     return;
   }
   mine.names = data.names.map(asText);
@@ -4055,8 +4169,16 @@ async function startFind(text, reply) {
   if (mine.started) mine.started();
 }
 
+// What the page answers when the server refuses the names: a name that is too long in the page's
+// own words; otherwise the server's plain sentence ("Looking for people by name is not supported ...").
+function refusedWords(text, message) {
+  const tooLong = text.split(/,|\band\b/i).some((name) => name.trim().length > FIND_LONGEST_NAME);
+  return tooLong ? TOO_LONG_NAME : message;
+}
+
 // One status for this page's own search: wait, answer, tell what has come into view, or let go.
-function followFind(search, number) {
+// `cameraUp` says the camera is sending pictures.
+function followFind(search, number, cameraUp) {
   const mine = finding;
   if (!mine || mine.names === null || number < mine.fromPoll) return;
   const ours = sameNames(search.names, mine.names) && search.state !== "off" &&
@@ -4069,61 +4191,99 @@ function followFind(search, number) {
     endFind(mine, "The finder could not start. " + (search.note || "No reason was given."));
     return;
   }
-  if (search.state !== "ready") return;  // still loading
-  if (!mine.readyAt) mine.readyAt = performance.now();
+  mine.search = search;                  // the newest, for a "now" said later
+  const cameraDown = cameraStaysDown(mine, cameraUp);
+  if (search.state === "ready" && !mine.readyAt) mine.readyAt = performance.now();
+  if (search.state !== "ready" || !search.seen) {   // still loading, or no picture looked at yet
+    if (!mine.answered && cameraDown) answerCameraDown(mine);
+    return;
+  }
+  if (!mine.seenAt) mine.seenAt = performance.now();
   if (mine.answered) {
     tellNewlyFound(mine, search);
     return;
   }
   const allSeen = mine.names.every((name) => foundEntry(search, name));
-  if (allSeen || performance.now() - mine.readyAt >= FIND_SETTLE_MS) answerFind(mine, search);
+  if (allSeen || performance.now() - mine.seenAt >= FIND_SETTLE_MS) answerFind(mine, search);
+}
+
+// True once the camera has sent no pictures for CAMERA_WAIT_MS in a row.
+function cameraStaysDown(mine, cameraUp) {
+  if (cameraUp) {
+    mine.downSince = 0;
+    return false;
+  }
+  if (!mine.downSince) mine.downSince = performance.now();
+  return performance.now() - mine.downSince >= CAMERA_WAIT_MS;
+}
+
+// The answer while the camera is down: said instead of "I can't see ...", and nothing more after it.
+function answerCameraDown(mine) {
+  findAnswered(mine, CAMERA_DOWN, "answer");
+  if (finding === mine) finding = null;
 }
 
 function answerFind(mine, search) {
   for (const name of mine.names) if (!foundEntry(search, name)) mine.waitingFor.add(name.toLowerCase());
-  findAnswered(mine, findSentences(search, mine.names), false);
+  findAnswered(mine, findSentences(search, mine.names), "answer");
 }
 
 // A name that was not in view when the answer was given: said once, the first time it is seen.
-// Taking it out of waitingFor is what makes it once; a new search starts with a new, empty set.
+// It leaves waitingFor only when its sentence was really said or shown where the visitor sees it
+// (tellFound, or a conversation between two turns); until then the next status tries again.
 function tellNewlyFound(mine, search) {
   for (const name of mine.names) {
     const entry = foundEntry(search, name);
-    if (!entry || !mine.waitingFor.delete(name.toLowerCase())) continue;
-    tellFound(mine, seenSentence(entry, true));
+    const key = name.toLowerCase();
+    if (!entry || !mine.waitingFor.has(key)) continue;
+    if (conversation) conversationOwes(conversation, mine, name);   // it says it between two turns
+    else if (tellFound(mine, seenSentence(entry, true))) mine.waitingFor.delete(key);
   }
   if (mine.waitingFor.size === 0 && finding === mine) finding = null;   // nothing more to say
 }
 
+// Show the sentence and speak it when voice is on; false when that cannot be done now: the
+// page is speaking or listening (the sentence would cut off an answer, or never be heard), or
+// the place where it would be shown is taken. True once it was told.
 function tellFound(mine, text) {
+  if (voiceActive() && (talking || hearing)) return false;
+  if (!mine.canTell()) return false;
   mine.tell(text);
   say(text, "found");                    // the visitor asked to be told; spoken when voice is on
+  return true;
 }
 
 // The finder is still loading after FIND_WAIT_MS: answer now, and say "now" for each name later.
+// While the camera is down the status poll answers instead (answerCameraDown); this looks again.
 function findTimedOut(mine) {
   if (finding !== mine || mine.answered) return;
   if (online === false) {
     endFind(mine, "Program not running: the search could not be followed.");
     return;
   }
+  if (mine.downSince) {
+    mine.timer = setTimeout(() => findTimedOut(mine), 1000);
+    return;
+  }
   for (const name of mine.names) mine.waitingFor.add(name.toLowerCase());
   const names = joinWith(mine.names.map((name) => "the " + name), "and");
   findAnswered(mine, "The finder is still loading; the first time takes about 15 seconds. " +
-                     "I'll tell you when I can see " + names + ".", false);
+                     "I'll tell you when I can see " + names + ".", "answer");
 }
 
-function findAnswered(mine, text, isProblem) {
+// `kind`: "answer" (spoken when voice is on), "refused" (shown like an answer, never spoken, and
+// the search did not start) or "problem" (shown as an error, never spoken).
+function findAnswered(mine, text, kind) {
   mine.answered = true;
   clearTimeout(mine.timer);
-  if (isProblem && finding === mine) finding = null;
-  mine.deliver(text, isProblem);
+  if (kind !== "answer" && finding === mine) finding = null;
+  mine.deliver(text, kind);
 }
 
 // This page's search is over: an answer still owed is given as a problem (never spoken), and
 // nothing more is said about it.
 function endFind(mine, problem) {
-  if (!mine.answered) findAnswered(mine, problem, true);
+  if (!mine.answered) findAnswered(mine, problem, "problem");
   if (finding === mine) finding = null;
 }
 
@@ -4137,45 +4297,18 @@ function findFromChat(question, wanted) {
   const looking = addThinking("Looking");
   startFind(wanted, {
     where: "chat",
-    deliver: (text, isProblem) => {
+    deliver: (text, kind) => {
       looking.remove();
       setBusy(false);
-      addMessage(isProblem ? "error" : "answer", text);
-      answerArrived("chat", text, isProblem);   // spoken when voice is on; a conversation speaks it and goes on
+      addMessage(kind === "problem" ? "error" : "answer", text);
+      // Spoken when voice is on; a conversation speaks it and goes on. A refusal is never spoken.
+      answerArrived("chat", text, kind === "problem", kind === "refused");
       input.focus({ preventScroll: true });
     },
+    canTell: () => !fullView || !captionWait,   // in the full view the chat is hidden: the caption must be free
     tell: (text) => {
       addMessage("answer", text);
-      if (fullView && !captionWait) showCaption("", text, false, CAPTION_MS);
-    },
-  });
-}
-
-// The panel's microphone (and the stage microphone while a panel with its chat is open).
-function findFromPanel(question, wanted) {
-  const id = followId, shown = lookup;
-  const samePanel = () => shown === lookup && id === followId;
-  followQuestion.value = "";
-  addFollowMessage("question", question);
-  const looking = addFollowWaiting();
-  setFollowBusy(true);
-  startFind(wanted, {
-    where: "follow",
-    deliver: (text, isProblem) => {
-      if (!samePanel()) {                         // another thing is shown now: written in the chat, not spoken
-        addMessage(isProblem ? "error" : "answer", text);
-        return;
-      }
-      looking.remove();
-      setFollowBusy(false);
-      addFollowMessage(isProblem ? "error" : "answer", text);
-      answerArrived("follow", text, isProblem);
-      followQuestion.focus({ preventScroll: true });
-    },
-    tell: (text) => {
-      if (samePanel() && !details.hidden) addFollowMessage("answer", text);
-      else addMessage("answer", text);
-      if (fullView && !captionWait) showCaption("", text, false, CAPTION_MS);
+      if (fullView && !captionWait) showCaption("", text, false, CAPTION_MS);   // never over a waiting answer
     },
   });
 }
@@ -4196,9 +4329,10 @@ finderForm.addEventListener("submit", (event) => {
     started: () => {
       if (finderText.value.trim() === text) finderText.value = "";   // taken: the chips show it now
     },
-    deliver: (answer, isProblem) => answerArrived("stage", answer, isProblem),
+    deliver: (answer, kind) => answerArrived("stage", answer, kind === "problem", kind === "refused"),
+    canTell: () => !captionWait,         // the caption is the only place it is shown
     tell: (answer) => {
-      if (!captionWait) showCaption("", answer, false, CAPTION_MS);
+      if (!captionWait) showCaption("", answer, false, CAPTION_MS);   // never over a waiting answer
     },
   });
 });
@@ -4213,6 +4347,108 @@ finderStop.addEventListener("click", async () => {
     showCaption("", "Program not running: the search could not be stopped.", true, CAPTION_MS);
   }
 });
+
+// ---- auto-discover: a small hosted model names what is in view ---------------------------
+//
+// The switch beside the In view heading posts {"on": true|false} to /api/discover; the server
+// is the truth, so the switch shows what status.discover says (also when it was switched on
+// before this page was opened, or on another page). The page never switches it on by itself and
+// remembers nothing between visits. Beside the switch, small: how often it looks, today's looks
+// and the estimated cost, or the reason it is paused. The first time it is on during a visit, a
+// line under the switch says what is sent; it stays while it is on. Discovered things are drawn
+// like any other and carry a small tag on their pills (drawObjects). Nothing here is spoken.
+
+const discoverRow = byId("discoverRow"), discoverSwitch = byId("discoverSwitch");
+const discoverState = byId("discoverState"), discoverPrivacy = byId("discoverPrivacy");
+const discoverEvery = Number(discoverState.dataset.every) || 0;   // lookout.every_seconds; 0 when unknown
+let discoverSending = false;   // a switch press is on its way; the switch is left alone meanwhile
+let discoverNext = null;       // the newest press made while one was on its way, or null
+let discoverFromPoll = 0;      // statuses asked for before the last press was answered are old
+let discoverProblem = "";      // why the last press failed, shown in place of the status
+let discoverFirst = "not yet"; // the first-use line: "not yet" shown, "showing", "done" for this visit
+
+function readDiscover(raw) {
+  if (!raw || typeof raw !== "object") return null;
+  const state = ["looking", "paused"].includes(raw.state) ? raw.state : "off";
+  return { on: raw.on === true, state, note: asText(raw.note),
+           looks: Math.max(0, Math.floor(Number(raw.looks)) || 0), spent: Math.max(0, Number(raw.spent_usd) || 0) };
+}
+
+// "about $0.0002", "about $0.01", "about $0.25": one significant digit below a cent, never a
+// long row of digits.
+function aboutDollars(amount) {
+  if (amount >= 0.01) return "about $" + amount.toFixed(2);
+  if (amount < 0.0000005) return "less than $0.000001";
+  const digits = Math.min(6, Math.ceil(-Math.log10(amount)));
+  return "about $" + amount.toFixed(digits).replace(/0+$/, "").replace(/\.$/, "");
+}
+
+// The small words beside the switch, as [bold part, plain part].
+function discoverWords(discover) {
+  if (discoverProblem) return ["", discoverProblem];
+  if (!discover.on) return ["", ""];
+  if (discover.state === "paused") return ["Paused", discover.note];
+  const every = discoverEvery ? "looking every " + discoverEvery + " s" : "looking every few seconds";
+  if (discover.looks === 0) return ["", every + " · no looks yet today"];
+  const looks = discover.looks === 1 ? "1 look today" : discover.looks + " looks today";
+  return ["", every + " · " + looks + " · " + aboutDollars(discover.spent)];
+}
+
+function drawDiscover(status, number) {
+  const discover = readDiscover(status.discover);
+  discoverRow.hidden = discover === null;          // a server without auto-discover: no switch
+  if (discover === null) {
+    hideDiscover();
+    return;
+  }
+  const fresh = !discoverSending && discoverNext === null && number >= discoverFromPoll;
+  if (fresh && discoverSwitch.checked !== discover.on) discoverSwitch.checked = discover.on;
+  const on = fresh ? discover.on : discoverSwitch.checked;
+  if (on && discoverFirst === "not yet") discoverFirst = "showing";
+  if (!on && discoverFirst === "showing") discoverFirst = "done";
+  discoverPrivacy.hidden = discoverFirst !== "showing";
+  const [bold, plain] = discoverWords({ ...discover, on });
+  if (!changed("discover", [bold, plain, Boolean(discoverProblem)])) return;
+  const parts = [];
+  if (bold) parts.push(make("strong", "", bold));
+  if (bold && plain) parts.push(" · ");
+  if (plain) parts.push(plain);
+  discoverState.replaceChildren(...parts);
+  discoverState.classList.toggle("problem", Boolean(discoverProblem));
+  discoverState.hidden = parts.length === 0;
+}
+
+function hideDiscover() {
+  discoverRow.hidden = true;
+  discoverState.hidden = true;
+  discoverPrivacy.hidden = true;
+}
+
+// Presses go to the server one after the other, as the picture choices do; only the newest
+// press made meanwhile is sent when the first is answered.
+discoverSwitch.addEventListener("change", () => {
+  discoverProblem = "";
+  if (discoverSending) discoverNext = discoverSwitch.checked;
+  else sendDiscover(discoverSwitch.checked);
+});
+
+async function sendDiscover(on) {
+  discoverSending = true;
+  try {
+    const { response, data } = await postJson("/api/discover", { on });
+    if (!response.ok || !data || data.ok !== true) discoverProblem = errorText(data, response, "Please try again.");
+  } catch (error) {
+    discoverProblem = "Program not running: auto-discover could not be switched.";
+  } finally {
+    discoverSending = false;
+    discoverFromPoll = pollCount + 1;  // the switch follows the first status asked for after this
+  }
+  if (discoverNext !== null) {
+    const next = discoverNext;
+    discoverNext = null;
+    sendDiscover(next);
+  }
+}
 
 // ---- people: add a person, take their photos, change or remove them ---------------------
 //

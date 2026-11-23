@@ -166,6 +166,12 @@ def client_for(assistant=None, pipeline=None):
     return app.test_client()
 
 
+def not_json_status(content_type):
+    """A change sent as JSON that is the wrong shape is 400; one not sent as JSON at all is 415
+    (tests/test_app_discover.py checks that refusal for every route)."""
+    return 400 if content_type == "application/json" else 415
+
+
 # ---- routes ------------------------------------------------------------------------
 
 
@@ -236,10 +242,10 @@ def test_ask_maps_the_assistants_value_error_to_400_with_its_message():
     ('{"text": "wrong key"}', "application/json"),
     ('{"question": 42}', "application/json"),
 ])
-def test_ask_with_a_body_that_is_not_a_json_question_is_400(body, content_type):
+def test_ask_with_a_body_that_is_not_a_json_question_is_refused(body, content_type):
     assistant = FakeAssistant()
     response = client_for(assistant).post("/api/ask", data=body, content_type=content_type)
-    assert response.status_code == 400
+    assert response.status_code == not_json_status(content_type)
     assert isinstance(response.get_json()["error"], str)
     assert assistant.questions == []
 
@@ -254,7 +260,7 @@ def test_ask_with_an_unexpected_error_gives_a_plain_message():
 
 def test_reset_forgets_the_conversation():
     assistant = FakeAssistant()
-    response = client_for(assistant).post("/api/reset")
+    response = client_for(assistant).post("/api/reset", json={})
     assert response.status_code == 200
     assert response.get_json() == {"ok": True}
     assert assistant.resets == 1
@@ -262,7 +268,7 @@ def test_reset_forgets_the_conversation():
 
 def test_reset_while_busy_returns_the_message():
     assistant = FakeAssistant(reset_error=AssistantError("The assistant is still busy."))
-    response = client_for(assistant).post("/api/reset")
+    response = client_for(assistant).post("/api/reset", json={})
     assert response.status_code == 200
     assert response.get_json() == {"error": "The assistant is still busy."}
 
@@ -274,7 +280,7 @@ def test_page_works_and_ask_explains_when_the_assistant_could_not_be_built():
     response = client.post("/api/ask", json={"question": "Hi"})
     assert response.status_code == 200
     assert "notes file was not found" in response.get_json()["error"]
-    assert client.post("/api/reset").get_json() == {"ok": True}
+    assert client.post("/api/reset", json={}).get_json() == {"ok": True}
 
 
 def test_only_the_listed_methods_are_accepted_and_the_answer_is_json():
@@ -301,7 +307,7 @@ class BrokenPipeline(FakePipeline):
 
 def test_an_unexpected_error_in_any_api_route_answers_json_without_a_traceback():
     client = client_for(FakeAssistant(reset_error=RuntimeError("secret detail")), BrokenPipeline())
-    for response in (client.get("/api/status"), client.post("/api/reset")):
+    for response in (client.get("/api/status"), client.post("/api/reset", json={})):
         assert response.status_code == 500
         assert response.is_json
         message = response.get_json()["error"]
@@ -398,10 +404,10 @@ def test_inspect_with_a_bad_click_is_400(body):
     ('{"x": 1' + "0" * 400 + ', "y": 0.5}', "application/json"),       # too big for a float
     ('{"x": 0.5, "y": -1' + "0" * 400 + "}", "application/json"),
 ])
-def test_inspect_with_a_body_that_is_not_a_json_click_is_400(body, content_type):
+def test_inspect_with_a_body_that_is_not_a_json_click_is_refused(body, content_type):
     pipeline = FakePipeline()
     response = client_for(pipeline=pipeline).post("/api/inspect", data=body, content_type=content_type)
-    assert response.status_code == 400
+    assert response.status_code == not_json_status(content_type)
     assert pipeline.clicks == []
 
 
@@ -764,10 +770,10 @@ def test_follow_up_with_an_unknown_id_is_404():
     ('{"id": 5, "question": "How heavy?"}', "application/json"),
     ('{"id": "x", "question": 42}', "application/json"),
 ])
-def test_follow_up_with_a_bad_body_is_400(body, content_type):
+def test_follow_up_with_a_bad_body_is_refused(body, content_type):
     assistant = FakeAssistant()
     response = client_for(assistant).post("/api/follow_up", data=body, content_type=content_type)
-    assert response.status_code == 400
+    assert response.status_code == not_json_status(content_type)
     assert isinstance(response.get_json()["error"], str)
     assert assistant.follow_ups == []
 
@@ -1065,10 +1071,10 @@ def test_camera_with_a_bad_address_is_400_with_its_message(tmp_path, address, me
     ('{"address": 192}', "application/json"),
     ('{"address": null}', "application/json"),
 ])
-def test_camera_with_a_body_that_is_not_a_json_address_is_400(tmp_path, body, content_type):
+def test_camera_with_a_body_that_is_not_a_json_address_is_refused(tmp_path, body, content_type):
     client, pipeline, camera_file = camera_client(tmp_path)
     response = client.post("/api/camera", data=body, content_type=content_type)
-    assert response.status_code == 400
+    assert response.status_code == not_json_status(content_type)
     assert isinstance(response.get_json()["error"], str)
     assert pipeline.phones == [] and not camera_file.exists()
 
@@ -1120,10 +1126,10 @@ def test_camera_picture_refuses_what_the_pipeline_refuses(choice):
     ('{"choice": null}', "application/json"),
     ('{"choice": ["auto"]}', "application/json"),
 ])
-def test_camera_picture_with_a_body_that_is_not_a_json_choice_is_400(body, content_type):
+def test_camera_picture_with_a_body_that_is_not_a_json_choice_is_refused(body, content_type):
     pipeline = FakePipeline()
     response = client_for(pipeline=pipeline).post("/api/camera/picture", data=body, content_type=content_type)
-    assert response.status_code == 400
+    assert response.status_code == not_json_status(content_type)
     assert isinstance(response.get_json()["error"], str)
     assert pipeline.pictures == []
 
@@ -1421,6 +1427,17 @@ def test_main_gives_the_page_the_camera_file(fake_main):
     assert response.status_code == 200
     assert FakePipeline.instances[0].phones == ["http://192.168.1.7:8080/video"]
     assert "192.168.1.7:8080" in fake_main["camera_file"].read_text(encoding="utf-8")
+
+
+def test_main_gives_the_page_the_auto_discover_interval(fake_main, monkeypatch):
+    main([])                                                     # TEST_CONFIG has no lookout section
+    (app, _kwargs), = fake_main["calls"]["run"]
+    assert 'data-every=""' in app.test_client().get("/").get_data(as_text=True)
+    config = {**app_module.load_config(), "lookout": {"every_seconds": 10}}
+    monkeypatch.setattr(app_module, "load_config", lambda: config)
+    main([])
+    app = fake_main["calls"]["run"][-1][0]
+    assert 'data-every="10"' in app.test_client().get("/").get_data(as_text=True)
 
 
 def test_file_argument_cannot_be_combined_with_another_source():
@@ -1930,7 +1947,7 @@ def test_template_speaks_each_answer_once_and_never_an_error():
     page = TEMPLATE.read_text(encoding="utf-8")
     assert page.count('answerArrived("chat", data.text, false);') == 1
     assert page.count('answerArrived("follow", data.text, false);') == 1
-    assert 'if (!isProblem) say(text, "answer");' in page
+    assert 'if (!isProblem && !quiet) say(text, "answer");' in page        # a refusal is not spoken either
     assert 'say(sentences(name, info.summary), "answer");' in between(page, "function showInfo(", "const errorText")
     assert 'say(sentences(data.person.name, data.person.role), "answer");' in page
     # A late answer for a thing no longer shown is dropped before it could be spoken.
@@ -2108,7 +2125,10 @@ def test_template_conversation_never_listens_while_the_page_speaks():
     page = TEMPLATE.read_text(encoding="utf-8")
     decide = between(page, "function conversationNext(", "\n}\n")
     assert 'if (conv.state === "speaking") waitThenListen(conv);' in decide            # "quiet": wait
-    assert 'if (conv.state === "speaking" && !talking) toListening(conv);' in decide   # "ready": look again
+    assert 'if (conv.state === "speaking" && !talking) nextTurn(conv);' in decide      # "ready": look again
+    # Between two turns an owed "I can see it now" is said first, as a turn of its own, then it listens.
+    turn = between(page, "function nextTurn(", "\n}\n")
+    assert "if (owed !== null) toSpeaking(conv, owed);" in turn and "else toListening(conv);" in turn
     wait = between(page, "function waitThenListen(", "\n}\n")
     assert "speech ? AFTER_SPEECH_MS : NO_SPEECH_WAIT_MS" in wait and "NO_SPEECH_WAIT_MS = 1500" in page
     # Every way speech stops tells the conversation: the end, hush() (also the last-resort timer)
@@ -2121,7 +2141,7 @@ def test_template_conversation_never_listens_while_the_page_speaks():
     # The answer is spoken by the conversation, never a second time by say().
     arrived = between(page, "function answerArrived(", "\n}\n")
     assert 'if (conversationWaitsFor(where)) {' in arrived
-    assert '} else if (!isProblem) say(text, "answer");' in arrived
+    assert '} else if (!isProblem && !quiet) say(text, "answer");' in arrived
     # Each turn is an ordinary listening session, with its own once-only end.
     assert "startListening(conv.button, target, conv);" in page
     assert "conversation: conv || null" in page

@@ -200,7 +200,10 @@ def test_bad_details_are_refused_with_the_books_message_and_nothing_changes(worl
 
 def test_a_body_that_is_not_json_is_refused(world):
     response = world["client"].post("/api/people", data="name=Lina", content_type="text/plain")
+    assert response.status_code == 415 and "Send the request as JSON" in response.get_json()["error"]
+    response = world["client"].post("/api/people", data="[1, 2]", content_type="application/json")
     assert response.status_code == 400 and "Send the person as JSON" in response.get_json()["error"]
+    assert world["calls"] == []
 
 
 def test_changing_a_person_rewrites_about_md_and_keeps_the_photos(world):
@@ -219,7 +222,7 @@ def test_an_unknown_or_hostile_id_is_404_and_touches_nothing(world, person_id):
     client = world["client"]
     before = sorted(str(p) for p in world["tmp"].rglob("*"))
     for response in (client.put(f"/api/people/{person_id}", json={"name": "X"}),
-                     client.delete(f"/api/people/{person_id}"),
+                     client.delete(f"/api/people/{person_id}", json={}),
                      client.post(f"/api/people/{person_id}/photos", json={})):
         assert response.status_code == 404, (person_id, response.status_code)
         assert response.get_json()["error"]
@@ -238,7 +241,7 @@ def test_a_failing_assistant_reload_still_answers_ok_with_a_warning(world):
 
 
 def test_removing_moves_the_folder_aside_then_enrols_then_reloads(world):
-    response = world["client"].delete("/api/people/sara")
+    response = world["client"].delete("/api/people/sara", json={})
     assert response.status_code == 200 and response.get_json() == {"ok": True}
     assert not (world["photos_dir"] / "sara").exists()
     moved, = world["removed_dir"].iterdir()
@@ -249,14 +252,14 @@ def test_removing_moves_the_folder_aside_then_enrols_then_reloads(world):
 
 def test_removing_with_recognition_off_skips_enrolment_without_a_warning(world):
     world["pipeline"].reload_error = RuntimeError("Face recognition is off.")
-    data = world["client"].delete("/api/people/sara").get_json()
+    data = world["client"].delete("/api/people/sara", json={}).get_json()
     assert data == {"ok": True}
 
 
 def test_a_failing_enrolment_after_a_removal_is_a_warning(world):
     world["pipeline"].reload_error = OSError("disk full")
     world["assistant"].reload_error = AssistantError("busy")
-    data = world["client"].delete("/api/people/sara").get_json()
+    data = world["client"].delete("/api/people/sara", json={}).get_json()
     assert data["ok"] is True
     assert "could not be enrolled again" in data["warning"] and "busy" in data["warning"]
     assert world["calls"] == ["reload_people", "assistant.reload"]      # the assistant still reloads
@@ -265,7 +268,7 @@ def test_a_failing_enrolment_after_a_removal_is_a_warning(world):
 def test_removing_a_person_whose_photos_are_being_taken_cancels_them_first(world):
     world["client"].post("/api/people/omar/photos", json={})
     world["calls"].clear()
-    world["client"].delete("/api/people/omar")
+    world["client"].delete("/api/people/omar", json={})
     assert world["calls"] == ["cancel_photos", "reload_people", "assistant.reload"]
 
 
@@ -274,7 +277,7 @@ def test_removing_a_person_whose_photos_are_being_taken_cancels_them_first(world
 
 def test_taking_photos_starts_a_session_with_five_or_the_count_given(world):
     client = world["client"]
-    assert client.post("/api/people/sara/photos").get_json() == {"ok": True}          # no body at all
+    assert client.post("/api/people/sara/photos", json={}).get_json() == {"ok": True}   # no count given
     world["pipeline"].progress = None
     client.post("/api/people/omar/photos", json={"count": 7})
     assert world["calls"] == [("start_photos", "sara", 5), ("start_photos", "omar", 7)]
@@ -336,7 +339,7 @@ def test_a_failing_reload_at_the_end_of_a_session_is_a_warning(world):
 
 def test_cancelling_photos_is_not_taken_for_removing_a_person_called_photos(world):
     world["client"].post("/api/people/omar/photos", json={})
-    response = world["client"].delete("/api/people/photos")
+    response = world["client"].delete("/api/people/photos", json={})
     assert response.get_json() == {"ok": True}
     assert world["calls"][-1] == "cancel_photos"
     assert (world["photos_dir"] / "omar").exists()
@@ -362,14 +365,14 @@ def test_the_scene_is_described_from_the_servers_own_picture(world):
 
 def test_no_picture_yet_is_a_plain_error(world):
     world["pipeline"].photo = None
-    response = world["client"].post("/api/scene")
+    response = world["client"].post("/api/scene", json={})
     assert response.status_code == 503 and "no picture from the camera yet" in response.get_json()["error"]
     assert world["assistant"].scenes == []
 
 
 def test_an_assistant_error_while_describing_is_shown_like_elsewhere(world):
     world["assistant"].scene_error = AssistantError("The assistant is still busy.")
-    response = world["client"].post("/api/scene")
+    response = world["client"].post("/api/scene", json={})
     assert response.status_code == 200 and response.get_json() == {"error": "The assistant is still busy."}
 
 

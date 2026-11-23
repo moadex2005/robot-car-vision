@@ -6,6 +6,7 @@ of the script, and the find-request rule also through a small Python copy of it 
 reads its word lists and its opening pattern from the page itself.
 """
 
+import json
 import re
 import unicodedata
 
@@ -115,14 +116,16 @@ def test_split_names(text, names):
     {"text": None}, {"text": ["keys"]}, {"name": ["keys"]},
 ])
 def test_search_with_a_body_of_the_wrong_shape_is_400_with_a_plain_message(client, pipeline, body):
-    reply = client.post("/api/search", json=body)
+    reply = client.post("/api/search", data=json.dumps(body), content_type="application/json")   # None: null
     assert reply.status_code == 400
     assert "Send what to look for as JSON" in reply.get_json()["error"]
     assert pipeline.searches == []
 
 
-def test_search_with_a_body_that_is_not_json_is_400(client, pipeline):
+def test_search_with_a_body_that_is_not_json_is_refused(client, pipeline):
     reply = client.post("/api/search", data="keys", content_type="text/plain")
+    assert reply.status_code == 415 and "error" in reply.get_json()
+    reply = client.post("/api/search", data="keys", content_type="application/json")
     assert reply.status_code == 400 and "error" in reply.get_json()
     assert pipeline.searches == []
 
@@ -154,13 +157,23 @@ def test_search_passes_on_a_value_error_from_the_pipeline_as_400():
 
 
 def test_search_names_in_any_script_are_fine(client, pipeline):
-    reply = client.post("/api/search", json={"text": "مفاتيح, Schlüssel and power-bank, kid's cup"})
+    reply = client.post("/api/search", json={"text": "مفاتيح, Schlüssel and power-bank, cat's bowl"})
     assert reply.status_code == 200
-    assert pipeline.searches == [["مفاتيح", "Schlüssel", "power-bank", "kid's cup"]]
+    assert pipeline.searches == [["مفاتيح", "Schlüssel", "power-bank", "cat's bowl"]]
+
+
+@pytest.mark.parametrize("names", [["man"], ["face"], ["person"], ["keys", "person"]])
+def test_words_for_people_are_refused_with_the_pipelines_plain_message(client, pipeline, names):
+    """The page shows this message as the answer to "can you see my face" (never spoken)."""
+    reply = client.post("/api/search", json={"names": names})
+    assert reply.status_code == 400
+    assert reply.get_json() == {"error": "Looking for people by name is not supported. "
+                                         "People the camera knows are recognised by their face."}
+    assert pipeline.searches == []
 
 
 def test_delete_search_stops_looking(client, pipeline):
-    reply = client.delete("/api/search")
+    reply = client.delete("/api/search", json={})
     assert reply.status_code == 200 and reply.get_json() == {"ok": True}
     assert pipeline.searches == [[]]
 
@@ -206,7 +219,7 @@ def test_with_the_memory_off_the_memory_routes_answer_empty():
     client = client_for(FakePipeline(memory=None))
     assert client.get("/api/memory").get_json() == {"sightings": []}
     assert client.get("/api/memory/3/picture").status_code == 404
-    assert client.delete("/api/memory").get_json() == {"ok": True}
+    assert client.delete("/api/memory", json={}).get_json() == {"ok": True}
 
 
 def test_a_pipeline_without_a_memory_method_counts_as_memory_off():
@@ -226,7 +239,8 @@ def test_the_picture_of_a_remembered_object(client, pipeline):
     reply = client.get("/api/memory/3/picture")
     assert reply.status_code == 200
     assert reply.mimetype == "image/jpeg" and reply.data == JPEG
-    assert reply.headers["Cache-Control"] == "private, max-age=3600"
+    # Never kept by the browser: after Clear memory the same id may belong to another row.
+    assert reply.headers["Cache-Control"] == "no-store"
     assert pipeline.memory.picture_ids == [3]
 
 
@@ -256,7 +270,7 @@ def test_only_get_is_allowed_on_a_picture(client):
 
 
 def test_delete_memory_empties_it(client, pipeline):
-    reply = client.delete("/api/memory")
+    reply = client.delete("/api/memory", json={})
     assert reply.status_code == 200 and reply.get_json() == {"ok": True}
     assert pipeline.memory.cleared == 1
     assert client.get("/api/memory").get_json() == {"sightings": []}
@@ -336,15 +350,12 @@ def test_the_field_sends_what_was_typed_and_the_server_splits_it():
 def test_only_this_pages_own_search_speaks_and_each_name_once():
     """The owner's rule: the answer to the request, and one "I can see it now" per name and
     search. `finding` exists only on the page that started the search; `waitingFor` is the
-    names still owed their "now", and a name leaves it the moment it is said."""
+    names still owed their "now"."""
     page = page_text()
     start = between(page, "async function startFind(", "\n}\n")
     assert "waitingFor: new Set()" in start and "finding = mine;" in start       # a new search, a new empty set
     assert "mine.fromPoll = pollCount + 1;" in start                            # no status from before it started
-    tell = between(page, "function tellNewlyFound(", "\n}\n")
-    assert "!mine.waitingFor.delete(name.toLowerCase())" in tell                # said once: taken out as it is said
-    assert "tellFound(mine, seenSentence(entry, true));" in tell
-    # tellFound is the only "now", called only from tellNewlyFound, and only after the answer.
+    # tellFound is the "now" outside a conversation, called only from tellNewlyFound, only after the answer.
     assert page.count("tellFound(") == 2                                        # its definition and that one call
     follow = between(page, "function followFind(", "\n}\n")
     assert follow.index("if (mine.answered) {") < follow.index("tellNewlyFound(mine, search);")
@@ -354,37 +365,96 @@ def test_only_this_pages_own_search_speaks_and_each_name_once():
     assert "endFind(mine," in follow
     end = between(page, "function endFind(", "\n}\n")
     assert "if (finding === mine) finding = null;" in end
-    assert "findAnswered(mine, problem, true)" in end                           # a problem is never spoken
+    assert 'findAnswered(mine, problem, "problem")' in end                      # a problem is never spoken
     stop = between(page, 'finderStop.addEventListener("click"', "\n});\n")
     assert stop.index("endFind(finding,") < stop.index('sendJson("DELETE", "/api/search")')   # silent before it stops
     answered = between(page, "function findAnswered(", "\n}\n")
-    assert "clearTimeout(mine.timer);" in answered and "if (isProblem && finding === mine) finding = null;" in answered
+    assert "clearTimeout(mine.timer);" in answered
+    assert 'if (kind !== "answer" && finding === mine) finding = null;' in answered
+
+
+def test_a_name_leaves_the_waiting_set_only_once_it_was_really_told():
+    """Fix: in conversation mode the "now" was shown but never spoken (the page was listening),
+    and the name was already out of the waiting set. Now it leaves the set only when its
+    sentence was said or shown where the visitor sees it; a conversation says it between turns."""
+    page = page_text()
+    tell = between(page, "function tellNewlyFound(", "\n}\n")
+    assert "!mine.waitingFor.has(key)" in tell and ".delete(" not in tell.split("else if")[0]
+    assert "if (conversation) conversationOwes(conversation, mine, name);" in tell
+    assert "else if (tellFound(mine, seenSentence(entry, true))) mine.waitingFor.delete(key);" in tell
+    told = between(page, "function tellFound(", "\n}\n")
+    assert "if (voiceActive() && (talking || hearing)) return false;" in told   # never over speech, never unheard
+    assert "if (!mine.canTell()) return false;" in told                         # nor where it would not be seen
+    assert told.index("mine.tell(text);") < told.index("return true;")
+    # Each place a search answers says whether its "now" can be seen there now.
+    chat = between(page, "function findFromChat(", "\n}\n")
+    assert "canTell: () => !fullView || !captionWait," in chat
+    submit = between(page, 'finderForm.addEventListener("submit"', "\n});\n")
+    assert "canTell: () => !captionWait," in submit
+    # The conversation: owed once per search and name, said only between two turns, and then the
+    # name leaves the set (with the newest status, so a thing that went away again is not called in view).
+    owes = between(page, "function conversationOwes(", "\n}\n")
+    assert "owed.mine === mine && sameName(owed.name, name)" in owes
+    owed = between(page, "function takeOwed(", "\n}\n")
+    assert "foundEntry(mine.search, name)" in owed
+    assert owed.index("!mine.waitingFor.has(key)") < owed.index("mine.waitingFor.delete(key);")
+    assert "mine.tell(text);" in owed and "seenSentence(entry, true)" in owed
+    decide = between(page, "function conversationNext(", "\n}\n")
+    assert decide.count("nextTurn(conv);") == 2                                 # after an answer, after silence
+    assert "owed: []" in between(page, "function startConversation(", "\n}\n")
 
 
 def test_the_answers_go_back_where_the_request_came_from():
     page = page_text()
     chat = between(page, "function findFromChat(", "\n}\n")
-    assert 'answerArrived("chat", text, isProblem);' in chat and "setBusy(true);" in chat and "setBusy(false);" in chat
-    panel = between(page, "function findFromPanel(", "\n}\n")
-    assert 'answerArrived("follow", text, isProblem);' in panel
-    assert "if (!samePanel()) {" in panel                                       # the panel changed: shown, not spoken
+    assert 'answerArrived("chat", text, kind === "problem", kind === "refused");' in chat
+    assert "setBusy(true);" in chat and "setBusy(false);" in chat
+    assert 'addMessage(kind === "problem" ? "error" : "answer", text);' in chat   # a refusal looks like an answer
     submit = between(page, 'finderForm.addEventListener("submit"', "\n});\n")
-    assert 'deliver: (answer, isProblem) => answerArrived("stage", answer, isProblem)' in submit
+    assert 'deliver: (answer, kind) => answerArrived("stage", answer, kind === "problem", kind === "refused")' in submit
     assert 'captionWait = { where: "stage", question };' in submit
-    # answerArrived speaks only a non-problem, and lets a waiting conversation speak it instead.
+    # answerArrived speaks only an answer, and lets a waiting conversation speak it instead.
     arrived = between(page, "function answerArrived(", "\n}\n")
-    assert '} else if (!isProblem) say(text, "answer");' in arrived
+    assert '} else if (!isProblem && !quiet) say(text, "answer");' in arrived
+    assert 'isProblem || quiet ? "problem" : "answer"' in arrived              # a refusal ends a conversation quietly
+    # The panel never starts a search: typed or spoken, its questions are about the clicked thing.
+    assert "function findFromPanel(" not in page
 
 
-def test_the_answer_waits_for_the_finder_but_not_for_ever():
+def test_a_refused_name_is_answered_in_the_pages_own_words_and_never_spoken():
+    page = page_text()
+    start = between(page, "async function startFind(", "\n}\n")
+    assert 'if (response.status === 400 && data && typeof data.error === "string") {' in start
+    assert 'findAnswered(mine, refusedWords(text, data.error), "refused");' in start
+    words = between(page, "function refusedWords(", "\n}\n")
+    assert "name.trim().length > FIND_LONGEST_NAME" in words and "TOO_LONG_NAME : message" in words
+    assert "const FIND_LONGEST_NAME = 40;" in page
+    assert ('const TOO_LONG_NAME = "That name is too long for me to look for. '
+            'Please try a shorter one, like power bank.";') in page
+
+
+def test_the_answer_waits_for_the_finder_and_the_camera_but_not_for_ever():
     page = page_text()
     assert "const FIND_WAIT_MS = 20000;" in page and "const FIND_SETTLE_MS = 1500;" in page
+    assert "seen: search.seen === true," in between(page, "function readSearch(", "\n}\n")
     follow = between(page, "function followFind(", "\n}\n")
-    assert 'if (search.state !== "ready") return;' in follow
-    assert "performance.now() - mine.readyAt >= FIND_SETTLE_MS" in follow
+    # No answer until the finder has looked at a picture for these names (status.search.seen) ...
+    assert 'if (search.state !== "ready" || !search.seen) {' in follow
+    assert "performance.now() - mine.seenAt >= FIND_SETTLE_MS" in follow
+    # ... and while the camera sends nothing, after 20 seconds of that, it says so instead.
+    assert "if (!mine.answered && cameraDown) answerCameraDown(mine);" in follow
+    assert "const CAMERA_WAIT_MS = 20000;" in page
+    assert ('const CAMERA_DOWN = "The camera is not sending pictures right now, so I can\'t look.";') in page
+    down = between(page, "function cameraStaysDown(", "\n}\n")
+    assert "mine.downSince = 0;" in down and "performance.now() - mine.downSince >= CAMERA_WAIT_MS" in down
+    camera = between(page, "function answerCameraDown(", "\n}\n")
+    assert 'findAnswered(mine, CAMERA_DOWN, "answer");' in camera and "finding = null;" in camera
+    draw = between(page, "function drawSearch(", "\n}\n")
+    assert "const cameraUp = status.connected === true && !status.ended && !status.error;" in draw
     late = between(page, "function findTimedOut(", "\n}\n")
     assert "mine.waitingFor.add(name.toLowerCase())" in late                    # then each name gets its "now"
     assert "the first time takes about 15 seconds" in late
+    assert late.index("if (mine.downSince) {") < late.index("the first time takes")   # the camera answer wins
 
 
 def test_the_answer_sentences_are_built_from_the_status():
@@ -402,16 +472,17 @@ def test_the_answer_sentences_are_built_from_the_status():
 
 
 def rule_parts(page):
-    """The opening pattern and the word lists of the page's findRequest."""
+    """The opening pattern, the "where" pattern and the word lists of the page's findRequest."""
     opening = re.search(r"const FIND_OPENING = /(.+)/i;", page).group(1)
+    where = re.search(r"const FIND_WHERE = /(.+)/i;", page).group(1)
     little = re.findall(r'"([^"]+)"', between(page, "const FIND_LITTLE_WORDS = [", "];"))
     not_a_name = re.findall(r'"([^"]+)"', between(page, "const FIND_NOT_A_NAME = [", "];"))
-    return re.compile(opening, re.IGNORECASE), little, not_a_name
+    return re.compile(opening, re.IGNORECASE), re.compile(where, re.IGNORECASE), little, not_a_name
 
 
 def find_request(text):
     """A line-by-line Python copy of the page's findRequest, over the page's own lists."""
-    opening, little, not_a_name = rule_parts(page_text())
+    opening, where, little, not_a_name = rule_parts(page_text())
     sentence = re.sub(r"\s+", " ", text.replace("‘", "'").replace("’", "'")).strip()
     sentence = re.sub(r",?\s+please$", "", re.sub(r"[.!?]+$", "", sentence), flags=re.IGNORECASE).strip()
     if not sentence or len(sentence) > 80:
@@ -419,9 +490,13 @@ def find_request(text):
     match = opening.match(sentence)
     if not match:
         return None
+    needs_little_word = where.match(match.group(1)) is not None
     names = []
-    for part in re.split(r"\s*,\s*|\s+and\s+", match.group(1), flags=re.IGNORECASE):
-        words = [word for word in part.split(" ") if word and word.lower() not in little]
+    for part in re.split(r"\s*,\s*|\s+and\s+", match.group(2), flags=re.IGNORECASE):
+        every = [word for word in part.split(" ") if word]
+        if needs_little_word and not (every and every[0].lower() in little):
+            return None
+        words = [word for word in every if word.lower() not in little]
         if not words or len(words) > 4:
             return None
         for word in words:
@@ -444,6 +519,9 @@ def find_request(text):
     ("find my keys and the remote", "keys, remote"), ("where is the TV remote", "TV remote"),
     ("look for a wifi router, a power bank and my keys", "wifi router, power bank, keys"),
     ("can you see an umbrella", "umbrella"), ("find the USB cable", "USB cable"),
+    ("find power bank", "power bank"), ("look for keys", "keys"), ("where are my keys and the remote", "keys, remote"),
+    ("where is a cup", "cup"), ("can you see my face", "face"),          # people words: the server answers
+    ("find my car keys", "car keys"), ("find the charging station", "charging station"),
 ])
 def test_a_sentence_that_is_only_a_find_request_is_taken(sentence, wanted):
     assert find_request(sentence) == wanted
@@ -457,27 +535,41 @@ def test_a_sentence_that_is_only_a_find_request_is_taken(sentence, wanted):
     "where are you", "find and", "look for one, two, three, four, five, six, seven",
     "find the big old red metal toolbox", "how do I find my keys",
     "Can you find out what the team built and where the code is kept for the next demo day at the university?",
+    # Questions for the web, not for the camera (fix after review):
+    "find a good restaurant nearby", "find python tutorials", "where is the nearest hospital", "where is the capital",
+    "where is the robot", "find the best way to clean a lens", "look for the latest news", "find the weather",
+    "where is the closest pharmacy", "look for a website about robots", "find information on lidar",
+    "find a link to the docs", "find cheap flights", "where is the capital of France",
+    # "where is" and "where are" need the, my, a or an before every name:
+    "where is paris", "where is london", "where are keys", "where is power bank", "where are my keys and remote",
+    "where's paris",
+    # People are not looked for by these words: "me" and the like stay with the assistant.
+    "can you see me", "can you see us", "do you see him",
 ])
 def test_anything_else_goes_to_the_assistant(sentence):
     assert find_request(sentence) is None
 
 
-def test_the_rule_is_one_small_function_near_the_top_used_by_the_chat_and_every_microphone():
+def test_the_rule_is_one_small_function_near_the_top_used_by_the_chat_and_its_microphones():
     page = page_text()
     script = page[page.index("<script>\n\"use strict\";"):]
     assert script.index("function findRequest(") < script.index("// ---- the page coming alive")   # near the top
     rule = between(page, "function findRequest(", "\n}\n")
     assert "fetch(" not in rule and "document" not in rule                    # pure: text in, names or null out
     for word in ("the", "my", "a", "an"):
-        assert word in rule_parts(page)[1]
-    # The chat field and the chat microphone (also the stage one, and conversation mode) send through
-    # sendChat; the panel's microphone through sendFollowUp. Both ask the rule first.
+        assert word in rule_parts(page)[2]
+    assert len(set(rule_parts(page)[3])) == len(rule_parts(page)[3])           # each word once
+    # The chat field and the chat microphone (also the stage one without a panel, and conversation
+    # mode) send through sendChat, which asks the rule first. The panel's field and its microphone
+    # send through askFollowUp, never the rule: their questions are about the clicked thing.
     chat = between(page, "function sendChat()", "\n}\n")
     assert "const wanted = findRequest(question);" in chat and "findFromChat(question, wanted)" in chat
     panel = between(page, "function sendFollowUp()", "\n}\n")
-    assert "const wanted = findRequest(question);" in panel and "findFromPanel(question, wanted)" in panel
-    assert page.count("function findRequest(") == 1 and page.count("findRequest(question)") == 2
-    # A conversation sends what it heard through the same function (sendHeard calls target.send()).
+    assert "findRequest(" not in panel and "askFollowUp(question, true);" in panel
+    submit = between(page, 'followForm.addEventListener("submit"', "\n});\n")
+    assert "findRequest(" not in submit
+    assert page.count("function findRequest(") == 1 and page.count("findRequest(question)") == 1
+    # A conversation sends what it heard through the same functions (sendHeard calls target.send()).
     assert "send: sendChat" in page and "send: sendFollowUp" in page
 
 

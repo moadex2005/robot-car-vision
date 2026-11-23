@@ -459,3 +459,105 @@ def test_a_locked_file_slows_nothing_and_is_written_later(make_log, path, caplog
     assert len(memory_warnings(caplog)) == warnings_while_locked
     rows = reopened(log, make_log).recent()
     assert [(r.first_seen, r.last_seen) for r in rows] == [(BASE, BASE + 14)]
+
+
+# ----- tick: the periodic work without a new sighting (review fix) -----
+
+def test_tick_writes_a_thing_that_left_although_nothing_else_is_seen(make_log, path):
+    log = make_log(min_seconds=1.0)
+    watch(log, "bottle", 0, 1.5)                           # held up 1.5 s, then taken away
+    for moment in (2.0, 2.5, 3.0):
+        log.tick(BASE + moment)
+    rows = log.recent()
+    assert [(r.label, r.first_seen, r.last_seen) for r in rows] == [("bottle", BASE, BASE + 1.5)]
+
+
+def test_tick_stores_the_whole_time_in_view(make_log, path):
+    log = make_log(min_seconds=1.0)
+    watch(log, "bottle", 0, 3.6)
+    for moment in range(4, 12):
+        log.tick(BASE + moment)
+    assert [(r.first_seen, r.last_seen) for r in log.recent()] == [(BASE, BASE + 3.6)]   # not 2.0
+    watch(log, "bottle", 12, 14)                           # back after the gap: a new sighting
+    log.tick(BASE + 20)
+    assert len(log.recent()) == 2
+
+
+def test_tick_does_the_hourly_delete(make_log, path):
+    log = make_log(keep_days=1 / 24 / 60)                  # one minute
+    watch(log, "old", 0, 2, label="old")
+    log.tick(BASE + 3)
+    log.tick(BASE + 3700)
+    assert log.recent() == []
+
+
+def test_tick_after_close_does_nothing(make_log):
+    log = make_log()
+    log.close()
+    log.tick(BASE)
+
+
+# ----- staying fast when large (review fix) -----
+
+def test_only_the_newest_rows_are_kept(make_log, path, monkeypatch):
+    monkeypatch.setattr(memory, "MAX_ROWS", 3)
+    log = make_log(min_seconds=0.0)
+    for number in range(6):
+        start = number * 10
+        watch(log, f"thing {number}", start, start + 1, label=f"thing {number}", picture=JPEG)
+    log.tick(BASE + 3700)                                  # the hourly delete
+    labels = [r.label for r in log.recent()]
+    assert labels == ["thing 5", "thing 4", "thing 3"]
+    log = reopened(log, make_log)
+    assert [r.label for r in log.recent()] == ["thing 5", "thing 4", "thing 3"]
+    assert memory.MAX_ROWS == 3
+
+
+def test_the_row_limit_is_20000():
+    assert memory.MAX_ROWS == 20_000
+
+
+def slow_seen_while(log, slow_call):
+    """Run slow_call in a web thread and time seen() (with writes due) in the meantime."""
+    started = threading.Event()
+    worker = threading.Thread(target=lambda: (started.set(), slow_call()))
+    worker.start()
+    started.wait(1)
+    time.sleep(0.02)
+    slowest = 0.0
+    for number in range(60):
+        began = time.perf_counter()
+        log.seen("cup", "object", "cup", None, "left", 0.5, BASE + 100 + number * 0.1)
+        slowest = max(slowest, time.perf_counter() - began)
+    worker.join(5)
+    return slowest
+
+
+def test_a_slow_filter_query_never_makes_seen_wait(make_log, monkeypatch):
+    log = make_log()
+    watch(log, "bottle", 0, 3, label="bottle")
+    real_folded = memory._folded
+
+    def slow_folded(text):
+        time.sleep(0.3)
+        return real_folded(text)
+
+    monkeypatch.setattr(memory, "_folded", slow_folded)    # the side connection is opened with it
+    log._side = None
+    slowest = slow_seen_while(log, lambda: log.recent(text="bot"))
+    assert slowest < 0.05
+
+
+def test_clear_never_makes_seen_wait(make_log, monkeypatch):
+    log = make_log()
+    watch(log, "bottle", 0, 3, label="bottle")
+    real_delete = memory._delete_everything
+
+    def slow_delete(db):
+        time.sleep(0.4)
+        real_delete(db)
+
+    monkeypatch.setattr(memory, "_delete_everything", slow_delete)
+    slowest = slow_seen_while(log, log.clear)
+    assert slowest < 0.05
+    assert log.recent() == []

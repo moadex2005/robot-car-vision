@@ -1,0 +1,125 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 480" width="880" height="480" role="img" aria-labelledby="title desc"
+     font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">
+  <title id="title">How Robot Car Vision works</title>
+  <desc id="desc">A camera sends frames to the laptop. Four readers work on each frame on the laptop: an object detector, a find-by-name detector, face recognition and a code reader. The result goes to a web page. Claude and Hugging Face are called only when the visitor asks.</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M1 1 L9 5 L1 9" fill="none" stroke="#1d1d1f" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+    </marker>
+    <marker id="arrow-blue" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M1 1 L9 5 L1 9" fill="none" stroke="#0066cc" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+    </marker>
+  </defs>
+
+  <rect x="0.5" y="0.5" width="879" height="479" rx="27.5" fill="#f5f5f7" stroke="#d2d2d7"/>
+
+  <!-- column headings -->
+  <g font-size="11" font-weight="600" letter-spacing="1.4" fill="#6e6e73">
+    <text x="24" y="44">CAMERA</text>
+    <text x="216" y="44">LAPTOP</text>
+    <text x="672" y="44">WEB PAGE</text>
+  </g>
+  <g font-size="12" fill="#6e6e73">
+    <text x="24" y="62">one of three</text>
+    <text x="216" y="62">everything on this side runs locally, on the graphics card</text>
+    <text x="672" y="62">in any browser</text>
+  </g>
+
+  <!-- cameras -->
+  <g fill="#ffffff" stroke="#d2d2d7">
+    <rect x="24" y="84" width="160" height="66" rx="14"/>
+    <rect x="24" y="162" width="160" height="66" rx="14"/>
+    <rect x="24" y="240" width="160" height="66" rx="14"/>
+  </g>
+  <g fill="none" stroke="#1d1d1f" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+    <!-- a phone -->
+    <rect x="42" y="100" width="20" height="34" rx="4"/><circle cx="52" cy="108" r="2.6" stroke="#0066cc"/>
+    <!-- a laptop -->
+    <rect x="40" y="181" width="26" height="18" rx="2.5"/><path d="M36 204 h34"/>
+    <!-- a film clip -->
+    <rect x="40" y="259" width="26" height="28" rx="4"/><path d="M49 267 l10 6 l-10 6 z" stroke="#0066cc"/>
+  </g>
+  <g font-size="13" font-weight="600" fill="#1d1d1f">
+    <text x="78" y="113">Phone on the car</text>
+    <text x="78" y="191">Laptop camera</text>
+    <text x="78" y="269">Recorded clip</text>
+  </g>
+  <g font-size="11.5" fill="#6e6e73">
+    <text x="78" y="130">IP Webcam, WiFi</text>
+    <text x="78" y="208">built in</text>
+    <text x="78" y="286">for testing</text>
+  </g>
+
+  <!-- the laptop -->
+  <rect x="216" y="84" width="424" height="252" rx="18" fill="#ffffff" stroke="#d2d2d7"/>
+  <rect x="232" y="100" width="392" height="34" rx="10" fill="#f5f5f7"/>
+  <text x="246" y="121.5" font-size="12.5" fill="#1d1d1f"><tspan font-weight="600">Stream</tspan><tspan fill="#6e6e73">  keeps only the newest frame, so the video is never late</tspan></text>
+
+  <g fill="#ffffff" stroke="#d2d2d7">
+    <rect x="232" y="146" width="190" height="60" rx="12"/>
+    <rect x="434" y="146" width="190" height="60" rx="12"/>
+    <rect x="232" y="216" width="190" height="60" rx="12"/>
+    <rect x="434" y="216" width="190" height="60" rx="12"/>
+  </g>
+  <g fill="#0066cc">
+    <rect x="232" y="158" width="3.5" height="36" rx="1.75"/><rect x="434" y="158" width="3.5" height="36" rx="1.75"/>
+    <rect x="232" y="228" width="3.5" height="36" rx="1.75"/><rect x="434" y="228" width="3.5" height="36" rx="1.75"/>
+  </g>
+  <g font-size="13" font-weight="600" fill="#1d1d1f">
+    <text x="248" y="171">Detector</text><text x="450" y="171">Find by name</text>
+    <text x="248" y="241">Faces</text><text x="450" y="241">Codes</text>
+  </g>
+  <g font-size="11.5" fill="#6e6e73">
+    <text x="248" y="190">YOLO: 80 everyday objects</text><text x="450" y="190">YOLOE: any word you type</text>
+    <text x="248" y="260">InsightFace: people you added</text><text x="450" y="260">OpenCV: QR and barcodes</text>
+  </g>
+
+  <rect x="232" y="288" width="392" height="34" rx="10" fill="#f5f5f7"/>
+  <text x="246" y="309.5" font-size="12.5" fill="#1d1d1f"><tspan font-weight="600">World state</tspan><tspan fill="#6e6e73">  what is in view now, and a memory of the last day</tspan></text>
+
+  <!-- the page -->
+  <rect x="672" y="84" width="184" height="252" rx="18" fill="#ffffff" stroke="#d2d2d7"/>
+  <g fill="#0066cc">
+    <circle cx="694" cy="113" r="3"/><circle cx="694" cy="149" r="3"/><circle cx="694" cy="185" r="3"/>
+    <circle cx="694" cy="221" r="3"/><circle cx="694" cy="257" r="3"/><circle cx="694" cy="293" r="3"/>
+  </g>
+  <g font-size="13" font-weight="600" fill="#1d1d1f">
+    <text x="708" y="117.5">Live video</text><text x="708" y="153.5">In view list</text><text x="708" y="189.5">Details on a click</text>
+    <text x="708" y="225.5">Chat and voice</text><text x="708" y="261.5">Timeline</text><text x="708" y="297.5">People</text>
+  </g>
+
+  <!-- arrows between the columns -->
+  <g fill="none" stroke="#1d1d1f" stroke-width="1.6" stroke-linecap="round">
+    <path d="M184 117 h14 v93 h12" marker-end="url(#arrow)"/>
+    <path d="M184 195 h14"/>
+    <path d="M184 273 h14 v-63"/>
+    <path d="M640 180 h28" marker-end="url(#arrow)"/>
+    <path d="M672 240 h-28" marker-end="url(#arrow)"/>
+  </g>
+
+  <!-- only when you ask -->
+  <text x="24" y="418" font-size="11" font-weight="600" letter-spacing="1.4" fill="#0066cc">ONLY WHEN YOU ASK</text>
+  <text x="24" y="437" font-size="11.5" fill="#6e6e73">nothing else is sent</text>
+  <g fill="#ffffff" stroke="#0066cc" stroke-dasharray="5 4">
+    <rect x="216" y="392" width="206" height="62" rx="14"/>
+    <rect x="434" y="392" width="206" height="62" rx="14"/>
+    <rect x="672" y="392" width="184" height="62" rx="14"/>
+  </g>
+  <g font-size="13" font-weight="600" fill="#1d1d1f">
+    <text x="232" y="418">Claude</text><text x="450" y="418">Hugging Face</text><text x="688" y="418">Your phone</text>
+  </g>
+  <g font-size="11.5" fill="#6e6e73">
+    <text x="232" y="437">answers and descriptions</text><text x="450" y="437">auto-discover, hosted voice</text><text x="688" y="437">HTTPS and a password</text>
+  </g>
+  <g fill="none" stroke="#0066cc" stroke-width="1.6" stroke-linecap="round" stroke-dasharray="5 4">
+    <path d="M319 336 v52" marker-end="url(#arrow-blue)"/>
+    <path d="M537 336 v52" marker-end="url(#arrow-blue)"/>
+    <path d="M764 336 v52" marker-end="url(#arrow-blue)"/>
+  </g>
+
+  <!-- arrow labels, drawn last so they sit on top -->
+  <g font-size="10.5" fill="#6e6e73" text-anchor="middle">
+    <text x="656" y="172">video</text>
+    <text x="656" y="256">clicks</text>
+  </g>
+</svg>

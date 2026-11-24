@@ -1,0 +1,140 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 570" width="880" height="570" role="img" aria-labelledby="title desc"
+     font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">
+  <title id="title">A sketch of the page</title>
+  <desc id="desc">The page with its numbered parts: the top bar, the live video with labelled objects, the Look for field, the video buttons, the In view list, the details panel, the chat and the Timeline.</desc>
+  <defs>
+    <linearGradient id="video" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#2e2e33"/><stop offset="1" stop-color="#141416"/>
+    </linearGradient>
+    <filter id="shadow" x="-10%" y="-10%" width="120%" height="130%">
+      <feDropShadow dx="0" dy="6" stdDeviation="9" flood-color="#000000" flood-opacity="0.10"/>
+    </filter>
+  </defs>
+
+  <rect x="0.5" y="0.5" width="879" height="569" rx="27.5" fill="#f5f5f7" stroke="#d2d2d7"/>
+
+  <!-- 1: the top bar -->
+  <rect x="40" y="26" width="800" height="42" rx="21" fill="#ffffff" stroke="#d2d2d7"/>
+  <text x="60" y="52" font-size="13.5" font-weight="700" fill="#1d1d1f">Robot Car Vision</text>
+  <g font-size="12" fill="#6e6e73">
+    <text x="204" y="52">Live view</text><text x="272" y="52">Ask</text><text x="308" y="52">People</text><text x="362" y="52">Timeline</text>
+  </g>
+  <rect x="470" y="34" width="132" height="26" rx="13" fill="#f5f5f7"/>
+  <circle cx="486" cy="47" r="4" fill="#30d158"/>
+  <text x="497" y="51" font-size="11.5" fill="#1d1d1f">Live · phone · 25 fps</text>
+  <rect x="612" y="34" width="68" height="26" rx="13" fill="#f5f5f7"/>
+  <text x="646" y="51" font-size="11.5" font-weight="500" text-anchor="middle" fill="#1d1d1f">Camera</text>
+  <g fill="#f5f5f7"><circle cx="704" cy="47" r="13"/><circle cx="738" cy="47" r="13"/><circle cx="772" cy="47" r="13"/></g>
+  <text x="704" y="51" font-size="10.5" font-weight="600" text-anchor="middle" fill="#1d1d1f">EN</text>
+  <g fill="none" stroke="#1d1d1f" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M732 44.5 h3 l4 -3.5 v12 l-4 -3.5 h-3 z"/><path d="M742 44 q2.5 3 0 6"/>
+    <circle cx="772" cy="47" r="3.6"/><path d="M772 39.5 v1.6 M772 52.9 v1.6 M764.5 47 h1.6 M777.9 47 h1.6"/>
+  </g>
+
+  <!-- 2: the live video -->
+  <rect x="40" y="86" width="520" height="312" rx="20" fill="url(#video)"/>
+  <line x1="62" y1="330" x2="538" y2="330" stroke="#4a4a50" stroke-width="2" stroke-linecap="round"/>
+
+  <!-- a known person -->
+  <path d="M84 330 q0 -74 52 -74 q52 0 52 74 z" fill="#3a3a40" stroke="#6e6e73" stroke-width="1.5"/>
+  <circle cx="136" cy="212" r="30" fill="#3a3a40" stroke="#6e6e73" stroke-width="1.5"/>
+  <g fill="none" stroke="#2997ff" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M98 190 v-10 q0 -5 5 -5 h10"/><path d="M159 175 h10 q5 0 5 5 v10"/>
+    <path d="M174 236 v10 q0 5 -5 5 h-10"/><path d="M113 251 h-10 q-5 0 -5 -5 v-10"/>
+  </g>
+  <rect x="108" y="148" width="56" height="20" rx="10" fill="#2997ff"/>
+  <text x="136" y="162" font-size="11.5" font-weight="600" text-anchor="middle" fill="#ffffff">Sara</text>
+
+  <!-- a laptop with a box -->
+  <rect x="246" y="258" width="96" height="60" rx="5" fill="#26262a" stroke="#a1a1a6" stroke-width="1.5"/>
+  <line x1="232" y1="324" x2="356" y2="324" stroke="#a1a1a6" stroke-width="3.5" stroke-linecap="round"/>
+  <rect x="224" y="246" width="140" height="90" rx="8" fill="none" stroke="#2997ff" stroke-width="1.6"/>
+  <rect x="224" y="224" width="68" height="19" rx="6" fill="#2997ff"/>
+  <text x="258" y="237.5" font-size="11" font-weight="600" text-anchor="middle" fill="#ffffff">laptop 2</text>
+
+  <!-- keys found by name: their own outline -->
+  <g fill="none" stroke="#a1a1a6" stroke-width="1.6" stroke-linecap="round">
+    <circle cx="416" cy="312" r="9"/><path d="M424 318 l18 9 M436 324 l-3 6 M441 326.500 l-3 6"/>
+  </g>
+  <path d="M403 303 q10 -12 24 -3 l24 13 q6 4 2 12 l-6 12 q-4 5 -11 1 l-14 -8 q-12 4 -20 -6 q-7 -10 1 -21 z" fill="none" stroke="#ffd60a" stroke-width="2.4" stroke-linejoin="round"/>
+  <rect x="398" y="268" width="40" height="19" rx="6" fill="#ffd60a"/>
+  <text x="418" y="281.5" font-size="11" font-weight="600" text-anchor="middle" fill="#1d1d1f">keys</text>
+
+  <!-- a QR code -->
+  <rect x="478" y="270" width="48" height="48" rx="5" fill="#f5f5f7"/>
+  <g fill="#1d1d1f">
+    <rect x="484" y="276" width="12" height="12" rx="2"/><rect x="508" y="276" width="12" height="12" rx="2"/><rect x="484" y="300" width="12" height="12" rx="2"/>
+    <rect x="500" y="292" width="5" height="5"/><rect x="509" y="296" width="5" height="5"/><rect x="514" y="306" width="6" height="6"/><rect x="502" y="304" width="5" height="5"/>
+  </g>
+  <rect x="472" y="264" width="60" height="60" rx="8" fill="none" stroke="#30d158" stroke-width="1.8"/>
+
+  <!-- 3: Look for -->
+  <rect x="56" y="100" width="232" height="34" rx="17" fill="#ffffff" fill-opacity="0.16" stroke="#ffffff" stroke-opacity="0.35"/>
+  <text x="72" y="121.5" font-size="12" fill="#f5f5f7">keys</text>
+  <rect x="196" y="105" width="50" height="24" rx="12" fill="#2997ff"/>
+  <text x="221" y="121" font-size="11.5" font-weight="600" text-anchor="middle" fill="#ffffff">Find</text>
+  <path d="M267 111 q-5 0 -5 6 v4 l-2 3 h14 l-2 -3 v-4 q0 -6 -5 -6 z M265 126 q2 2.5 4 0" fill="none" stroke="#f5f5f7" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/>
+
+  <!-- 4: the buttons on the video -->
+  <g fill="#ffffff" fill-opacity="0.16" stroke="#ffffff" stroke-opacity="0.35">
+    <circle cx="464" cy="117" r="16"/><circle cx="502" cy="117" r="16"/><circle cx="540" cy="117" r="16"/>
+  </g>
+  <g fill="none" stroke="#f5f5f7" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M455 117 q9 -9 18 0 q-9 9 -18 0 z"/><circle cx="464" cy="117" r="2.4"/>
+    <rect x="494" y="112" width="16" height="11" rx="2.5"/><circle cx="502" cy="117.5" r="2.6"/>
+    <path d="M534 114 v-3 h3 M546 114 v-3 h-3 M534 120 v3 h3 M546 120 v3 h-3"/>
+  </g>
+
+  <!-- 5: In view -->
+  <text x="40" y="427" font-size="11" font-weight="600" letter-spacing="1.2" fill="#6e6e73">IN VIEW</text>
+  <g fill="#ffffff" stroke="#d2d2d7">
+    <rect x="106" y="410" width="58" height="26" rx="13"/><rect x="172" y="410" width="76" height="26" rx="13"/>
+    <rect x="256" y="410" width="58" height="26" rx="13"/><rect x="322" y="410" width="80" height="26" rx="13"/>
+  </g>
+  <g font-size="12" text-anchor="middle" fill="#1d1d1f">
+    <text x="135" y="427.5">Sara</text><text x="210" y="427.5">laptop 2</text><text x="285" y="427.5">keys</text><text x="362" y="427.5">QR code</text>
+  </g>
+
+  <!-- 6: the details panel -->
+  <rect x="580" y="86" width="260" height="350" rx="20" fill="#ffffff" stroke="#d2d2d7" filter="url(#shadow)"/>
+  <rect x="598" y="104" width="64" height="64" rx="12" fill="#e8e8ed"/>
+  <rect x="612" y="124" width="36" height="24" rx="3" fill="none" stroke="#6e6e73" stroke-width="1.5"/>
+  <line x1="606" y1="153" x2="654" y2="153" stroke="#6e6e73" stroke-width="2.4" stroke-linecap="round"/>
+  <text x="676" y="126" font-size="15" font-weight="700" fill="#1d1d1f">Laptop</text>
+  <text x="676" y="146" font-size="11.5" fill="#6e6e73">14-inch notebook</text>
+  <g fill="#e8e8ed">
+    <rect x="598" y="186" width="224" height="8" rx="4"/><rect x="598" y="202" width="206" height="8" rx="4"/><rect x="598" y="218" width="150" height="8" rx="4"/>
+  </g>
+  <g stroke="#e8e8ed" stroke-width="1"><line x1="598" y1="244" x2="822" y2="244"/><line x1="598" y1="272" x2="822" y2="272"/><line x1="598" y1="300" x2="822" y2="300"/></g>
+  <g font-size="11.5" fill="#6e6e73"><text x="598" y="262">Screen</text><text x="598" y="290">Weight</text><text x="598" y="318">Battery</text></g>
+  <g font-size="11.5" font-weight="500" fill="#1d1d1f" text-anchor="end"><text x="822" y="262">14 inches</text><text x="822" y="290">about 1.4 kg</text><text x="822" y="318">about 10 hours</text></g>
+
+  <!-- 7: ask about this -->
+  <rect x="598" y="384" width="224" height="34" rx="17" fill="#f5f5f7"/>
+  <text x="614" y="405.5" font-size="12" fill="#6e6e73">Ask about this</text>
+  <circle cx="803" cy="401" r="12" fill="#0066cc"/>
+  <path d="M803 395 v8 M798.500 401 q0 5 4.500 5 q4.500 0 4.500 -5 M803 406 v2.500" fill="none" stroke="#ffffff" stroke-width="1.6" stroke-linecap="round"/>
+
+  <!-- 8: the chat -->
+  <rect x="40" y="456" width="520" height="90" rx="20" fill="#ffffff" stroke="#d2d2d7"/>
+  <rect x="330" y="468" width="212" height="26" rx="13" fill="#0066cc"/>
+  <text x="436" y="485.500" font-size="11.5" text-anchor="middle" fill="#ffffff">Where did you last see the keys?</text>
+  <rect x="58" y="504" width="250" height="26" rx="13" fill="#f5f5f7"/>
+  <text x="72" y="521.500" font-size="11.5" fill="#1d1d1f">On the desk, two minutes ago, on the right.</text>
+
+  <!-- 9: the timeline -->
+  <rect x="580" y="456" width="260" height="90" rx="20" fill="#ffffff" stroke="#d2d2d7"/>
+  <g fill="#e8e8ed"><rect x="598" y="472" width="46" height="40" rx="9"/><rect x="654" y="472" width="46" height="40" rx="9"/><rect x="710" y="472" width="46" height="40" rx="9"/><rect x="766" y="472" width="46" height="40" rx="9"/></g>
+  <g font-size="10.5" fill="#6e6e73" text-anchor="middle"><text x="621" y="530">10:02</text><text x="677" y="530">10:05</text><text x="733" y="530">10:11</text><text x="789" y="530">10:14</text></g>
+  <path d="M598 518 h214" stroke="#d2d2d7" stroke-width="1"/>
+
+  <!-- the numbers -->
+  <g fill="#0066cc" stroke="#ffffff" stroke-width="2">
+    <circle cx="40" cy="26" r="12"/><circle cx="40" cy="86" r="12"/><circle cx="292" cy="100" r="12"/><circle cx="560" cy="86" r="12"/>
+    <circle cx="410" cy="410" r="12"/><circle cx="840" cy="86" r="12"/><circle cx="840" cy="384" r="12"/><circle cx="560" cy="456" r="12"/><circle cx="840" cy="456" r="12"/>
+  </g>
+  <g font-size="12.5" font-weight="700" fill="#ffffff" text-anchor="middle">
+    <text x="40" y="30.500">1</text><text x="40" y="90.500">2</text><text x="292" y="104.500">3</text><text x="560" y="90.500">4</text>
+    <text x="410" y="414.500">5</text><text x="840" y="90.500">6</text><text x="840" y="388.500">7</text><text x="560" y="460.500">8</text><text x="840" y="460.500">9</text>
+  </g>
+</svg>

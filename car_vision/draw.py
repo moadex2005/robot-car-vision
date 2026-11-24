@@ -10,7 +10,7 @@ how much larger. A frame 640 wide or narrower is drawn exactly at these sizes.
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 
 import cv2
 import numpy as np
@@ -65,8 +65,11 @@ def caption_for(detection: Detection) -> str:
     return text
 
 
+OUTLINE_FILL = 0.2          # how strongly the shape is tinted with its colour (0 = not at all)
+
+
 def draw_detections(frame: np.ndarray, detections: Iterable[Detection], wanted: Iterable[int] = ()) -> None:
-    """Draw a rectangle and a caption for each detection.
+    """Draw a rectangle, or the thing's own outline when it has one, and a caption for each detection.
 
     Boxes whose track number is in `wanted` (the things the visitor is looking
     for) get a thicker line in one fixed bright colour, so they stand out.
@@ -80,8 +83,32 @@ def draw_detections(frame: np.ndarray, detections: Iterable[Detection], wanted: 
             color, line = WANTED_COLOR, scaled(WANTED_THICKNESS, scale)
         else:
             color, line = color_for(detection.label), thickness
-        cv2.rectangle(frame, (x1, y1), (x2, y2), color, line)
+        if len(detection.outline) >= 3:
+            draw_outline(frame, detection.outline, color, line)
+        else:
+            cv2.rectangle(frame, (x1, y1), (x2, y2), color, line)
         draw_caption(frame, caption_for(detection), x1, y1, color)
+
+
+def draw_outline(frame: np.ndarray, outline: Sequence[tuple[int, int]],
+                 color: tuple[int, int, int], thickness: int) -> None:
+    """Tint the inside of the shape with its colour, then draw its edge as a closed smooth line.
+
+    Only the part of the frame under the shape's bounding rectangle is blended,
+    so many shapes on a large frame stay cheap. Points outside the frame are fine.
+    """
+    points = np.array(outline, dtype=np.int32).reshape(-1, 1, 2)
+    height, width = frame.shape[:2]
+    x, y, w, h = cv2.boundingRect(points)
+    left, top = max(x, 0), max(y, 0)
+    right, bottom = min(x + w, width), min(y + h, height)
+    if OUTLINE_FILL > 0 and right > left and bottom > top:
+        area = frame[top:bottom, left:right]            # a view: writing to it writes to the frame
+        inside = np.zeros(area.shape[:2], dtype=np.uint8)
+        cv2.fillPoly(inside, [points - np.array([left, top], dtype=np.int32)], 255)
+        tinted = cv2.addWeighted(area, 1 - OUTLINE_FILL, np.full_like(area, color), OUTLINE_FILL, 0)
+        cv2.copyTo(tinted, inside, area)                # only where the mask is set; fast
+    cv2.polylines(frame, [points], True, color, thickness, cv2.LINE_AA)
 
 
 def draw_caption(frame: np.ndarray, text: str, x: int, y: int, color: tuple[int, int, int]) -> None:

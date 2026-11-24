@@ -263,7 +263,7 @@ def test_very_long_card_text_is_cut_before_it_is_measured(monkeypatch):
 def test_draw_module_imports_only_cv2_numpy_and_state():
     text = (ROOT / "car_vision" / "draw.py").read_text(encoding="utf-8")
     imports = [line.strip() for line in text.splitlines() if line.startswith(("import ", "from "))]
-    allowed = {"from __future__ import annotations", "from collections.abc import Iterable",
+    allowed = {"from __future__ import annotations", "from collections.abc import Iterable, Sequence",
                "import cv2", "import numpy as np", "from car_vision.faces import Person",
                "from car_vision.state import Detection, RecognizedFace"}
     assert set(imports) <= allowed

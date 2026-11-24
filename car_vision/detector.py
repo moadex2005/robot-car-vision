@@ -26,7 +26,7 @@ import contextlib
 import importlib.util
 import logging
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -44,6 +44,7 @@ log = logging.getLogger(__name__)
 DEVICES = ("auto", "cuda", "cpu")
 VOTE_MEMORY_SECONDS = 30.0      # forget a track's label votes after this long unseen
 IDLE_WAIT_SECONDS = 0.005       # pause when no new frame has arrived yet
+OUTLINE_MAX_POINTS = 48         # a find's outline is cut down to at most this many corners
 PHONE_HINT = ("Check that IP Webcam is running, that the phone and the laptop are on "
               "the same network, and that stream.phone_url in config.yaml is right.")
 
@@ -316,6 +317,7 @@ class OpenDetector:
         self._device = choose_device(self._wanted_device, injected=True) if model is not None else "cpu"
         self._names: tuple[str, ...] = ()
         self._frame_size: tuple[int, int] | None = None
+        self._warned_outlines = False       # the "no outlines" warning is logged only once
 
     @property
     def loaded(self) -> bool:
@@ -372,7 +374,7 @@ class OpenDetector:
         height, width = frame.shape[:2]
         self._reset_if_size_changed((width, height))
         # Half precision is never passed (neither half= nor quantize=): GTX 16-series
-        # cards give empty or NaN results with it. Masks in the result are ignored.
+        # cards give empty or NaN results with it. The masks give each find its outline.
         results = self._model.track(
             frame,
             persist=True,
@@ -382,7 +384,10 @@ class OpenDetector:
             device=self._device,
             verbose=False,
         )
-        return to_detections(results[0], width, height, names=self._names) if results else []
+        if not results:
+            return []
+        return to_detections(results[0], width, height, names=self._names, outlines=True,
+                             warn=self._warn_once)
 
     def reset_tracks(self) -> None:
         """Forget every track, so the next detect() starts numbering afresh."""
@@ -427,6 +432,13 @@ class OpenDetector:
                 f"Could not load the text encoder for the named search. "
                 f"The first use needs the internet to download it into {folder}."
             ) from error
+
+    def _warn_once(self, message: str) -> None:
+        """Log why the outlines could not be read, the first time only: a model
+        without masks would otherwise give the same line on every run."""
+        if not self._warned_outlines:
+            self._warned_outlines = True
+            log.warning(message)
 
     def _reset_if_size_changed(self, size: tuple[int, int]) -> None:
         if self._frame_size is not None and size != self._frame_size:
@@ -475,10 +487,67 @@ def clip_box(box: np.ndarray, width: int, height: int) -> tuple[int, int, int, i
     return x1, y1, x2, y2
 
 
-def to_detections(result: Any, width: int, height: int, names: Any = None) -> list[Detection]:
+def simplify_outline(points: Any, width: int, height: int,
+                     max_points: int = OUTLINE_MAX_POINTS) -> tuple[tuple[int, int], ...]:
+    """One polygon from the model (N x 2 floats, frame pixels) as at most max_points whole-pixel corners.
+
+    The points are first kept inside the frame, then cv2.approxPolyDP drops
+    corners: its tolerance starts at one pixel and doubles until few enough are
+    left. Returns () for anything that is not a real shape: empty, None, not
+    N x 2, fewer than 3 corners or no area. Never raises.
+    """
+    try:
+        polygon = to_numpy(points).astype(np.float32)
+    except Exception:                   # None, text, ragged lists, a tensor that cannot be copied
+        return ()
+    if polygon.ndim != 2 or polygon.shape[1] != 2 or len(polygon) < 3 or width < 1 or height < 1:
+        return ()
+    if not np.isfinite(polygon).all():
+        return ()
+    polygon[:, 0] = polygon[:, 0].clip(0, width - 1)
+    polygon[:, 1] = polygon[:, 1].clip(0, height - 1)
+    polygon = polygon.reshape(-1, 1, 2)
+    perimeter = cv2.arcLength(polygon, True)
+    tolerance = 1.0
+    corners = cv2.approxPolyDP(polygon, tolerance, True)
+    while len(corners) > max_points and tolerance < perimeter:
+        tolerance *= 2
+        corners = cv2.approxPolyDP(polygon, tolerance, True)
+    corners = np.rint(corners).astype(np.int32)
+    if len(corners) < 3 or len(corners) > max_points or cv2.contourArea(corners) <= 0:
+        return ()
+    return tuple((int(x), int(y)) for x, y in corners.reshape(-1, 2))
+
+
+def read_outlines(result: Any, count: int, width: int, height: int,
+                  warn: Callable[[str], None] = log.warning) -> list[tuple[tuple[int, int], ...]]:
+    """One outline per box from result.masks.xy, in the order of result.boxes.
+
+    When the masks are missing or cannot be matched to the boxes, warn() is
+    called with one line and every outline is empty, so the boxes are drawn instead.
+    """
+    no_outlines: list[tuple[tuple[int, int], ...]] = [()] * count
+    try:
+        masks = getattr(result, "masks", None)
+        polygons = None if masks is None else list(masks.xy)
+    except Exception as error:
+        warn(f"Could not read the outlines of the finds, drawing boxes: {error}")
+        return no_outlines
+    if polygons is None or len(polygons) != count:
+        found = "no" if polygons is None else len(polygons)
+        warn(f"The model gave {found} outlines for {count} finds; drawing boxes")
+        return no_outlines
+    return [simplify_outline(polygon, width, height) for polygon in polygons]
+
+
+def to_detections(result: Any, width: int, height: int, names: Any = None,
+                  outlines: bool = False, warn: Callable[[str], None] = log.warning) -> list[Detection]:
     """Read result.boxes (xyxy, conf, cls, id) into Detections.
 
-    Labels come from names when it is given, else from result.names.
+    Labels come from names when it is given, else from result.names. With
+    outlines=True each Detection also gets its outline from result.masks.xy
+    (a segmentation model such as YOLOE gives these); otherwise masks are not read.
+    warn() is told, in one line, when the outlines cannot be read.
     """
     if names is None:
         names = getattr(result, "names", None)
@@ -489,6 +558,7 @@ def to_detections(result: Any, width: int, height: int, names: Any = None) -> li
     confidences = to_numpy(boxes.conf)
     classes = to_numpy(boxes.cls)
     ids = None if boxes.id is None else to_numpy(boxes.id)   # None until a track is confirmed
+    shapes = read_outlines(result, len(corners), width, height, warn) if outlines else [()] * len(corners)
 
     detections = []
     for row in range(len(corners)):
@@ -498,6 +568,7 @@ def to_detections(result: Any, width: int, height: int, names: Any = None) -> li
             confidence=float(confidences[row]),
             box=clip_box(corners[row], width, height),
             track_id=track_id,
+            outline=shapes[row],
         ))
     return detections
 

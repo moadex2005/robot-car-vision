@@ -955,7 +955,7 @@ def test_detect_passes_the_open_settings_and_never_half_precision():
     assert "half" not in call and "quantize" not in call
 
 
-def test_masks_in_the_result_are_ignored():
+def test_masks_that_cannot_be_read_still_give_the_finds():
     result = open_result([0], ids=[1])
     result.masks = object()                            # a segmentation model returns these
     detector = OpenDetector(OPEN_SETTINGS, model=FakeYoloe(result))

@@ -48,6 +48,15 @@ RECORD_FPS = 15.0
 FFMPEG_OPTIONS_VARIABLE = "OPENCV_FFMPEG_CAPTURE_OPTIONS"
 FFMPEG_LOW_DELAY = "fflags;nobuffer|flags;low_delay"
 
+# Only one reader may have the webcam at a time, from before it opens the camera until
+# after it has let it go. OpenCV's webcam driver on Windows keeps one shared record per
+# camera: opening the camera while another capture of it is still being closed corrupts
+# the program's memory and ends Python at once (seen live: off and on pressed quickly).
+# A new reader therefore waits here until the one before it has finished.
+WEBCAM_GATE = threading.Lock()
+GATE_CHECK_SECONDS = 0.05       # a waiting reader checks this often whether it was stopped
+GATE_SLOW_SECONDS = 3.0         # after waiting this long it says so in the log, once
+
 
 class Capture(Protocol):
     """The small part of cv2.VideoCapture this module uses. Tests pass a fake."""
@@ -117,6 +126,7 @@ class FrameSource:
         self,
         settings: dict[str, Any],
         opener: Callable[[], Capture | None] | None = None,
+        gate: Any = None,
     ) -> None:
         self.source: str = require(settings, "source", str)
         if self.source not in SOURCES:
@@ -126,6 +136,11 @@ class FrameSource:
         self.reconnect_seconds: float = float(require(settings, "reconnect_seconds", (int, float)))
         self.loop_file: bool = require(settings, "loop_file", bool)
         self._settings = settings
+        # The real webcam is used by one reader at a time (see WEBCAM_GATE). A test that
+        # hands in its own opener has no real camera, so it gets no gate unless it asks.
+        if gate is None and opener is None and self.source == "webcam":
+            gate = WEBCAM_GATE
+        self._gate = gate
         self._opener = opener if opener is not None else self._default_opener()
 
         self.fps = FpsCounter()
@@ -218,6 +233,38 @@ class FrameSource:
     # ---- the reader thread ---------------------------------------------
 
     def _run(self) -> None:
+        """The reader thread: wait for the camera to be free, read it, then say it is free again."""
+        if not self._wait_for_gate():
+            return                                     # stopped before the camera was free
+        try:
+            self._read_frames()
+        finally:
+            if self._gate is not None:
+                self._gate.release()
+
+    def _wait_for_gate(self) -> bool:
+        """Wait until no other reader has the camera. False when stop() came first.
+
+        The wait is in short steps, so stop() never has to wait for another
+        reader: a source that is switched off again before its turn never
+        touches the camera at all.
+        """
+        if self._gate is None:
+            return True
+        started = time.monotonic()
+        told = False
+        while not self._gate.acquire(timeout=GATE_CHECK_SECONDS):
+            if self._stop.is_set():
+                return False
+            if not told and time.monotonic() - started > GATE_SLOW_SECONDS:
+                told = True
+                log.info("Waiting for the %s to be let go by its last reader", self.source)
+        if self._stop.is_set():
+            self._gate.release()
+            return False
+        return True
+
+    def _read_frames(self) -> None:
         capture: Capture | None = None
         frames_since_open = 0
         try:

@@ -20,6 +20,12 @@ use_phone() switches the live source to another phone while the loop runs
 loop notices it, forgets everything about the old picture, and drops any
 result it was still working out for the old camera.
 
+set_camera() turns the camera off and on from the page (the round button on
+the video). Off is really off: the live source is let go like an old camera
+at a switch, a stand-in (CameraOff) takes its place, and the loop handles no
+frames, so no model runs; the memory still writes. On makes and starts the
+same camera again. The camera is on at every start.
+
 Whenever a phone is started, a short thread of its own asks the phone which
 picture sizes it offers and, with stream.phone_picture set to auto, asks for
 the smallest one that is still sharp enough: smaller pictures arrive sooner.
@@ -126,6 +132,7 @@ NO_INFO_CARDS = "No about.md was found for the enrolled people, so recognised fa
 PHOTO_MARGIN = 0.15            # the photo of a target is its box grown by 15 % on each side
 PHOTO_MIN_PIXELS = 160         # ... and at least this wide and high, where the frame allows
 CLIP_FINISHED = "Clip finished"   # drawn and shown when a clip has played to its end
+CAMERA_OFF = "Camera off"         # the line on the still picture, and nothing else is drawn
 AREA_SHARE = 0.5               # a click on no box takes half the frame wide and half the frame high
 FACE_LABEL = "face"            # the label of a target that is a face box with no person box around it
 DARK_LEVEL = 24                # the plain dark picture shown while a new camera connects
@@ -162,6 +169,7 @@ HINT_CLOSER = "Come closer"
 HINT_STILL = "Hold still"
 HINT_CANCELLED = "Cancelled"
 HINT_SWITCHED = "Cancelled: another camera was chosen"
+HINT_CAMERA_OFF = "Cancelled: the camera was switched off"
 
 MOST_NAMES = 6                           # search(): at most this many names at once ...
 LONGEST_NAME = 40                        # ... each at most this many characters
@@ -468,6 +476,7 @@ class Pipeline:
         self._look_lock = threading.Lock()     # one look thread talks to the lookout at a time
 
         self._switch_lock = threading.Lock()   # one use_phone() at a time
+        self._camera_on = True                 # set_camera(): on at every start, under self._lock
         self._phone_locks: dict[str, threading.Lock] = {}   # one talk with each phone at a time
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -475,6 +484,7 @@ class Pipeline:
         self._frames = 0                       # frames handed to the models so far
         self._failures = 0                     # broken frames in a row
         self._last_drawn: np.ndarray | None = None
+        self._drawn_from: int | None = None    # the camera generation _last_drawn belongs to
         self._lost_line: str | None = None     # the line already drawn on the last frame, if any
         self._frame_size: tuple[int, int] | None = None   # (width, height) of the last frame worked on
         self._named = NamedFinds()             # the named finds kept on screen between runs
@@ -543,6 +553,7 @@ class Pipeline:
                 old_source = self._source
                 self._source = new_source
                 self._phone_url = url
+                self._camera_on = True          # Connect means "use this camera", also while it is off
                 self._forget_old_picture()
                 cancelled = self._cancel_photos_locked(HINT_SWITCHED)
                 live = self._started and not self._stop.is_set()
@@ -554,9 +565,58 @@ class Pipeline:
             if restart:
                 self._start_loop()
             self._check_phone_picture()
+            self._resume_search()
         log.info("Switched the camera to the phone at %s", url)
         if cancelled is not None:
             log.info("Photos of %s cancelled by the camera switch after %d", cancelled.person_id, cancelled.taken)
+        let_go_in_background(old_source)
+
+    def set_camera(self, on: bool) -> None:
+        """Turn the camera off (False) or on again (True), now. It is on at every start.
+
+        Off: the live source is let go in a thread of its own (the webcam's
+        light goes out, the phone's stream is closed) and a CameraOff stand-in
+        takes its place. Everything the old picture showed is forgotten as at a
+        camera switch, a photo session is cancelled, and the loop handles no
+        frames, so no model runs; the memory still writes. A frame already in
+        the models when the camera goes off finishes at most the one model call
+        that was under way, and nothing of it is kept. On: a new source is made
+        from the settings in use now (see settings_to_turn_on) and started.
+        Returns at once, like use_phone(). The value it already has does nothing.
+        ConfigError when the source cannot be made (a clip that was deleted);
+        the camera then stays off.
+        """
+        if not isinstance(on, bool):
+            raise ValueError("The camera is switched with true or false.")
+        with self._switch_lock:
+            with self._lock:
+                if on == self._camera_on:
+                    return
+                kind = self._source.source
+            if on:
+                new_source = self._make_source(settings_to_turn_on(self._stream_settings, kind, self._phone_url))
+            else:
+                new_source = CameraOff(kind)
+            with self._lock:
+                old_source = self._source
+                self._source = new_source
+                self._camera_on = on
+                self._forget_old_picture()
+                cancelled = None if on else self._cancel_photos_locked(HINT_CAMERA_OFF)
+                live = self._started and not self._stop.is_set()
+                restart = live and not self._loop_running   # the loop had stopped after too many failures
+                if restart:
+                    self._loop_running = True
+            if live:
+                new_source.start()
+            if restart:
+                self._start_loop()
+            self._check_phone_picture()         # only does something when the camera is on and a phone
+            if on:
+                self._resume_search()
+        log.info("The camera was turned %s", "on" if on else "off")
+        if cancelled is not None:
+            log.info("Photos of %s cancelled by turning the camera off after %d", cancelled.person_id, cancelled.taken)
         let_go_in_background(old_source)
 
     def set_phone_picture(self, choice: str) -> None:
@@ -565,14 +625,17 @@ class Pipeline:
         config.yaml is not written. The box the phone's pictures are fitted into
         changes at once (see shown_box); the phone is asked in a thread of its
         own, so this returns at once. Raises ValueError with a plain message for
-        anything else, and for a size the phone does not offer.
+        anything else, for a size the phone does not offer, and for any size
+        while the camera is off (auto and keep are only stored then).
         """
         wanted = picture_choice(choice)
         if wanted is None:
             raise ValueError(NOT_A_PICTURE_CHOICE)
         size = parse_size(wanted)
         with self._lock:
-            offered = self._picture.offered if self._picture is not None else ()
+            if size is not None and not self._camera_on:     # the phone has said nothing since it went off
+                raise ValueError("Turn the camera on first to choose a picture size.")
+            offered =self._picture.offered if self._picture is not None else ()
             if size is not None and size not in offered:
                 raise ValueError(f"The phone does not offer {size[0]} x {size[1]}. "
                                  "Choose one of the sizes in the list.")
@@ -598,6 +661,7 @@ class Pipeline:
             on_screen = list(self._on_screen)
             error = self._error
             source = self._source
+            camera_on = self._camera_on
             phone_url = self._phone_url
             switched_at = self._switched_at        # 0.0 until the first switch
             picture, choice = self._picture, self._picture_choice
@@ -611,11 +675,12 @@ class Pipeline:
         found, discovered = (found, discovered) if fresh else ((), ())
         return {
             "source": source.source,
-            "connected": bool(source.connected) and error is None,   # a stopped loop is not live
+            "camera": {"on": camera_on},
+            "connected":bool(source.connected) and error is None,   # a stopped loop is not live
             "ended": bool(source.ended),              # a clip played to its end (loop_file: false)
             "phone_url": without_login(phone_url) if phone_url else None,   # in use or remembered; no password
             "phone_picture": picture_status(picture, choice) if source.source == "phone" else None,
-            "fps": round(self._fps.value(), 1),
+            "fps": round(self._fps.value(), 1) if camera_on else 0.0,
             "device": self._detector.device,
             "recognition": self._recognizer is not None,
             "notes": list(self._notes),
@@ -737,7 +802,8 @@ class Pipeline:
         """Begin taking `count` photos of an existing person from the live camera.
 
         KeyError for an unknown person. ValueError with a plain message when
-        face recognition is off, another session is running, or count is not 3 to 10.
+        face recognition is off, the camera is turned off, another session is running,
+        or count is not 3 to 10.
         """
         if self._recognizer is None:
             raise ValueError(f"{self._recognition_off} Photos cannot be taken without it.")
@@ -745,6 +811,8 @@ class Pipeline:
             raise ValueError(f"Take {FEWEST_PHOTOS} to {MOST_PHOTOS} photos.")
         folder = person_folder(self._photos_dir, person_id)
         with self._lock:
+            if not self._camera_on:
+                raise ValueError("Turn the camera on first to take photos.")
             if self._photos is not None and self._photos.running:
                 raise ValueError("Photos are being taken already. Wait until they are done, or cancel them.")
             self._photos = PhotoSession(person_id, folder, count, time.monotonic(), self._generation)
@@ -866,11 +934,11 @@ class Pipeline:
     def _prepare_search(self, names: tuple[str, ...], work: int) -> None:
         """Load the open detector if needed, give it the names and warm it up; then the search is ready."""
         with self._open_lock:
-            if not self._is_newest_search(work):
+            if not self._may_prepare(work):
                 return
             try:
                 detector = self._open_detector_ready()
-                if not self._is_newest_search(work):
+                if not self._may_prepare(work):
                     return
                 before = tuple(detector.names)
                 detector.set_names(list(names))
@@ -904,9 +972,17 @@ class Pipeline:
             self._open_detector.load()
         return self._open_detector
 
-    def _is_newest_search(self, work: int) -> bool:
+    def _may_prepare(self, work: int) -> bool:
+        """True when round `work` is the newest and the camera is on: no model runs while it is off.
+        A round that gives up because the camera is off stays "loading" (see _resume_search)."""
         with self._lock:
-            return self._search.round == work
+            return self._search.round == work and self._camera_on
+
+    def _resume_search(self) -> None:
+        """After the camera is turned on: prepare the names that were asked for while it was off."""
+        with self._lock:
+            waiting = self._search.round if self._search.state == "loading" else None
+        self._prepare_in_background(waiting)
 
     def _search_failed(self, work: int, note: str) -> None:
         """Mark the search as failed with this plain reason, if it is still the newest round."""
@@ -1058,12 +1134,12 @@ class Pipeline:
     def _check_phone_picture(self) -> None:
         """Read the phone's picture sizes and ask for the chosen one, off the video loop.
 
-        Does nothing unless the running source is the phone.
+        Does nothing unless the running source is the phone (never while the camera is off).
         """
         with self._lock:
             self._picture_round += 1
             work = self._picture_round
-            live = self._started and not self._stop.is_set()
+            live = self._started and not self._stop.is_set() and self._camera_on
             url = self._phone_url if self._source.source == "phone" else None
         if live and url is not None:
             threading.Thread(target=self._tune_phone_picture, args=(url, work),
@@ -1332,7 +1408,7 @@ class Pipeline:
         self._thread.start()
 
     def _forget_old_picture(self) -> None:
-        """What use_phone() clears, under the lock: a click must never hit the old camera's
+        """What use_phone() and set_camera() clear, under the lock: a click must never hit the old camera's
         picture, and the assistant must not be told about people that camera saw."""
         self._generation += 1
         self._switched_at = time.monotonic()
@@ -1362,9 +1438,8 @@ class Pipeline:
             with self._lock:                    # the source, its generation and the search, read together
                 source, current, search = self._source, self._generation, self._search
             if current != generation:
-                switched = generation is not None
                 generation, last_sequence = current, 0
-                self._start_afresh(source, switched)
+                self._start_afresh(source, current)
             frame, sequence = source.read()
             if frame is None or sequence == last_sequence:
                 if not source.connected:
@@ -1380,13 +1455,14 @@ class Pipeline:
             else:
                 self._failures = 0
 
-    def _start_afresh(self, source: Any, switched: bool) -> None:
+    def _start_afresh(self, source: Any, generation: int) -> None:
         """A new camera: forget the faces, failures, frame count, FPS and lost line of the old one.
 
-        Only the loop thread uses these, so the loop clears them itself. After a
-        switch the old picture is replaced at once by a plain dark one of the same
-        size with "Connecting to the phone ...", so nothing of the old camera stays
-        on screen.
+        Only the loop thread uses these, so the loop clears them itself. When the
+        kept picture belongs to another camera generation (a switch, also one that
+        restarted a loop stopped after too many failures), it is replaced at once by
+        a plain dark one of the same size with "Connecting to the phone ..." (or
+        "Camera off"), so nothing of the old camera stays on screen.
         """
         self._frames = 0
         self._failures = 0
@@ -1395,8 +1471,9 @@ class Pipeline:
         self._lost_line = None
         self._frame_size = None
         self._forget_named_finds()
-        if switched and self._last_drawn is not None:
+        if self._last_drawn is not None and self._drawn_from != generation:
             self._last_drawn = np.full_like(self._last_drawn, DARK_LEVEL)
+            self._drawn_from = generation
             self._show_stream_lost(source)          # no frame yet, so: "Connecting to the phone ..."
 
     def _process(self, frame: np.ndarray, generation: int, search: Search) -> None:
@@ -1413,6 +1490,8 @@ class Pipeline:
             self._faces_changed.clear()
             self._memory = FaceMemory()
         detections = self._detector.detect(frame)
+        if self._camera_changed_since(generation):
+            return                                  # switched or turned off meanwhile: no more models for it
         # The faces are matched to the everyday person boxes, as before.
         if self._recognizer is not None and (index % self.every_n_frames == 0 or resized or enrolled_again):
             check = self._recognizer.check_faces(frame, detections)
@@ -1451,6 +1530,7 @@ class Pipeline:
             phone_not_heard = self._picture is None
         self._remember(frame, shown, faces, named, memory_epochs)
         self._last_drawn = drawn
+        self._drawn_from = generation
         came_back = self._lost_line is not None and index > 0    # this camera had dropped out and returned
         self._lost_line = None
         self._fps.tick(now)
@@ -1465,6 +1545,11 @@ class Pipeline:
             # yet: its camera app was not serving when it was asked at start-up or at
             # Connect. Now it is, so ask again. (Does nothing for a clip or the webcam.)
             self._check_phone_picture()
+
+    def _camera_changed_since(self, generation: int) -> bool:
+        """True when the camera was switched or turned off after this generation's frame was read."""
+        with self._lock:
+            return self._generation != generation
 
     def _forget_stream_size(self) -> None:
         """The reader opened the stream again by itself: its size is learned afresh from the phone."""
@@ -1652,8 +1737,11 @@ class Pipeline:
 
         Each line is drawn once; it is drawn again only when the reason changes,
         e.g. from reconnecting to "Clip finished" when a clip has played to its end.
+        While the camera is off the line is "Camera off" (on the plain dark picture).
         """
-        if source.ended:
+        if isinstance(source, CameraOff):
+            text = CAMERA_OFF
+        elif source.ended:
             text = CLIP_FINISHED
         elif self._frames == 0:                 # no picture from this camera yet (just switched)
             text = f"Connecting to the {source.source} ..."
@@ -1720,6 +1808,42 @@ def let_go_in_background(source: Any) -> None:
             log.exception("Letting go of the old camera failed")
 
     threading.Thread(target=let_go, name="old-camera", daemon=True).start()
+
+
+class CameraOff:
+    """Stands in for the live source while the camera is turned off (set_camera(False)).
+
+    It never gives a frame, so the loop handles none and no model runs. `source`
+    names the camera that will be used again, so status() still says it.
+    """
+
+    def __init__(self, source: str) -> None:
+        self.source = source
+        self.connected = False
+        self.ended = False
+
+    def read(self) -> tuple[None, int]:
+        return None, 0
+
+    def start(self) -> "CameraOff":
+        return self
+
+    def stop(self) -> None:
+        pass
+
+    def set_box(self, max_width: int, max_height: int) -> None:
+        pass
+
+    def reopen(self) -> None:
+        pass
+
+
+def settings_to_turn_on(stream_settings: dict[str, Any], kind: str, phone_url: str | None) -> dict[str, Any]:
+    """The stream settings for set_camera(True): the phone at the address in use when the
+    camera was a phone, otherwise the source the program started with."""
+    if kind == "phone" and phone_url is not None:
+        return {**stream_settings, "source": "phone", "phone_url": phone_url}
+    return dict(stream_settings)
 
 
 # ---- the phone's picture size: the setting and the status --------------------------------

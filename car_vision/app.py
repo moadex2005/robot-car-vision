@@ -8,7 +8,8 @@ part the visitor brushed over (the page sends only the brush strokes; marking.py
 draws them on the server's own copy of the photo). The camera
 box on the page sends a phone's address to /api/camera, which switches the
 video to that phone and remembers the address for the next start, and the
-picture size to ask the phone for to /api/camera/picture.
+picture size to ask the phone for to /api/camera/picture. /api/camera/power
+turns the camera off and on (the round button on the video).
 
 The People section of the page adds, edits and removes the person folders
 (/api/people, through people.PeopleBook) and takes a person's photos from the
@@ -64,7 +65,7 @@ from car_vision.faces import PERSON_ID
 from car_vision.marking import NEARLY_ALL, mark_photo, marked_share
 from car_vision.people import MAX_LINE, MAX_LINES, MAX_NAME, MAX_ROLE, MAX_STORY, PeopleBook
 from car_vision.phone import load_remembered, phone_url, remember, same_phone
-from car_vision.pipeline import Pipeline, clean_names
+from car_vision.pipeline import Pipeline, clean_names, first_line
 from car_vision.stream import SOURCES
 
 log = logging.getLogger(__name__)
@@ -120,6 +121,7 @@ SIGHTING_ID = re.compile(r"[0-9]{1,18}")   # an id in an address: digits only, a
 PICTURE_CACHE = "no-store"       # after Clear memory an id may belong to another row: never kept
 NO_MEMORY_PICTURE = "There is no picture of that."
 DISCOVER_SHAPE = 'Send the switch as JSON, like {"on": true} or {"on": false}.'
+CAMERA_POWER_SHAPE = 'Send {"on": true} or {"on": false}.'
 
 CHANGING_METHODS = frozenset({"POST", "PUT", "DELETE"})   # these must come from this page, as JSON
 NOT_JSON = 'Send the request as JSON (Content-Type: application/json), with {} when there is nothing to send.'
@@ -817,6 +819,20 @@ def create_app(pipeline: Any, assistant: Any, camera_file: Path | None = None,
         except ValueError as error:                  # not a choice, or a size the phone does not offer
             return jsonify(error=str(error)), 400
         return jsonify(ok=True)
+
+    @app.post("/api/camera/power")
+    def camera_power() -> Any:
+        """Turn the camera off and on (the round button on the video)."""
+        body = request.get_json(silent=True)
+        on = body.get("on") if isinstance(body, dict) and set(body) == {"on"} else None
+        if not isinstance(on, bool):
+            return jsonify(error=CAMERA_POWER_SHAPE), 400
+        try:
+            pipeline.set_camera(on)                   # returns at once; the page follows the status
+        except ConfigError as error:                  # e.g. the clip given by --file was deleted
+            return jsonify(error=f"The camera could not be started: {first_line(error)}"), 400
+        log.info("The camera was turned %s from the page", "on" if on else "off")
+        return jsonify(ok=True, on=on)
 
     # ---- people: the order of effects is always files, then the vision side, then the assistant
 

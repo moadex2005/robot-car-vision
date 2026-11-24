@@ -450,6 +450,46 @@
   .frame-button:active { transform: scale(0.92); transition-duration: 0.12s; }
   .frame-button svg { width: 1.15rem; height: 1.15rem; }
   .frame-button .shrink { display: none; }
+
+  /* The camera's power, first in the row: dark like the other buttons while the camera is on.
+     While it is off the button turns light and a line is drawn once through the camera, the way
+     a phone shows a camera that is off. Pressed (aria-pressed) means on. */
+  .frame-button.power-button { transition: transform 0.45s var(--spring), background-color 0.25s, color 0.25s; }
+  .frame-button.power-button[aria-pressed="true"] {
+    background: rgba(0, 0, 0, 0.55); color: #fff; border-color: rgba(255, 255, 255, 0.3);
+  }
+  .frame-button.power-button[aria-pressed="false"] { background: #f5f5f7; color: #1d1d1f; border-color: transparent; }
+  .power-button .power-strike { stroke-dasharray: 1; stroke-dashoffset: 1; transition: stroke-dashoffset 0.35s var(--ease-out); }
+  .power-button[aria-pressed="false"] .power-strike { stroke-dashoffset: 0; }
+  .frame-button.power-button.is-busy { opacity: 0.6; cursor: progress; transform: none; }
+  /* A press that failed: one short line under the buttons for a few seconds. Solid, not blurred. */
+  .capsule.power-problem {
+    position: absolute; top: calc(100% + 8px); right: 0;
+    width: max-content; max-width: min(22rem, 70vw); margin: 0;
+    color: #fff; font-size: 0.85rem; font-weight: 500;
+    background: #1c1c1e;
+    border: 1px solid rgba(255, 255, 255, 0.28);
+    box-shadow: 0 12px 30px rgba(0, 0, 0, 0.3);
+  }
+  .is-off .dot { background: var(--grey); }
+  /* While the camera is off: centred over the dark picture, a calm line and a Turn on button.
+     Only the capsule takes clicks, so the finder below it still works. */
+  .camera-off {
+    position: absolute; inset: 0;
+    display: grid; place-items: center;
+    padding: 1rem;
+    pointer-events: none;
+  }
+  .capsule.camera-off-capsule {
+    pointer-events: auto;
+    gap: 1rem;
+    padding: 0.5em 0.5em 0.5em 1.4em;
+    color: #f5f5f7; font-size: clamp(1.1rem, 1.6vw, 1.5rem); font-weight: 600;
+    background: #1c1c1e;
+    border: 1px solid rgba(255, 255, 255, 0.28);
+    box-shadow: 0 12px 30px rgba(0, 0, 0, 0.3);
+  }
+  .frame.is-camera-off .waiting { display: none; }
   /* The microphone on the stage sits left of the full-view button, and only in the full view. */
   .stage:not(.is-full) .stage-mic { display: none; }
 
@@ -1190,8 +1230,25 @@
         <div class="frame" id="frame">
           <img id="video" src="/video" tabindex="-1" alt="Live camera view from the car, with labelled objects and faces">
           <div class="waiting" id="waiting">Waiting for the camera&hellip;</div>
+          <!-- While the camera is off: over the dark picture, with a way to turn it on again. -->
+          <div class="camera-off" id="cameraOff" hidden>
+            <div class="capsule camera-off-capsule">
+              <span>Camera off</span>
+              <button class="pill primary small" id="cameraOn" type="button">Turn on</button>
+            </div>
+          </div>
           <!-- The buttons in the top right corner of the video, left to right. -->
           <div class="frame-tools">
+            <!-- The camera: off and on. Also in the full view. A line goes through it while it is off. -->
+            <button class="frame-button power-button" id="cameraPower" type="button" aria-pressed="true"
+                    aria-label="Turn the camera off" title="Turn the camera off">
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <rect x="2.5" y="6.5" width="13" height="11" rx="2.5" fill="none" stroke="currentColor" stroke-width="2"/>
+                <path d="M15.5 10.5l5-3v9l-5-3" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/>
+                <path class="power-strike" d="M3.5 3.5l17 17" pathLength="1" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/>
+              </svg>
+            </button>
+            <p class="capsule power-problem" id="powerProblem" role="status" hidden></p>
             <!-- Describe the scene: the assistant looks at the whole picture. Also in the full view. -->
             <button class="frame-button scene-button" id="sceneButton" type="button" title="Describe the scene"
                     aria-label="Describe the scene">
@@ -1715,6 +1772,7 @@ function pictureFillsFrame() {
 }
 
 video.addEventListener("mousemove", (event) => {
+  if (cameraIsOff) return;               // nothing to inspect while the camera is off
   if (pictureFillsFrame()) {
     if (!video.classList.contains("is-clickable")) video.classList.add("is-clickable");
     return;
@@ -1729,13 +1787,14 @@ video.addEventListener("mousemove", (event) => {
 });
 video.addEventListener("mouseleave", () => video.classList.remove("is-clickable"));
 video.addEventListener("click", (event) => {
+  if (cameraIsOff) return;
   const point = pointOnPicture(event);
   if (point) inspect(point, null, video);
 });
 
 // ---- the status ----------------------------------------------------------
 
-const STATE_CLASSES = ["is-live", "is-down", "is-ended", "is-stopped", "is-offline"];
+const STATE_CLASSES = ["is-live", "is-down", "is-ended", "is-stopped", "is-offline", "is-off"];
 
 function setState(className, text) {
   for (const name of STATE_CLASSES) statusPill.classList.toggle(name, name === className);
@@ -1743,9 +1802,11 @@ function setState(className, text) {
   if (liveText.title !== text) liveText.title = text;
 }
 
-// Live, reconnecting, a clip that has finished, or a loop that stopped after too many errors.
+// Live, reconnecting, a clip that has finished, a loop that stopped after too many errors,
+// or a camera that was turned off.
 function drawStatusLine(status) {
   if (status.error) setState("is-stopped", "Stopped: " + asText(status.error));
+  else if (cameraOffShown(status)) setState("is-off", "Camera off");
   else if (status.ended) setState("is-ended", "Clip finished");
   else if (status.connected) setState("is-live", "Live");
   else setState("is-down", "Reconnecting");
@@ -1761,6 +1822,97 @@ function drawStatusLine(status) {
     notes.replaceChildren(...items);
   }
 }
+
+// ---- the camera: off and on ----
+//
+// The round button at the top right of the video, and the Turn on button over the dark picture
+// while the camera is off. A press sends the wish and shows the button as busy until the answer
+// comes; after that the page shows what the status says (status.camera.on), so two tabs agree.
+// Nothing is spoken. While the camera is off there is nothing to inspect: no hand, no clicks.
+
+const POWER_PROBLEM_MS = 4000;  // a failed press says so this long
+const POWER_WAIT_MS = 8000;     // a press gives up after this long without an answer
+const cameraPower = byId("cameraPower"), cameraOffBox = byId("cameraOff"), cameraOnButton = byId("cameraOn");
+const powerProblem = byId("powerProblem");
+let cameraIsOff = false;        // what the page shows now; the camera is on at every start
+let powerSending = false;       // a press is on its way
+let powerFromPoll = 0;          // after an answer, only a status asked for later is shown
+let powerProblemTimer = 0;
+
+function isCameraOff(status) {
+  return Boolean(status.camera) && status.camera.on === false;
+}
+
+function showCamera(off) {
+  if (off === cameraIsOff) return;
+  cameraIsOff = off;
+  const words = off ? "Turn the camera on" : "Turn the camera off";
+  cameraPower.setAttribute("aria-pressed", off ? "false" : "true");
+  cameraPower.setAttribute("aria-label", words);
+  cameraPower.title = words;
+  if (!off && cameraOffBox.contains(document.activeElement)) cameraPower.focus({ preventScroll: true });
+  cameraOffBox.hidden = !off;
+  frame.classList.toggle("is-camera-off", off);
+  if (off) video.classList.remove("is-clickable");
+}
+
+// While a press is on its way, or its answer is newer than the status of this poll (a status
+// asked for before the switch), the button and the status pill keep what the page shows.
+function powerHeldBack() {
+  return powerSending || pollCount < powerFromPoll;
+}
+
+function cameraOffShown(status) {
+  return powerHeldBack() ? cameraIsOff : isCameraOff(status);
+}
+
+// On every status poll, except while the state is held back.
+function drawCamera(status) {
+  if (powerHeldBack()) return;
+  showCamera(isCameraOff(status));
+}
+
+function setPowerBusy(isBusy) {
+  powerSending = isBusy;
+  cameraPower.classList.toggle("is-busy", isBusy);
+  if (isBusy) cameraPower.setAttribute("aria-busy", "true");
+  else cameraPower.removeAttribute("aria-busy");
+  cameraOnButton.disabled = isBusy;
+}
+
+function showPowerProblem(text) {
+  setText(powerProblem, text);
+  powerProblem.hidden = false;
+  clearTimeout(powerProblemTimer);
+  powerProblemTimer = setTimeout(() => { powerProblem.hidden = true; }, POWER_PROBLEM_MS);
+}
+
+async function sendCameraPower(on) {
+  if (powerSending) return;
+  setPowerBusy(true);
+  let problem = "";
+  const controller = new AbortController();      // the busy state ends even when no answer comes
+  const timer = setTimeout(() => controller.abort(), POWER_WAIT_MS);
+  try {
+    const { response, data } = await postJson("/api/camera/power", { on }, controller.signal);
+    if (response.ok && data && data.ok === true && data.on === on) {
+      powerFromPoll = pollCount + 1;    // a status asked for before the switch would show the old state
+      showCamera(!on);
+    } else {
+      problem = errorText(data, response, "Please try again.");
+    }
+  } catch (error) {
+    problem = error && error.name === "AbortError" ? "The camera did not answer. Please try again."
+                                                    : "Program not running: the camera could not be switched.";
+  } finally {
+    clearTimeout(timer);
+  }
+  setPowerBusy(false);
+  if (problem) showPowerProblem(problem);
+}
+
+cameraPower.addEventListener("click", () => sendCameraPower(cameraIsOff));
+cameraOnButton.addEventListener("click", () => sendCameraPower(true));
 
 // ---- in view: one pill per detected thing ----------------------------------
 
@@ -1929,6 +2081,7 @@ function setOnline(isOnline) {
   online = isOnline;
   offline.hidden = isOnline;
   finder.hidden = !isOnline;           // nothing can be looked for while the program is not running
+  cameraPower.hidden = !isOnline;      // nor can the camera be turned off or on
   if (isOnline) {
     if (wasOffline) restartVideo();
     return;
@@ -1941,6 +2094,7 @@ function setOnline(isOnline) {
   pictureRow.hidden = true;
   clearSearch();
   hideDiscover();
+  showCamera(false);                   // a program that starts again starts with the camera on
   setState("is-offline", "Program not running");
 }
 
@@ -1958,6 +2112,7 @@ async function poll() {
     setOnline(true);
     setText(nothing, "Nothing detected right now");
     drawStatusLine(status);
+    drawCamera(status);
     drawObjects(status);
     drawReactions(status);
     phoneUrl = asText(status.phone_url);
@@ -2404,11 +2559,13 @@ function setBusy(isBusy) {
   clearButton.disabled = isBusy;
 }
 
-async function postJson(url, body) {
+// `signal` (optional, only the camera's power button passes one) lets a request be given up.
+async function postJson(url, body, signal) {
   const response = await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
+    signal,
   });
   let data = null;
   try {

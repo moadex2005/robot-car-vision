@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="color-scheme" content="light dark">
 <title>Robot car vision</title>
 <script>
@@ -835,7 +835,7 @@
   .stage.is-full .delay { position: absolute; top: clamp(10px, 1.2vw, 18px); left: clamp(10px, 1.2vw, 18px); z-index: 2; margin: 0; }
   .stage.is-full .delay-clock { font-size: clamp(1.6rem, 2.6vw, 3.4rem); }   /* smaller: it lies over the picture */
   .stage.is-full .details {
-    position: relative; width: auto; max-width: none; height: 100%; max-height: none;
+    position: relative; inset: auto; width: auto; max-width: none; height: 100%; max-height: none;
     border-radius: 0; border-width: 0 0 0 1px;
     box-shadow: none;
     background: var(--glass-solid);
@@ -1147,6 +1147,308 @@
     *, *::before, *::after { animation: none !important; transition: none !important; }
     .js .reveal { opacity: 1; transform: none; }
     .hero-text { transform: none !important; }
+  }
+
+  /* ---- phone: up to 640 px wide ----
+     A phone held upright (up to 640 px wide) or on its side (under 450 px high). Everything
+     above 640 px wide and 450 px high keeps the layout above, pixel for pixel. These rules only
+     override the ones above; they add no behaviour. Three parts: what both ways of holding the
+     phone share, then upright, then on its side.
+     The safe areas (env(safe-area-inset-*)) are the edges a notch or a rounded corner covers;
+     they are 0 everywhere else. */
+  @media (max-width: 640px), (max-height: 450px) and (orientation: landscape) {
+    html {
+      -webkit-text-size-adjust: 100%; text-size-adjust: 100%;   /* the phone does not enlarge text on its side */
+      -webkit-tap-highlight-color: transparent;                 /* the buttons' own press look is enough */
+    }
+
+    /* iPhone Safari zooms the whole page into a field whose text is smaller than 16 px.
+       !important, so that fields added later with smaller text keep this too. */
+    input, select, textarea { font-size: max(16px, 1rem) !important; }
+
+    /* Room for a thumb: every button at least 44 px. */
+    .pill { min-height: 44px; }
+    .round { width: 44px; height: 44px; }
+    .switch, select { min-height: 44px; }
+    .frame { --finder-height: 2.75rem; }
+    .finder-form { height: auto; padding: 3px; }
+    .finder-form input, .finder-form .finder-button { height: 44px; }
+
+    /* The two boxes from the bar stay inside the screen and scroll when taller than it. */
+    .glass.camera-box, .glass.voice-box {
+      max-height: calc(100svh - var(--nav-space) - 12px - env(safe-area-inset-bottom));
+      overflow-y: auto; overscroll-behavior: contain;
+      overflow-wrap: anywhere;
+    }
+
+    /* Nothing cut off: the timeline's line of detail wraps instead of ending in "...". */
+    .moment-detail { white-space: normal; overflow: visible; }
+
+    /* Look for: under the video instead of over its bottom edge, so it never covers the picture.
+       The frame lets it hang below and keeps room for it (--finder-room, measured by the script);
+       the picture keeps the frame's round corners. The field takes the row, Stop sits beside it,
+       and the chips get a row of their own under it, with room for their state (no hover needed).
+       The caption, no longer above Look for, sits at the bottom of the picture. */
+    .stage:not(.is-full) .frame { overflow: visible; margin-bottom: calc(var(--finder-room) + 4px); }
+    .stage:not(.is-full) .frame img, .stage:not(.is-full) .offline { border-radius: inherit; }
+    .stage:not(.is-full) .finder {
+      left: 0; right: 0; bottom: auto; top: calc(100% + 12px);
+      max-width: none;
+      flex-wrap: wrap; align-items: flex-start; gap: 0.45rem;
+    }
+    .stage:not(.is-full) .finder-form { flex: 1 1 0; min-width: 0; box-shadow: 0 6px 18px rgba(0, 0, 0, 0.14); }
+    .stage:not(.is-full) .finder-form input { flex: 1 1 auto; width: auto; }
+    .stage:not(.is-full) .finder-button { padding: 0 1.1rem; }
+    .stage:not(.is-full) .finder-button.stop { order: 1; height: calc(44px + 8px); }
+    .stage:not(.is-full) .find-chips { order: 2; flex: 1 1 100%; flex-wrap: wrap; }
+    :where(.stage:not(.is-full)) .find-chip-state { display: inline; }
+    .stage:not(.is-full) .caption { bottom: 10px; max-width: calc(100% - 20px); }
+
+    /* Full view: buttons, pills and captions keep clear of a notch and of the rounded corners. */
+    .stage.is-full .frame-tools {
+      top: calc(clamp(10px, 1.2vw, 18px) + env(safe-area-inset-top));
+      right: calc(clamp(10px, 1.2vw, 18px) + env(safe-area-inset-right));
+    }
+    .stage.is-full .delay {
+      top: calc(clamp(10px, 1.2vw, 18px) + env(safe-area-inset-top));
+      left: calc(clamp(10px, 1.2vw, 18px) + env(safe-area-inset-left));
+    }
+    .stage.is-full .inview {
+      padding-left: calc(clamp(10px, 1.4vw, 22px) + env(safe-area-inset-left));
+      padding-right: calc(clamp(10px, 1.4vw, 22px) + env(safe-area-inset-right));
+      padding-bottom: calc(clamp(10px, 1.4vw, 22px) + env(safe-area-inset-bottom));
+    }
+    .stage.is-full .finder {
+      left: calc(var(--frame-edge) + env(safe-area-inset-left));
+      bottom: calc(var(--frame-edge) + 2.9rem + 36px + env(safe-area-inset-bottom));
+      max-width: calc(100% - 2 * var(--frame-edge) - env(safe-area-inset-left) - env(safe-area-inset-right));
+    }
+    .stage.is-full .caption {
+      bottom: calc(clamp(10px, 1.4vw, 22px) + 2.9rem + 36px + var(--finder-room) + env(safe-area-inset-bottom));
+    }
+    .stage.is-full .details-scroll {
+      padding-right: calc(1.2rem + env(safe-area-inset-right));
+      padding-bottom: calc(1.4rem + env(safe-area-inset-bottom));
+    }
+    .footer { padding-bottom: calc(3rem + env(safe-area-inset-bottom)); }
+  }
+
+  @media (max-width: 640px) {
+    :root {
+      --nav-space: calc(74px + env(safe-area-inset-top));
+      --radius-big: 26px;
+      --radius: 20px;
+    }
+
+    /* The bar: always one row with the status and the buttons. The section links and the name
+       go (the hero says the name, and the sections are reached by scrolling). When there is not
+       room for everything, the status pill gives way first: its state word ends in "..." (the
+       whole word is in its title, and the bad states are also shown over the video). The
+       buttons never shrink, however many there are. */
+    .nav {
+      top: calc(8px + env(safe-area-inset-top));
+      width: calc(100% - 20px - env(safe-area-inset-left) - env(safe-area-inset-right));
+      flex-wrap: nowrap; justify-content: flex-end; gap: 4px;
+      padding: 4px;
+      border-radius: 26px;
+    }
+    .nav > * { flex: none; }
+    .brand, .nav-links { display: none; }
+    .nav > .status-pill {
+      flex: 0 1 auto; min-width: 0; overflow: hidden;
+      margin-right: auto;
+      min-height: 36px;
+      padding: 0 0.65rem 0 0.75rem; gap: 0.4rem;
+      font-size: 0.8rem;
+    }
+    .status-state, .is-stopped .status-state {
+      min-width: 0; max-width: none;
+      overflow: hidden; white-space: nowrap; text-overflow: ellipsis;
+    }
+    .status-item { display: none; }
+    .nav .pill.small { padding: 0 0.8rem; font-size: 0.85rem; }
+    @media (max-width: 359.98px) {           /* the smallest phones: a little less air in the bar */
+      .nav { width: calc(100% - 12px - env(safe-area-inset-left) - env(safe-area-inset-right)); }
+      .nav > .status-pill { padding: 0 0.5rem; gap: 0.35rem; }
+      .nav .pill.small { padding: 0 0.7rem; }
+    }
+
+    /* The boxes from the bar: the whole width, with a margin. */
+    .glass.camera-box, .glass.voice-box {
+      left: calc(10px + env(safe-area-inset-left));
+      right: calc(10px + env(safe-area-inset-right));
+      width: auto;
+      padding: 1rem 1.05rem 1.1rem;
+    }
+
+    /* Sections: less air around them, and the content keeps clear of a notch. */
+    main {
+      padding-left: max(var(--gutter), env(safe-area-inset-left));
+      padding-right: max(var(--gutter), env(safe-area-inset-right));
+    }
+    .section { padding: 44px 0; }
+    .section-head { margin-bottom: 22px; }
+    .section-head p { font-size: 1rem; }
+
+    /* The hero: a smaller headline and no screen-high gap before the video. */
+    .hero { min-height: 0; padding: calc(var(--nav-space) + 9vh) 0 1.5rem; }
+    .hero-title { font-size: clamp(2.6rem, 12.5vw, 3.6rem); letter-spacing: -0.04em; }
+    .hero-line { margin-top: 0.8rem; font-size: 1.15rem; }
+    .hero-actions { margin-top: 1.6rem; gap: 0.7rem; }
+    .hero-actions .pill { padding: 0.7rem 1.3rem; }
+
+    /* The live view: the video the whole width. Its buttons stay in the top right corner. */
+    .stage { gap: 20px; }
+    .frame-tools { gap: 0.5rem; }
+    .stage:not(.is-full) .banners {
+      align-items: flex-start;
+      padding: 10px calc(3 * 2.6rem + 2 * 0.5rem + 20px) 10px 10px;   /* left of the three buttons */
+    }
+    /* A video under 330 px wide: the buttons a little smaller and closer to the edge, so they
+       stay right of the picture's middle (40 px each, 8 px apart, still easy to touch). */
+    @container (max-width: 330px) {
+      .frame-tools { top: 8px; right: 8px; gap: 8px; }
+      .frame-button, .frame-button.scene-button { width: 40px; height: 40px; }
+      .stage:not(.is-full) .banners { padding: 8px calc(3 * 40px + 2 * 8px + 16px) 8px 8px; }
+    }
+    .greeting, .photo-capsule { font-size: 0.95rem; padding: 0.5em 0.95em; overflow-wrap: anywhere; }
+    .offline { font-size: 1.3rem; overflow-wrap: anywhere; }
+    .offline small { font-size: 0.85rem; }
+    .capsule.camera-off-capsule { font-size: 1rem; }
+    .stage:not(.is-full) .caption { padding: 0.6rem 1rem 0.65rem; }
+    .caption-answer { font-size: 0.95rem; -webkit-line-clamp: 3; }
+    .delay-clock { font-size: min(2.6rem, 10.5vw); }
+
+    /* In view: the switch and its small text under the heading. */
+    .inview { margin-top: 1.3rem; }
+    .inview-head { flex-direction: column; gap: 0.2rem; }
+    .things { gap: 0.5rem; }
+
+    /* The details: a bottom sheet, fixed to the bottom of the screen and as wide as it, at most
+       62 % of its height, scrolling inside itself. So a tap on a thing shows its details at once,
+       wherever the page is scrolled, and the page itself never moves. Solid, not blurred: it
+       may lie over the video. The width handle goes. While the sheet is open the page gets as
+       much room at its bottom as the sheet can take, so its last part can be scrolled above it
+       (:has(), in Safari 15.4+, Chrome and Edge 105+, Firefox 121+; an older browser only
+       misses that room). */
+    .details {
+      position: fixed; z-index: 40;
+      top: auto; left: 0; right: 0; bottom: 0;
+      width: auto; max-width: none; max-height: 62svh;
+      border-radius: var(--radius-big) var(--radius-big) 0 0; border-width: 1px 0 0;
+      background: var(--surface);
+      -webkit-backdrop-filter: none; backdrop-filter: none;
+      box-shadow: 0 -16px 44px rgba(0, 0, 0, 0.2);
+      animation: phone-sheet-in 0.45s var(--ease-out);
+    }
+    body:has(#details:not([hidden])) { padding-bottom: 62svh; }
+    .details-grip { display: none; }
+    .details-scroll {
+      padding: 1.1rem calc(1.2rem + env(safe-area-inset-right)) calc(1.4rem + env(safe-area-inset-bottom))
+               calc(1.2rem + env(safe-area-inset-left));
+    }
+    .details-title { font-size: 1.7rem; }
+    .follow-form { justify-content: flex-end; }
+    .follow-form input { flex: 1 1 10rem; min-height: 44px; }
+
+    /* Chat, People and Timeline: the whole width, one field per row when the field and its
+       buttons do not fit side by side. */
+    .chat { padding: 16px; }
+    .chat-top { flex-wrap: wrap; gap: 0.5rem; }
+    .ask-form { flex-wrap: wrap; justify-content: flex-end; gap: 0.5rem; }
+    .ask-form input { flex: 1 1 8rem; padding: 0.7rem 1.1rem; }
+    .ask-form .pill { padding: 0.6rem 1.2rem; }
+    .ask-form .mic-button { width: 48px; height: 48px; }
+    .msg { max-width: 92%; }
+    .person-form, .photo-progress { padding: 18px; }
+    .timeline-tools input { flex-basis: 100%; min-height: 44px; }
+    .moment { padding-right: 0.9rem; }
+    .footer { padding-left: max(var(--gutter), env(safe-area-inset-left)); padding-right: max(var(--gutter), env(safe-area-inset-right)); }
+
+    /* Full view: the picture fills the screen (the whole width, centred), with black room above
+       and below it. That room is used: the greetings sit just above the picture, a caption under
+       the buttons, Look for just under the picture, the pills at the bottom. While the picture
+       is as wide as the screen its height is 100vw / --ratio (the script sets --ratio on the
+       frame), which places them; min() and max() keep them on the screen for a tall picture.
+       The details are a sheet over the lower half, solid because it lies over the video; the
+       picture moves into the upper half so the sheet does not cover it. */
+    .stage.is-full .banners {
+      top: max(calc(env(safe-area-inset-top) + 10px + 2.6rem + 8px), calc(50% - 50vw / var(--ratio) - 3.6rem));
+      padding: 0 10px;
+    }
+    .stage.is-full .caption {
+      top: calc(env(safe-area-inset-top) + 10px + 2.6rem + 10px); bottom: auto;
+      max-width: calc(100% - 20px);
+    }
+    .stage.is-full .finder {
+      top: min(calc(50% + 50vw / var(--ratio) + 12px),
+               calc(100% - var(--frame-edge) - 2.9rem - 36px - 52px - 8px - env(safe-area-inset-bottom)));
+      bottom: auto;
+      flex-wrap: wrap; align-items: flex-start;
+    }
+    .stage.is-full .find-chips { flex-wrap: wrap; }
+    .stage.is-full .codes { max-width: calc(100% - 2 * clamp(10px, 1.4vw, 22px)); }
+    .stage.is-full.has-details { grid-template-columns: minmax(0, 1fr); }
+    .stage.is-full.has-details .frame { height: 50%; }
+    /* With the sheet open the picture goes to the top of the upper half (its box is exactly the
+       picture, so a click is still measured right) and Look for lies under it. */
+    .stage.is-full.has-details .frame img {
+      top: env(safe-area-inset-top); bottom: auto;
+      height: min(calc(100vw / var(--ratio)), calc(100% - env(safe-area-inset-top)));
+    }
+    .stage.is-full.has-details .finder {
+      top: min(calc(env(safe-area-inset-top) + 100vw / var(--ratio) + 12px), calc(100% - 52px - 8px));
+    }
+    .stage.is-full .details {
+      position: absolute; z-index: 4;
+      top: 50%; left: 0; right: 0; bottom: 0;
+      width: auto; max-width: 100%; height: auto;
+      border-radius: var(--radius-big) var(--radius-big) 0 0; border-width: 1px 0 0;
+      background: var(--surface);          /* fully solid: the pills under it do not show through */
+      box-shadow: 0 -18px 50px rgba(0, 0, 0, 0.35);
+      animation: phone-sheet-in 0.5s var(--ease-out);
+    }
+    .stage.is-full .details-scroll { padding-left: calc(1.2rem + env(safe-area-inset-left)); }
+  }
+  @keyframes phone-sheet-in { from { opacity: 0; transform: translateY(32px); } to { opacity: 1; transform: none; } }
+
+  @media (max-height: 450px) and (orientation: landscape) {
+    :root { --nav-space: calc(62px + env(safe-area-inset-top)); }
+
+    /* On its side the screen is low: a slimmer bar, a short hero and a video that fits. */
+    .nav {
+      top: calc(6px + env(safe-area-inset-top));
+      width: calc(100% - 2 * var(--gutter) - env(safe-area-inset-left) - env(safe-area-inset-right));
+      padding: 4px 4px 4px 1.1rem;
+    }
+    .status-item.wide { display: none; }
+    .hero { min-height: 0; padding: calc(var(--nav-space) + 5vh) 0 0.5rem; }
+    .hero-title { font-size: clamp(2.6rem, 7vw, 4.2rem); }
+    .hero-line { margin-top: 0.6rem; font-size: 1.15rem; }
+    .hero-actions { margin-top: 1.2rem; }
+    .section { padding: 36px 0; }
+    .section-head { margin-bottom: 18px; }
+    main {
+      padding-left: max(var(--gutter), env(safe-area-inset-left));
+      padding-right: max(var(--gutter), env(safe-area-inset-right));
+    }
+    .frame { width: min(100%, calc((100svh - var(--nav-space) - 16px) * var(--ratio))); }
+    .messages { height: min(60svh, 520px); }
+
+    /* Full view on its side: the picture is as high as the screen and the room beside it is
+       small. The details keep their column at the right (a sheet over the lower part would
+       cover most of a picture this low). The greetings keep left of the four buttons; Look for
+       (left) and the codes (right) share the strip above the pills, and an open code card stays
+       below the buttons, scrolling when it is taller than the room. */
+    .stage.is-full .banners { padding-right: calc(4 * 2.6rem + 3 * 0.55rem + 24px); }
+    .stage.is-full .finder { max-width: 58%; flex-wrap: wrap-reverse; }   /* the chips in a row above the field */
+    .stage.is-full .finder-button.stop { order: 1; }
+    .stage.is-full .find-chips { order: 2; flex: 1 1 100%; }
+    .stage.is-full .codes { max-width: 40%; }
+    .stage.is-full .code-card {
+      max-height: calc(100svh - 2.6rem - 2.9rem - 36px - 84px - env(safe-area-inset-top) - env(safe-area-inset-bottom));
+      overflow-y: auto; overscroll-behavior: contain;
+    }
   }
 </style>
 </head>

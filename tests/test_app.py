@@ -1336,6 +1336,7 @@ def fake_main(monkeypatch, tmp_path):
     monkeypatch.setattr(app_module, "load_config", lambda: config)
     monkeypatch.setattr(app_module, "CAMERA_FILE", str(tmp_path / "camera.json"))   # never the real one
     monkeypatch.setattr(app_module, "already_serving", lambda host, port: False)   # 5000 may really be in use
+    monkeypatch.setattr(app_module, "take_start_lock", lambda path: object())     # no lock file, nothing held
     monkeypatch.setattr(app_module, "Pipeline", FakePipeline)
     monkeypatch.setattr(app_module, "Assistant", fake_assistant)
     monkeypatch.setattr(app_module.Flask, "run", fake_run)

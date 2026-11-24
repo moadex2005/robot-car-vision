@@ -75,6 +75,8 @@ VIDEO_POLL_SECONDS = 0.01        # how often /video looks for a new frame
 VIDEO_KEEPALIVE_SECONDS = 1.0    # with no new frame for this long, the last one is sent again, so a
                                  # closed browser tab is noticed and its server thread ends
 PORT_CHECK_SECONDS = 0.5         # how long main() waits for an answer on the port before starting
+START_LOCK_FILE = "car_vision.lock"   # beside the log file; held by the copy of the program that runs
+STILL_STARTING = "The demo is still starting. Wait for the page to open; it takes about a minute."
 BOUNDARY = "frame"               # separates the pictures in the MJPEG stream
 BROWSER_DELAY_SECONDS = 1.0      # --open waits this long, so the server is up first
 LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
@@ -1224,6 +1226,43 @@ def already_serving(host: str, port: int, timeout: float = PORT_CHECK_SECONDS) -
         return False
 
 
+def take_start_lock(path: Path) -> Any | None:
+    """Hold a lock on this file for as long as the program runs. None: another copy holds it.
+
+    The port is only taken once the models are loaded, so during the first minute a
+    second copy cannot see the first one on the port; it sees this lock instead.
+    Windows lets go of the lock by itself when the program ends, however it ends,
+    so a crash never leaves a lock behind. Where msvcrt is missing (not Windows)
+    the file is opened but not locked, so the program still starts.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = open(path, "a+b")                    # for writing, without emptying it
+    try:
+        import msvcrt
+    except ImportError:
+        return handle
+    try:
+        handle.seek(0)                            # every copy locks the same first byte
+        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+    except OSError:                               # another copy holds it
+        handle.close()
+        return None
+    return handle
+
+
+def show_running_copy(url: str, serving: bool, open_page: bool) -> int:
+    """What a second start does while another copy holds the start lock: the exit code."""
+    if not serving:                               # the other copy is still loading its models
+        print(STILL_STARTING)
+        return 1
+    print(f"The demo page is already running at {url}.")
+    if not open_page:
+        return 1
+    print("Opening it in the browser.")
+    webbrowser.open(url)
+    return 0
+
+
 def open_browser_soon(url: str) -> None:
     timer = threading.Timer(BROWSER_DELAY_SECONDS, webbrowser.open, args=(url,))
     timer.daemon = True
@@ -1245,7 +1284,13 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Cannot start: {error}")
         return 1
     url = f"http://{host}:{port}/"
-    if already_serving(host, port):                   # checked before any model is loaded
+    # Both checks come before any model is loaded. The lock stays held while this local
+    # variable lives, that is until main() returns (or the program dies).
+    start_lock = take_start_lock(log_file.parent / START_LOCK_FILE)
+    serving = already_serving(host, port)
+    if start_lock is None:                            # another copy of this program runs
+        return show_running_copy(url, serving, args.open)
+    if serving:                                       # another program answers on the port
         print(f"The demo page is already running at {url} (or another program uses port {port}). "
               "Open that address, or stop the other copy first.")
         return 1

@@ -400,7 +400,7 @@ def test_a_lasting_error_stops_the_hosted_voice_for_the_visit():
 
 def test_the_test_button_speaks_with_whichever_voice_is_chosen():
     page = page_text()
-    assert 'voiceTest.addEventListener("click", () => speak(TEST_SPEECH, "test"));' in page
+    assert 'voiceTest.addEventListener("click", () => speak(testSentence(), "test"));' in page   # M26: or Arabic
 
 
 # ---- the page: hosted listening --------------------------------------------------------------

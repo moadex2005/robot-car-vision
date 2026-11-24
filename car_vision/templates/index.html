@@ -290,6 +290,8 @@
   .voice-box .hosted-voice { display: grid; gap: 0.85rem; margin-top: 0.85rem; }
   .hosted-note { margin: -0.4rem 0 0; color: var(--grey); font-size: 0.8rem; line-height: 1.4; }
   .hosted-note:empty { display: none; }
+  /* Shown only while the answers are in Arabic: the voice that speaks them, or that none can. */
+  .voice-arabic-note { margin: 0.5rem 0 0; color: var(--grey); font-size: 0.8rem; line-height: 1.4; }
 
   /* During a conversation the microphone that drives it shows its state with a ring that
      does not move: solid while listening, dotted while thinking, double while speaking.
@@ -1601,6 +1603,8 @@
     <button class="pill secondary small" id="voiceTest" type="button">Test</button>
   </div>
   <p class="camera-help" id="voiceHelp">The most natural voices are the "Natural" ones in Microsoft Edge; they need the internet.</p>
+  <!-- Shown only while the answers are in Arabic (the EN / ع switch). -->
+  <p class="voice-arabic-note" id="voiceArabicNote" aria-live="polite" hidden></p>
 </div>
 
 <main>
@@ -4041,6 +4045,7 @@ languageButton.addEventListener("click", () => {
   arabicWanted = !arabicWanted;
   store(LANGUAGE_KEY, arabicWanted ? "ar" : null);
   showLanguage();
+  voiceLanguageChanged();              // speaking and listening stop: they were in the old language
 });
 showLanguage();
 
@@ -4413,6 +4418,10 @@ fullButton.addEventListener("click", toggleFullView);
 //     ends it as a last resort; the speaking mark on the Voice button follows that record.
 //   - Browsers refuse to speak before the visitor has clicked or pressed a key on the page,
 //     so a remembered "voice on" starts only after that first click or key.
+//   - ARABIC (M26). Each piece is judged by itself: a piece with more Arabic than Latin letters
+//     (isArabicPiece) is spoken by the browser with its best Arabic voice, never by the hosted voice and never
+//     by a voice that is not Arabic. Without an Arabic voice the piece is left out (it is still
+//     shown) and the talk goes on. See "Arabic pieces" below.
 //
 // LISTENING (window.SpeechRecognition, or webkitSpeechRecognition in Chrome and Edge).
 //   - A microphone button starts one listening session (hearing). The words appear in the
@@ -4423,6 +4432,7 @@ fullButton.addEventListener("click", toggleFullView);
 //   - While listening the page does not speak, so it never hears itself.
 //   - In Edge and Chrome the sound goes to Microsoft's or Google's speech service; the
 //     privacy line says so.
+//   - The browser listens for Egyptian Arabic while the answers are in Arabic, else for English.
 //
 // CONVERSATION (the switch in the voice box). One press, then: listen, send, speak the answer,
 //   listen again, until the visitor stops it. A small state machine on top of the two halves,
@@ -4441,6 +4451,9 @@ fullButton.addEventListener("click", toggleFullView);
 const VOICE_KEY = "voice";               // "on" or "off" in localStorage
 const VOICE_NAME_KEY = "voiceName";      // the chosen voice's name; none means automatic
 const TEST_SPEECH = "Hello. This is the voice the page will use.";
+const ARABIC_TEST_SPEECH = "مرحباً. هذا هو الصوت الذي ستستخدمه الصفحة.";   // the same, while answers are in Arabic
+const NO_ARABIC_VOICE = "This browser has no Arabic voice, so Arabic answers are shown but not spoken. " +
+                        "Microsoft Edge has Arabic voices.";
 const MAX_SPOKEN_CHARS = 600;  // about 40 seconds of speech
 const PIECE_CHARS = 160;       // pieces this short finish before Chrome's silence on long ones
 const SPEAK_DELAY_MS = 60;     // after cancel(), the next speak() waits this long
@@ -4452,7 +4465,7 @@ const CAPTION_MS = 12000;      // an answer stays in the caption this long
 const CAPTION_WAIT_MS = 45000; // "Thinking ..." is given up after this long
 
 const voiceButton = byId("voiceButton"), voiceBox = byId("voiceBox"), voiceSwitch = byId("voiceSwitch");
-const voiceChoice = byId("voiceChoice"), voiceTest = byId("voiceTest");
+const voiceChoice = byId("voiceChoice"), voiceTest = byId("voiceTest"), voiceArabicNote = byId("voiceArabicNote");
 const askMic = byId("askMic"), followMic = byId("followMic"), stageMic = byId("stageMic");
 const caption = byId("caption"), captionQuestion = byId("captionQuestion"), captionAnswer = byId("captionAnswer");
 const micButtons = [askMic, followMic, stageMic];
@@ -4491,7 +4504,7 @@ function findSpeech() {
 let speech = findSpeech();
 let voiceWanted = readStored(VOICE_KEY) === "on";   // off by default
 let pageTouched = false;       // the visitor has clicked or pressed a key: browsers allow speech now
-let talking = null;            // { kind, pieces, next, voice, timer, tick, hosted } while the page says something
+let talking = null;            // { kind, pieces, next, voice, arabicVoice, timer, tick, hosted } while the page says something
 let voiceWaiters = [];         // what waits for the list of voices to arrive
 let voicesWaitedFor = false;   // the empty list was waited for once already: never again
 
@@ -4527,25 +4540,31 @@ function readableLines(text) {
                        .replace(/[|#]+/g, " ")                            // tables, headings; "_" stays (snake_case)
                        .replace(/\s+/g, " ").trim())
     .filter(Boolean)
-    .map((line) => (/[.!?:;,]$/.test(line) ? line : line + "."));         // a short pause after each line
+    // A short pause after each line. The Arabic question mark, comma, semicolon and full stop
+    // (؟ ، ؛ ۔) are pauses already: no "." is added after them.
+    .map((line) => (/[.!?:;,؟،؛۔]$/.test(line) ? line : line + "."));
 }
 
+// "؟" (question) and "۔" (full stop) end an Arabic sentence as ".", "!" and "?" end an English one.
 function cutAtSentence(text, limit) {
   if (text.length <= limit) return text;
   const head = text.slice(0, limit + 1);
-  const end = Math.max(head.lastIndexOf(". "), head.lastIndexOf("! "), head.lastIndexOf("? "));
+  const end = Math.max(head.lastIndexOf(". "), head.lastIndexOf("! "), head.lastIndexOf("? "),
+                       head.lastIndexOf("؟ "), head.lastIndexOf("۔ "));
   if (end > limit / 3) return head.slice(0, end + 1);
   const space = head.lastIndexOf(" ", limit);
   return head.slice(0, space > 0 ? space : limit) + ".";
 }
 
 // Whole sentences, joined into pieces of at most PIECE_CHARS; a very long sentence is cut at a comma or a space.
+// An Arabic sentence ends at "؟" or "۔" too, and a long one is cut at the Arabic comma "،" or semicolon "؛".
 function speechPieces(text) {
   const pieces = [];
-  for (const sentence of text.split(/(?<=[.!?])\s+/)) {
+  for (const sentence of text.split(/(?<=[.!?؟۔])\s+/)) {
     let rest = sentence.trim();
     while (rest.length > PIECE_CHARS) {
-      let cut = rest.lastIndexOf(", ", PIECE_CHARS);
+      let cut = Math.max(rest.lastIndexOf(", ", PIECE_CHARS), rest.lastIndexOf("، ", PIECE_CHARS),
+                         rest.lastIndexOf("؛ ", PIECE_CHARS));
       if (cut < PIECE_CHARS / 2) cut = rest.lastIndexOf(" ", PIECE_CHARS);
       if (cut <= 0) cut = PIECE_CHARS;
       pieces.push(rest.slice(0, cut + 1).trim());
@@ -4553,10 +4572,21 @@ function speechPieces(text) {
     }
     if (!rest) continue;
     const last = pieces.length - 1;
-    if (last >= 0 && pieces[last].length + rest.length < PIECE_CHARS) pieces[last] += " " + rest;
-    else pieces.push(rest);
+    if (last >= 0 && pieces[last].length + rest.length < PIECE_CHARS && sameLanguage(pieces[last], rest)) {
+      pieces[last] += " " + rest;
+    } else {
+      pieces.push(rest);
+    }
   }
   return pieces;
+}
+
+// Only sentences in the same language (isArabicPiece) are joined into one piece: an English and
+// an Arabic sentence stay two pieces, so each is said by a voice of its own language (speakPiece).
+// A "sentence" without letters, such as "١." in an Arabic list, has no language and joins either.
+function sameLanguage(one, other) {
+  const hasLetters = (text) => /\p{L}/u.test(text);
+  return !hasLetters(one) || !hasLetters(other) || isArabicPiece(one) === isArabicPiece(other);
 }
 
 // ---- choosing the voice ----
@@ -4592,6 +4622,31 @@ function chosenVoice() {
   return voices.find((voice) => voice.name === wanted) || voices[0] || null;
 }
 
+// Arabic voices (M26), for the Arabic pieces of an answer. There is no choice in the box for them:
+// the best one is used.
+const isArabicVoice = (voice) => /^ar(-|$)/.test(langOf(voice));
+
+// Lower is better, in the same groups as voiceRank: "Natural" voices, then "Online" or "Google"
+// ones, then any other Arabic voice; within each group ar-EG (Egypt), then ar-SA, then the rest.
+function arabicVoiceRank(voice) {
+  const name = asText(voice.name), lang = langOf(voice);
+  const group = /natural/i.test(name) ? 0 : /online/i.test(name) || /^google/i.test(name) ? 1 : 2;
+  const region = lang === "ar-eg" ? 0 : lang === "ar-sa" ? 1 : 2;
+  return group * 3 + region;
+}
+
+// The best Arabic voice the browser offers, or null. Never a voice in another language.
+function arabicVoice() {
+  let voices = [];
+  try {
+    voices = asList(speech.synth.getVoices());
+  } catch (error) {
+    voices = [];
+  }
+  const arabic = voices.filter((voice) => voice && isArabicVoice(voice));
+  return arabic.sort((a, b) => arabicVoiceRank(a) - arabicVoiceRank(b))[0] || null;
+}
+
 // "Microsoft Aria Online (Natural) - English (United States)" is shown as
 // "Aria, English (United States) · natural, online".
 function plainVoiceName(voice) {
@@ -4609,6 +4664,7 @@ function shortVoiceName(voice) {
 }
 
 function drawVoiceChoices() {
+  drawArabicVoiceNote();               // also without the browser's speech: then no Arabic voice is said
   if (!speech) return;
   const voices = englishVoices();
   const auto = new Option(voices.length ? "Automatic: " + shortVoiceName(voices[0]) : "Automatic: the browser's own voice", "auto");
@@ -4617,9 +4673,20 @@ function drawVoiceChoices() {
   voiceChoice.value = voices.some((voice) => voice.name === wanted) ? wanted : "auto";   // gone: automatic
 }
 
+// The quiet line under the list of voices, shown only while the answers are in Arabic: which
+// voice says them, or that this browser cannot. Drawn with the list (also when the voices arrive
+// late) and when the language switch is pressed.
+function drawArabicVoiceNote() {
+  voiceArabicNote.hidden = answerLanguage() !== "ar";
+  if (voiceArabicNote.hidden) return;
+  const voice = speech ? arabicVoice() : null;
+  setText(voiceArabicNote, voice ? "Arabic answers are spoken by: " + shortVoiceName(voice) : NO_ARABIC_VOICE);
+}
+
 // The list of voices arrived (or changed): the voice box is drawn again, and speech that
 // waited for the list goes on.
 function voicesChanged() {
+  voicesChangedOnce = true;            // an Arabic piece no longer waits for late voices
   drawVoiceChoices();
   const waiting = voiceWaiters;
   voiceWaiters = [];
@@ -4676,7 +4743,9 @@ function speak(text, kind) {
   if (!pieces.length) return;
   hush();
   // `hosted`: the hosted voice's parts for this talk (hostedParts), or null for the browser's voice.
-  const talk = { kind, pieces, next: 0, voice: null, timer: 0, tick: 0, hosted: speaksHosted() ? hostedParts() : null };
+  // `arabicVoice`: the voice of the Arabic piece being said (speakArabicPiece), else null.
+  const talk = { kind, pieces, next: 0, voice: null, arabicVoice: null, timer: 0, tick: 0,
+                 hosted: speaksHosted() ? hostedParts() : null };
   talking = talk;
   talk.tick = setTimeout(() => startTalking(talk), SPEAK_DELAY_MS);   // the next tick after cancel()
 }
@@ -4707,10 +4776,19 @@ function startTalking(talk) {
 // One piece at a time: the next one is handed over only when this one has ended.
 function speakPiece(talk) {
   if (talking !== talk) return;
+  if (isArabicPiece(talk.pieces[talk.next])) {
+    speakArabicPiece(talk);            // with either voice switched on: see "Arabic pieces" below
+    return;
+  }
   if (talk.hosted) {
     playHostedPiece(talk);             // the hosted voice: see "the hosted voice" below
     return;
   }
+  browserSpeaksPiece(talk);
+}
+
+// The browser's own voice says the piece talk.next; its "end" moves the talk on (utterance).
+function browserSpeaksPiece(talk) {
   try {
     speech.synth.speak(utterance(talk, talk.pieces[talk.next]));
   } catch (error) {
@@ -4720,13 +4798,23 @@ function speakPiece(talk) {
   waitForTalk(talk, START_WAIT_MS);
 }
 
+// An English piece gets the answer's English voice; an Arabic piece the Arabic voice that
+// speakArabicPiece found, in that voice's own language (ar-EG, ar-SA, ...).
 function utterance(talk, piece) {
   const voice = talk.voice;
   const words = new speech.Utterance(piece);
-  if (voice) words.voice = voice;
-  words.lang = voice && voice.lang ? asText(voice.lang) : "en-US";   // English, whatever the system's language
+  if (isArabicPiece(piece)) {
+    words.voice = talk.arabicVoice;
+    words.lang = asText(talk.arabicVoice.lang);
+  } else {
+    if (voice) words.voice = voice;
+    words.lang = voice && voice.lang ? asText(voice.lang) : "en-US";   // English, whatever the system's language
+  }
   let ended = false;
-  words.onstart = () => pieceStarted(talk, piece);
+  words.onstart = () => {
+    pieceStarted(talk, piece);
+    fetchNextHostedPiece(talk);        // after an Arabic piece in a hosted talk: its next piece, early
+  };
   words.onend = () => {
     if (ended || talking !== talk) return;           // an "end" fired twice moves on only once
     ended = true;
@@ -5064,6 +5152,76 @@ hostedListenSwitch.addEventListener("change", () => {
   drawVoicePrivacy();
 });
 
+// ---- Arabic pieces: an Arabic voice, or silence ----
+//
+// speakPiece sends here every piece that is Arabic (isArabicPiece), whichever voice says the
+// English pieces. The page's own English sentences stay English. An Arabic piece:
+//   - is said by the browser's own speech with the best Arabic voice it lists (arabicVoice),
+//     looked for when the list of voices is there (whenVoicesListed, as for English);
+//   - is never sent to the hosted voice, which speaks English only and would refuse it;
+//   - is left out when the browser has no Arabic voice (or no speech of its own): a voice that
+//     is not Arabic reads Arabic as noise, and silence is better. The answer is still shown, and
+//     the talk goes on to the next piece and ends as usual, so the speaker button and a
+//     conversation still get its end.
+//   - Some browsers list their English voices first and their Arabic ones a moment later. When
+//     an Arabic piece finds none and the list has not changed since the page loaded, it waits
+//     once, at most VOICES_WAIT_MS, for the list to change, and looks again (whenArabicVoicesMayCome).
+
+let voicesChangedOnce = false;     // the browser has changed its list of voices since the page loaded
+let arabicVoicesWaitedFor = false; // an Arabic piece has waited for late voices once: never again
+
+// For speaking only: a piece is Arabic when its Arabic letters outnumber its Latin ones; a tie
+// is English. (textDirection's one-third rule is for the layout.) So "I can see محمد now, on the
+// left." stays English, and an Arabic answer that names an "iPhone 15 Pro" stays Arabic.
+function isArabicPiece(piece) {
+  const letters = asText(piece).match(/\p{L}/gu) || [];
+  const arabic = letters.filter((letter) => /\p{Script=Arabic}/u.test(letter)).length;
+  const latin = letters.filter((letter) => /\p{Script=Latin}/u.test(letter)).length;
+  return arabic > latin;
+}
+
+function speakArabicPiece(talk) {
+  if (talking !== talk) return;        // hushed meanwhile (while late voices were waited for)
+  if (!speech) {
+    pieceEnded(talk);                  // no speech of the browser's own: shown, not spoken
+    return;
+  }
+  waitForTalk(talk, VOICES_WAIT_MS + START_WAIT_MS);   // the last resort, as in startTalking
+  whenVoicesListed(() => {
+    if (talking !== talk) return;
+    talk.arabicVoice = arabicVoice();
+    if (talk.arabicVoice) {
+      browserSpeaksPiece(talk);        // its start fetches the next hosted piece (utterance)
+    } else if (!voicesChangedOnce && !arabicVoicesWaitedFor) {
+      whenArabicVoicesMayCome(() => speakArabicPiece(talk));   // the Arabic voices may come a moment later
+    } else {
+      pieceEnded(talk);                // no Arabic voice in this browser: shown, not spoken
+    }
+  });
+}
+
+// Run `then` once the list of voices changes, or after VOICES_WAIT_MS; only once in this visit.
+function whenArabicVoicesMayCome(then) {
+  arabicVoicesWaitedFor = true;
+  let done = false;
+  const go = () => {
+    if (done) return;
+    done = true;
+    then();
+  };
+  voiceWaiters.push(go);
+  setTimeout(go, VOICES_WAIT_MS);
+}
+
+// With the hosted voice on, its next (English) piece is fetched once the browser has started
+// this Arabic one, as playClip does when a hosted piece starts playing: no gap between the two,
+// and nothing fetched for a piece that a hush stopped before it was heard.
+function fetchNextHostedPiece(talk) {
+  const next = talk.next + 1;
+  if (talking !== talk || !talk.hosted || next >= talk.pieces.length) return;
+  if (!isArabicPiece(talk.pieces[next])) hostedClip(talk, next);
+}
+
 // ---- the Voice button and its box ----
 
 function setVoiceWanted(on) {
@@ -5108,7 +5266,21 @@ document.addEventListener("pointerdown", (event) => {
 });
 voiceSwitch.addEventListener("change", () => setVoiceWanted(voiceSwitch.checked));
 voiceChoice.addEventListener("change", () => store(VOICE_NAME_KEY, voiceChoice.value === "auto" ? null : voiceChoice.value));
-voiceTest.addEventListener("click", () => speak(TEST_SPEECH, "test"));   // a test speaks even with voice off
+voiceTest.addEventListener("click", () => speak(testSentence(), "test"));   // a test speaks even with voice off
+
+// The Test button's sentence, in the language of the answers.
+function testSentence() {
+  return answerLanguage() === "ar" ? ARABIC_TEST_SPEECH : TEST_SPEECH;
+}
+
+// The language switch was pressed: what is being said, heard or talked about is in the old
+// language, so all of it stops at once (as Escape stops it), and the Arabic note is drawn again.
+function voiceLanguageChanged() {
+  if (conversation) conversationNext(conversation, "stop");
+  cancelListening();
+  hush();
+  drawArabicVoiceNote();
+}
 
 // Browsers allow speech only after the visitor has done something on the page.
 function notePageTouched() {
@@ -5217,6 +5389,7 @@ function startListening(button, target, conv) {
   try {
     recognizer = new Recognition();
     recognizer.lang = "en-US";
+    if (answerLanguage() === "ar") recognizer.lang = "ar-EG";   // Arabic questions while the answers are Arabic
     recognizer.interimResults = true;  // words appear while they are heard
     recognizer.continuous = false;     // one sentence, then the browser ends
     recognizer.maxAlternatives = 1;
@@ -5816,6 +5989,10 @@ const CONVERSATION_PAUSED = "The conversation was paused. Press the microphone t
 const SILENT_ERRORS = ["no-speech", "no-match"];   // these mean nothing was heard, not a failure
 // Only the whole sentence: "Thank you." ends it, "how do I stop the car" is a question.
 const STOP_WORDS = /^(stop|goodbye|bye|that's all|thank you)[.!?]*$/;
+// The same in Arabic, also only as the whole sentence: stop, stop, enough, enough, thanks, thanks, goodbye.
+const ARABIC_STOP_WORDS = ["توقف", "قف", "خلاص", "كفاية", "شكراً", "شكرا", "مع السلامة"];
+const ARABIC_VOWEL_MARKS = /[\u064B-\u0652\u0670]/g;   // tanween, fatha, damma, kasra, shadda, sukun, small alef
+const DIRECTION_MARKS = /[\u200E\u200F\u061C]/g;    // invisible left-to-right, right-to-left and Arabic letter marks
 const STOP_REPLY = "Okay.";
 const CONVERSATION_LABELS = {
   listening: "Conversation: listening. Press to stop",
@@ -5829,7 +6006,15 @@ let conversation = null;       // the running conversation, or null (idle)
 
 function isStopWords(words) {
   const cleaned = asText(words).toLowerCase().replace(/[\u2018\u2019]/g, "'").replace(/\s+/g, " ").trim();
-  return STOP_WORDS.test(cleaned);
+  return STOP_WORDS.test(cleaned) || isArabicStopWords(cleaned);
+}
+
+// "شكراً!" and "شكرا" are the same: the vowel marks, invisible direction marks and a final
+// ".", "!", "؟" or "،" do not count.
+function isArabicStopWords(cleaned) {
+  const bare = (text) => text.replace(ARABIC_VOWEL_MARKS, "").replace(DIRECTION_MARKS, "").trim()
+    .replace(/[.!؟،]+$/, "").trim();
+  return ARABIC_STOP_WORDS.some((words) => bare(words) === bare(cleaned));
 }
 
 function startConversation(button, makeTarget) {

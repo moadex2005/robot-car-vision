@@ -5316,14 +5316,20 @@ hostedListenSwitch.addEventListener("change", () => {
 let voicesChangedOnce = false;     // the browser has changed its list of voices since the page loaded
 let arabicVoicesWaitedFor = false; // an Arabic piece has waited for late voices once: never again
 
-// For speaking only: a piece is Arabic when its Arabic letters outnumber its Latin ones; a tie
-// is English. (textDirection's one-third rule is for the layout.) So "I can see محمد now, on the
-// left." stays English, and an Arabic answer that names an "iPhone 15 Pro" stays Arabic.
+// For speaking only (textDirection's one-third rule is for the layout): a piece is Arabic when
+// it has more Arabic words than Latin ones, or when it has an Arabic word and starts with one.
+// Words are counted, not letters, because product names are long: "هذا هاتف iPhone 15 Pro من
+// شركة Apple." has more Latin letters than Arabic ones and is still an Arabic sentence. So
+// "I can see محمد عبد الرحمن now, on the left." and "Name: Omar أحمد." stay English, and
+// "الهاتف: Samsung Galaxy A54" stays Arabic.
 function isArabicPiece(piece) {
-  const letters = asText(piece).match(/\p{L}/gu) || [];
-  const arabic = letters.filter((letter) => /\p{Script=Arabic}/u.test(letter)).length;
-  const latin = letters.filter((letter) => /\p{Script=Latin}/u.test(letter)).length;
-  return arabic > latin;
+  const words = asText(piece).match(/[\p{L}\p{M}]+/gu) || [];
+  const isArabicWord = (word) => /\p{Script=Arabic}/u.test(word);
+  const isLatinWord = (word) => !isArabicWord(word) && /\p{Script=Latin}/u.test(word);
+  const arabic = words.filter(isArabicWord).length;
+  const latin = words.filter(isLatinWord).length;
+  const first = words.find((word) => isArabicWord(word) || isLatinWord(word));
+  return arabic > latin || (arabic > 0 && isArabicWord(first));
 }
 
 function speakArabicPiece(talk) {

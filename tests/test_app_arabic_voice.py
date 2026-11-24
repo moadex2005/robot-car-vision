@@ -35,7 +35,8 @@ def test_each_piece_is_judged_by_itself():
     page = page_text()
     rule = body(page, "function isArabicPiece(")
     assert "/\\p{Script=Arabic}/u" in rule and "/\\p{Script=Latin}/u" in rule
-    assert "return arabic > latin;" in rule                   # a tie is English
+    assert "/[\\p{L}\\p{M}]+/gu" in rule                      # words are counted, not letters
+    assert "return arabic > latin || (arabic > 0 && isArabicWord(first));" in rule
     assert "textDirection(" not in rule                       # the one-third rule is for the layout
     piece = body(page, "function speakPiece(")
     # The Arabic check comes before the hosted voice is even looked at.
@@ -105,23 +106,41 @@ def test_sentences_of_two_languages_are_never_one_piece():
 
 
 def arabic_for_speaking(text):
-    """isArabicPiece in Python: more Arabic letters than Latin letters."""
-    letters = [char for char in text if unicodedata.category(char).startswith("L")]
-    arabic = sum(1 for char in letters if unicodedata.name(char, "").startswith("ARABIC"))
-    latin = sum(1 for char in letters if unicodedata.name(char, "").startswith("LATIN"))
-    return arabic > latin
+    """isArabicPiece in Python: more Arabic words than Latin ones, or an Arabic word first."""
+    def kind(word):
+        names = [unicodedata.name(char, "") for char in word]
+        if any(name.startswith("ARABIC") for name in names):
+            return "arabic"
+        return "latin" if any(name.startswith("LATIN") for name in names) else ""
+
+    words, word = [], ""
+    for char in text + " ":
+        if unicodedata.category(char)[0] in "LM":
+            word += char
+        elif word:
+            words.append(word)
+            word = ""
+    kinds = [kind(word) for word in words if kind(word)]
+    arabic, latin = kinds.count("arabic"), kinds.count("latin")
+    return arabic > latin or (arabic > 0 and kinds[0] == "arabic")
 
 
 @pytest.mark.parametrize("text, arabic", [
     ("Name: Omar أحمد.", False),                                      # an Arabic name in an English sentence
     ("I can see محمد عبد الرحمن now, on the left.", False),           # the page's own find sentence
     ("I can see سارة, on the right.", False),
-    ("ab سب", False),                                                  # a tie is English
+    ("ab سب", False),                                                  # a tie that starts in English
+    ("سب ab", True),                                                   # a tie that starts in Arabic
     ("إنه هاتف iPhone 15 Pro رائع.", True),                            # an Arabic answer with a product name
+    ("هذا هاتف iPhone 15 Pro من شركة Apple.", True),                   # more Latin letters, still Arabic
+    ("• الهاتف: Samsung Galaxy A54", True),                            # one Arabic word, but it comes first
+    ("Samsung Galaxy A54 هو هاتف جيد جداً.", True),                    # starts with a name, mostly Arabic
     ("هذه سيارة روبوت صغيرة تعمل بالبطارية.", True),
     ("I can see the keys, on the left.", False),
+    ("42.", False),
+    ("", False),
 ])
-def test_a_piece_is_arabic_only_when_arabic_letters_outnumber_latin_ones(text, arabic):
+def test_a_piece_is_arabic_by_its_words_not_its_letters(text, arabic):
     assert arabic_for_speaking(text) is arabic
 
 

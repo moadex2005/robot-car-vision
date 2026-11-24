@@ -329,7 +329,7 @@ def test_discovered_things_carry_a_small_tag_on_their_pills():
     assert 'button.append(make("span", "thing-name"), tag, make("span", "thing-detail"));' in item
     draw = between(page, "function drawObjects(", "\n}\n")
     assert 'button.classList.toggle("is-discovered", thing.discovered);' in draw
-    assert 'button.querySelector(".thing-tag").hidden = !thing.discovered;' in draw
+    assert "tag.hidden = !thing.discovered && !thing.maybe;" in draw        # M20: the same tag says "maybe" too
     assert 'const DISCOVERED_TAG = "discovered";' in page
     tag_css = css_rule(page, ".thing-tag")
     assert "backdrop-filter" not in tag_css and "animation" not in tag_css

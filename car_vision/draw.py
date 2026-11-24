@@ -58,9 +58,12 @@ def color_for(label: str) -> tuple[int, int, int]:
     return int(blue), int(green), int(red)
 
 
-def caption_for(detection: Detection) -> str:
-    """Text such as 'person 0.87 #3'; no '#' part when there is no track number."""
-    text = f"{detection.label} {detection.confidence:.2f}"
+def caption_for(detection: Detection, unsure: bool = False) -> str:
+    """Text such as 'person 0.87 #3'; no '#' part when there is no track number.
+
+    An unsure find (a "maybe") gets a '?' after its label: 'window? 0.26 #100003'.
+    """
+    text = f"{detection.label}{'?' if unsure else ''} {detection.confidence:.2f}"
     if detection.track_id is not None:
         text += f" #{detection.track_id}"
     return text
@@ -69,45 +72,53 @@ def caption_for(detection: Detection) -> str:
 OUTLINE_FILL = 0.2          # how strongly the shape is tinted with its colour (0 = not at all)
 
 
-def draw_detections(frame: np.ndarray, detections: Iterable[Detection], wanted: Iterable[int] = ()) -> None:
+def draw_detections(frame: np.ndarray, detections: Iterable[Detection], wanted: Iterable[int] = (),
+                    unsure: Iterable[Detection] = ()) -> None:
     """Draw a rectangle, or the thing's own outline when it has one, and a caption for each detection.
 
     Boxes whose track number is in `wanted` (the things the visitor is looking
     for) get a thicker line in one fixed bright colour, so they stand out.
+    The detections in `unsure` (a "maybe": perhaps what the visitor is looking
+    for; the very objects, so one without a track number counts too) get that
+    colour with the ordinary line, no tint inside, and a '?' in the caption.
     """
-    wanted = set(wanted)
+    wanted, unsure = set(wanted), list(unsure)
     scale = drawing_scale(frame.shape[1])
     thickness = scaled(BOX_THICKNESS, scale)
     for detection in detections:
         x1, y1, x2, y2 = detection.box
-        if detection.track_id is not None and detection.track_id in wanted:
+        maybe = any(detection is find for find in unsure)
+        if maybe:
+            color, line = WANTED_COLOR, thickness
+        elif detection.track_id is not None and detection.track_id in wanted:
             color, line = WANTED_COLOR, scaled(WANTED_THICKNESS, scale)
         else:
             color, line = color_for(detection.label), thickness
         if len(detection.outline) >= 3:
-            draw_outline(frame, detection.outline, color, line)
+            draw_outline(frame, detection.outline, color, line, tint=0.0 if maybe else OUTLINE_FILL)
         else:
             cv2.rectangle(frame, (x1, y1), (x2, y2), color, line)
-        draw_caption(frame, caption_for(detection), x1, y1, color)
+        draw_caption(frame, caption_for(detection, unsure=maybe), x1, y1, color)
 
 
 def draw_outline(frame: np.ndarray, outline: Sequence[tuple[int, int]],
-                 color: tuple[int, int, int], thickness: int) -> None:
+                 color: tuple[int, int, int], thickness: int, tint: float = OUTLINE_FILL) -> None:
     """Tint the inside of the shape with its colour, then draw its edge as a closed smooth line.
 
-    Only the part of the frame under the shape's bounding rectangle is blended,
-    so many shapes on a large frame stay cheap. Points outside the frame are fine.
+    `tint` says how strongly (0: not at all). Only the part of the frame under
+    the shape's bounding rectangle is blended, so many shapes on a large frame
+    stay cheap. Points outside the frame are fine.
     """
     points = np.array(outline, dtype=np.int32).reshape(-1, 1, 2)
     height, width = frame.shape[:2]
     x, y, w, h = cv2.boundingRect(points)
     left, top = max(x, 0), max(y, 0)
     right, bottom = min(x + w, width), min(y + h, height)
-    if OUTLINE_FILL > 0 and right > left and bottom > top:
+    if tint > 0 and right > left and bottom > top:
         area = frame[top:bottom, left:right]            # a view: writing to it writes to the frame
         inside = np.zeros(area.shape[:2], dtype=np.uint8)
         cv2.fillPoly(inside, [points - np.array([left, top], dtype=np.int32)], 255)
-        tinted = cv2.addWeighted(area, 1 - OUTLINE_FILL, np.full_like(area, color), OUTLINE_FILL, 0)
+        tinted = cv2.addWeighted(area, 1 - tint, np.full_like(area, color), tint, 0)
         cv2.copyTo(tinted, inside, area)                # only where the mask is set; fast
     cv2.polylines(frame, [points], True, color, thickness, cv2.LINE_AA)
 

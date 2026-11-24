@@ -667,6 +667,7 @@ OPEN_SETTINGS = {
     **SETTINGS,
     "open_model": "yoloe-26s-seg.pt",
     "open_confidence": 0.25,
+    "open_maybe_confidence": 0.2,
     "open_every_n_frames": 3,
 }
 
@@ -757,7 +758,8 @@ def test_constructing_the_open_detector_imports_nothing_heavy():
     code = (
         "import sys, numpy as np\n"
         "from car_vision.detector import OpenDetector\n"
-        "settings = dict(open_model='m.pt', models_dir='models', open_confidence=0.25, image_size=640,\n"
+        "settings = dict(open_model='m.pt', models_dir='models', open_confidence=0.25, open_maybe_confidence=0.2,\n"
+        "                image_size=640,\n"
         "                device='auto', tracker='bytetrack.yaml')\n"
         "d = OpenDetector(settings)\n"
         "d.set_names([])\n"
@@ -948,7 +950,7 @@ def test_detect_passes_the_open_settings_and_never_half_precision():
     call = model.calls[0]
     assert call["persist"] is True
     assert call["tracker"] == "bytetrack.yaml"
-    assert call["conf"] == pytest.approx(0.25)
+    assert call["conf"] == pytest.approx(0.2)             # open_maybe_confidence: the pipeline sorts sure from maybe
     assert call["imgsz"] == 320
     assert call["device"] == "cpu"
     assert call["verbose"] is False

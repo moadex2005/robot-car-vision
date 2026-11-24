@@ -66,8 +66,34 @@ Looking for things by a typed name (search()):
   adds them to the everyday detections; what it returns is what the whole page
   sees (the list, the clicks, the photos, the assistant and the memory).
 
-A named find on a person is always dropped (on_a_person), and words for
-people are refused as names: a person keeps their own box, name and rules.
+A named find on a person (M20): a person is never treated as an object.
+- A find that is the person (same_as_person) is dropped: the name is only
+  another word for them.
+- A find on a person (on_person: glasses, a shirt, keys held in front of the
+  body) is shown, listed and counted as found, but it is never a thing of its
+  own: a click on it is a click on that person (nothing is sent), and the
+  memory is not told about it.
+- Anything else, like a window behind a person, is an ordinary find; but a
+  named find that touches a person or face box is remembered without a picture.
+Every face box, known or unknown, counts as a person box too (someone close to
+the camera often has a face and no person box). Being the person or on a
+person sticks to the find's track (PersonGuard), so a frame where the person
+detector misses them never turns the find into an object. Every cut-out of an
+object or an area has the faces in it covered with grey (cover_faces) before
+it is shown or sent.
+Words for people are refused as names: a person keeps their own box, name and rules.
+
+Sure and maybe (M20): the open detector gives everything at or above
+detector.open_maybe_confidence. A find at or above open_confidence is found,
+and its track stays sure while it goes on. A name of the visitor's own with no
+sure find gets its single most confident other find as a "maybe": shown with
+a "?", never told to the memory. Discovered names never get a maybe.
+
+A known person's name in Look for (M20): a typed name that is an enrolled
+person's (their name, their folder name or their first name, see
+people_among) is never given to the open detector. That person is found when
+their face is recognised in view; their person box is drawn in the wanted
+colour. People are still only ever recognised by their enrolled face.
 
 Auto-discover (discover()): a look thread of its own asks the lookout
 (lookout.Lookout, a small hosted model) every few seconds what is in view,
@@ -96,11 +122,12 @@ fakes and need no camera, model or graphics card.
 from __future__ import annotations
 
 import logging
+import math
 import re
 import threading
 import time
 import unicodedata
-from collections.abc import Callable, Hashable, Sequence
+from collections.abc import Callable, Collection, Hashable, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -111,7 +138,7 @@ import numpy as np
 from car_vision import draw
 from car_vision.codes import Code, CodeReader, checked_settings, web_link
 from car_vision.config import ConfigError, require, resolve_path, section
-from car_vision.detector import Detector
+from car_vision.detector import Detector, open_limits
 from car_vision.enroll import encode_people, save_enrolment
 from car_vision.faces import FaceMatcher, FaceMemory, Person
 from car_vision.people import person_folder
@@ -183,7 +210,11 @@ NAMED_ID_OFFSET = 100_000                # named track numbers are kept apart fr
 NAMED_HOLD_SECONDS = 1.0                 # a named find stays on screen this long without being seen again
 REPLACE_OVERLAP = 0.6                    # a named find replaces an everyday box it overlaps more than this
 PLACES = ("left", "middle", "right")     # the thirds of the picture
-PERSON_OVERLAP = 0.3                     # a named find overlapping a person box more than this is dropped
+SAME_AS_PERSON = 0.6                     # a named find overlapping a person box more than this ...
+MOSTLY_INSIDE = 0.8                      # ... with this share of its box inside it, is that person
+ON_PERSON_SHARE = 0.5                    # a named find with this share of its box inside a person box is on them
+FACE_COVER_MARGIN = 0.2                  # a face in a cut-out is covered by its box grown 20 % on each side ...
+FACE_COVER_GREY = 128                    # ... filled with this plain mid-grey
 NO_PEOPLE = ("Looking for people by name is not supported. "
              "People the camera knows are recognised by their face.")
 # Words for people and parts of people, one list: a name with one of them is refused, because
@@ -255,6 +286,8 @@ class View:
     detections: tuple[Detection, ...]
     faces: tuple[RecognizedFace, ...]
     epoch: int = 0                      # the track-number epoch this frame's track numbers belong to
+    on_person: tuple[Detection, ...] = ()   # the named finds on a person: a click on one is a click on them
+    maybes: tuple[Detection, ...] = ()      # the named finds the finder is not sure of
 
     @property
     def size(self) -> tuple[int, int]:
@@ -297,12 +330,22 @@ class PhotoSession:
 
 
 @dataclass(frozen=True)
+class PersonName:
+    """A name the visitor typed that is an enrolled person's: who it means and how it is shown."""
+
+    typed: str                         # as typed (cleaned), e.g. "mohamed"
+    shown: str                         # as enrolled, e.g. "Mohamed Adel"
+    person_ids: tuple[str, ...]        # everyone it means: several people can share a first name
+
+
+@dataclass(frozen=True)
 class Search:
     """What the open detector is asked to find: the visitor's own names, then discovered ones.
 
     Replaced as a whole, under the pipeline's lock. Every new list of names is
     a new round; the newest round wins. `state` is that of the open detector
-    for this round's names.
+    for this round's names. The own names that are enrolled people's (`people`)
+    are never given to the open detector: the recognised faces answer them.
     """
 
     names: tuple[str, ...] = ()        # the visitor's own names (status()["search"] reports only these)
@@ -311,11 +354,21 @@ class Search:
     round: int = 0                     # goes up with every new list of names; the newest round wins
     discovered: tuple[str, ...] = ()   # discovered names given to the open detector after the own ones
     own_ready: bool = False            # the own names were ready already (only discovered ones changed)
+    people: tuple[PersonName, ...] = ()    # the own names that are enrolled people's
+    # How each own name is shown, fixed when the visitor searched: enrolling someone later may
+    # change how a name is answered, never its text (the page knows the search by it).
+    shown: tuple[str, ...] = ()
+
+    @property
+    def object_names(self) -> tuple[str, ...]:
+        """The own names that are not people's: these go to the open detector."""
+        typed = {person.typed for person in self.people}
+        return tuple(name for name in self.names if name not in typed)
 
     @property
     def finder_names(self) -> tuple[str, ...]:
         """Every name the open detector is given: the own ones first."""
-        return self.names + self.discovered
+        return self.object_names + self.discovered
 
 
 @dataclass(frozen=True)
@@ -403,6 +456,8 @@ class Pipeline:
         self.open_every_n_frames: int = require(self._detector_settings, "open_every_n_frames", int)
         if self.open_every_n_frames < 1:
             raise ConfigError("detector.open_every_n_frames must be 1 or more")
+        # A named find at or above this is sure; the open detector checks and uses the maybe limit.
+        self.sure_confidence, _maybe = open_limits(self._detector_settings)
         memory_settings = section(config, "memory")
         memory_file = require(memory_settings, "file", (str, type(None)))     # empty: no memory
         keep_days = float(require(memory_settings, "keep_days", (int, float)))
@@ -502,6 +557,8 @@ class Pipeline:
         self._lost_line: str | None = None     # the line already drawn on the last frame, if any
         self._frame_size: tuple[int, int] | None = None   # (width, height) of the last frame worked on
         self._named = NamedFinds()             # the named finds kept on screen between runs
+        self._guard = PersonGuard()            # which named tracks are on a person, or are one
+        self._sure_tracks: set[int] = set()    # named tracks that once reached open_confidence
         self._named_tick = 0                   # ready frames of this search round so far
         self._open_tracks_stale = False        # the open detector must start its tracks again first
         self._pictures = PictureTimer(min_seconds) if keep_pictures else None
@@ -675,8 +732,10 @@ class Pipeline:
 
     def status(self) -> dict[str, Any]:
         """Everything the page shows besides the video, as plain JSON-ready values."""
-        snapshot = self._state.snapshot()
         with self._lock:
+            # The loop writes the detections under this lock too, so the entries and what marks
+            # them (found, maybe, on a person) always come from the same frame.
+            snapshot = self._state.snapshot()
             on_screen = list(self._on_screen)
             error = self._error
             source = self._source
@@ -688,11 +747,15 @@ class Pipeline:
             looked = search.names and self._looked_for == search.names
             discovery, discovered_names = self._discovery, self._discovered_list_locked()
             codes, code_frame_size = self._shown_codes
+            view = self._view
+        on_person, maybes = (view.on_person, view.maybes) if view is not None else ((), ())
         # While the stream is down nothing new is seen, so old sightings are left out,
         # and so is everything seen by the camera used before the last switch.
         seen_at = snapshot.detections_at
         fresh = seen_at > switched_at and time.monotonic() - seen_at <= STALE_SECONDS
         found, discovered = (found, discovered) if fresh else ((), ())
+        wanted_people = {person_id for person in search.people for person_id in person.person_ids}
+        people_seen = people_in_view(search.people, snapshot.detections, snapshot.faces) if fresh else {}
         return {
             "source": source.source,
             "camera": {"on": camera_on},
@@ -705,15 +768,17 @@ class Pipeline:
             "recognition": self._recognizer is not None,
             "notes": list(self._notes),
             "people": self._people(snapshot) if fresh else [],
-            "objects": objects_in_view(snapshot, self._person_card, found, discovered) if fresh else [],
+            "objects": objects_in_view(snapshot, self._person_card, found, discovered, maybes=maybes,
+                                       on_person=on_person, wanted_people=wanted_people) if fresh else [],
             "codes": codes_in_view(codes, code_frame_size) if fresh else [],
             "reactions": [{"kind": r.kind, "text": r.text} for r in on_screen] if fresh else [],
             "error": error,
-            "search": search_status(search, found, snapshot.frame_size[0], bool(looked and fresh)),
+            "search": search_status(search, found, snapshot.frame_size[0], bool(looked and fresh),
+                                    maybes, people_seen),
             "discover": self._discover_status(discovery, discovered_names, search),
         }
 
-    def search(self, names: Sequence[str]) -> None:
+    def search(self, names: Sequence[str]) -> tuple[str, ...]:
         """Look for these things by name from now on; [] stops looking.
 
         1 to 6 names, each 1 to 40 letters, digits, spaces, hyphens or
@@ -723,14 +788,20 @@ class Pipeline:
         names happen in a thread of its own (status()["search"]["state"] says
         how far it is), and a newer search replaces an older one that has not
         finished. The finds of names no longer looked for vanish at once.
+
+        An enrolled person's name is answered by their recognised face, never
+        by the open detector. Returns the names as status()["search"]["names"]
+        shows them: a person's name as they were enrolled.
         """
         wanted = clean_names(names)
         with self._lock:
             if wanted != self._search.names:
                 self._looked_for = None         # the page waits until the finder has looked for these
             work = self._new_finder_round_locked(wanted, self._search.discovered, always=True)
+            shown = shown_names(self._search)
         log.info("Looking for %d thing(s)", len(wanted))     # the names themselves stay off the log
         self._prepare_in_background(work)
+        return shown
 
     def discover(self, on: bool) -> None:
         """Switch auto-discover on or off (it is off at start-up).
@@ -764,7 +835,9 @@ class Pipeline:
 
         x and y are the click as fractions of the picture (0 to 1 from the
         top-left corner). With a track_id the point is not used. Called from
-        the web server's threads while the loop runs.
+        the web server's threads while the loop runs. The photo of an object or
+        an area may go to the assistant, so every face in it is covered first
+        (see cover_faces); the page shows that same covered photo.
         """
         with self._lock:
             view = self._view                   # the view is never changed, only replaced
@@ -774,7 +847,8 @@ class Pipeline:
         if found is None:
             return None
         target, box = found
-        photo = self._encode(cut_out(view.frame, photo_box(box, view.size)))
+        frame = view.frame if target.kind == "person" else cover_faces(view.frame, [face.box for face in view.faces])
+        photo = self._encode(cut_out(frame, photo_box(box, view.size)))
         return replace(target, photo=photo, epoch=view.epoch)
 
     def scene_photo(self, max_side: int = 960) -> bytes | None:
@@ -815,6 +889,7 @@ class Pipeline:
             recognizer.reload_known(enrolment.people, matcher)
             self._faces_changed.set()
             self._update_enrolment_notes(enrolment.people, matcher)
+            self._search_with_new_people()
         log.info("Enrolled again: %d face vectors for %d people",
                  len(enrolment.ids), len(matcher.person_ids))
         return notes
@@ -918,14 +993,41 @@ class Pipeline:
         # The order of names already given is kept, so the open detector is not set again
         # (and its tracks restarted) just because the lookout named things in another order.
         extra = in_earlier_order(names_after(own, discovered), old.discovered)
-        if not always and (own, extra) == (old.names, old.discovered):
+        people = people_among(own, self._enrolled_people())
+        if not always and (own, extra, people) == (old.names, old.discovered, old.people):
             return None
-        own_ready = bool(own) and own == old.names and (
-            old.state == "ready" or (old.state == "loading" and old.own_ready))
-        finder = own + extra
-        self._search = Search(own, "loading" if finder else "off", "", old.round + 1, extra, own_ready)
+        new = Search(own, "off", "", old.round + 1, extra, people=people)
+        keep_text = not always and own == old.names and len(old.shown) == len(own)
+        new = replace(new, shown=old.shown if keep_text else tuple(text_of(new, name) for name in own))
+        objects = new.object_names
+        # People's names alone need no open detector: such a search is ready at once.
+        own_ready = bool(own) and (not objects or (objects == old.object_names and (
+            old.state == "ready" or (old.state == "loading" and old.own_ready))))
+        finder = new.finder_names
+        state = "loading" if finder else ("ready" if own else "off")
+        self._search = replace(new, state=state, own_ready=own_ready)
         self._drop_finds_not_wanted_locked(finder)
         return self._search.round if finder else None
+
+    def _enrolled_people(self) -> dict[str, str]:
+        """Everyone the recogniser knows by face: person id -> their name as enrolled.
+        Empty with recognition off."""
+        if self._recognizer is None:
+            return {}
+        people = {}
+        for person_id in sorted(self._recognizer.enrolled_ids()):
+            card = self._recognizer.person(person_id)
+            people[person_id] = card.name if card is not None else person_id   # as the video shows them
+        return people
+
+    def _search_with_new_people(self) -> None:
+        """After enrolling: the next frame answers the own names with the new list of people."""
+        with self._lock:
+            objects = self._search.object_names
+            work = self._new_finder_round_locked(self._search.names, self._search.discovered)
+            if self._search.object_names != objects:
+                self._looked_for = None         # a name went back to the finder: the page waits until it looked
+        self._prepare_in_background(work)
 
     def _prepare_in_background(self, work: int | None) -> None:
         """Start the thread that gives the open detector the names of round `work`."""
@@ -1521,15 +1623,19 @@ class Pipeline:
             self._memory.remember(check.faces, detections, now)
             self._take_photo_if_ready(frame, check.boxes, now, generation)
         faces = self._memory.current(detections, now)
-        shown, named, looked = self._add_named_finds(frame, detections, search, now)
+        shown, named, looked = self._add_named_finds(frame, detections, faces, search, now)
+        looked = looked or (bool(search.names) and not search.object_names)   # people's names: the faces answer
         # The visitor's own finds stand out in yellow; discovered ones are drawn like everyday ones.
         found = tuple(find for find in named if label_among(find.label, search.names))
         discovered = tuple(find for find in named if not label_among(find.label, search.names))
+        maybes = tuple(find for find in found if not is_sure(find, self.sure_confidence, self._sure_tracks))
+        on_people = tuple(find for find in named if self._guard.on_a_person(find, now))
         codes = self._codes_to_show(frame, index, now)
 
         # The boxes are drawn on a copy: the camera's own frame goes into the view untouched.
         drawn = frame.copy()
-        draw.draw_detections(drawn, shown, wanted=[d.track_id for d in found if d.track_id is not None])
+        draw.draw_detections(drawn, shown, wanted=wanted_tracks(found, maybes, shown, faces, search),
+                             unsure=maybes)
         draw.draw_faces(drawn, faces)
         draw.draw_codes(drawn, codes)
         jpeg = self._encode(drawn)
@@ -1547,14 +1653,15 @@ class Pipeline:
             self._jpeg = jpeg
             epoch = self._epoch
             memory_epochs = (self._everyday_epoch, self._named_epoch)
-            self._view = View(frame, tuple(shown), tuple(faces), epoch)
+            self._view = View(frame, tuple(shown), tuple(faces), epoch, on_people, maybes)
             self._found, self._discovered = found, discovered
             self._shown_codes = (codes, (width, height))
             if looked and current.names == search.names:
                 self._looked_for = search.names     # the page may answer now: the finder has looked
             self._on_screen = list(on_screen)
             phone_not_heard = self._picture is None
-        self._remember(frame, shown, faces, named, memory_epochs)
+        self._remember(frame, shown, faces, named, memory_epochs, untold=maybes + on_people,
+                       people=self._guard.recent_boxes(now))
         self._last_drawn = drawn
         self._drawn_from = generation
         came_back = self._lost_line is not None and index > 0    # this camera had dropped out and returned
@@ -1605,13 +1712,16 @@ class Pipeline:
 
     # ---- the named finds (the loop thread) -------------------------------------
 
-    def _add_named_finds(self, frame: np.ndarray, detections: list[Detection], search: Search,
-                         now: float) -> tuple[list[Detection], tuple[Detection, ...], bool]:
+    def _add_named_finds(self, frame: np.ndarray, detections: list[Detection], faces: Sequence[RecognizedFace],
+                         search: Search, now: float) -> tuple[list[Detection], tuple[Detection, ...], bool]:
         """The frame's detections with the named finds added, the named finds alone, and
         whether the open detector ran on this frame.
 
-        With no names to look for, the detections themselves and no finds: nothing is copied.
+        Every person box and every face box (known or unknown) counts as a person
+        (see PersonGuard). With no names to look for, the detections themselves
+        and no finds: nothing is copied.
         """
+        self._guard.see(people_boxes(detections) + [face.box for face in faces], now)
         names = search.finder_names
         if not names:
             if self._named.finds:
@@ -1620,7 +1730,11 @@ class Pipeline:
         if self._named.search_round != search.round:
             self._named_tick = 0                    # a new list of names runs on its first ready frame
         fresh = self._detect_named(frame, search)
-        shown, self._named = merge_named(detections, self._named, fresh, search.round, now, names)
+        shown, self._named = merge_named(detections, self._named, fresh, search.round, now, names,
+                                         own=search.names, sure=self.sure_confidence, sure_tracks=self._sure_tracks,
+                                         is_person=lambda find: self._guard.is_the_person(find, now))
+        self._sure_tracks = sure_tracks_now(self._named.detections, self._sure_tracks, self.sure_confidence)
+        self._guard.forget_ended(self._named.detections, now)
         return shown, self._named.detections, fresh is not None
 
     def _detect_named(self, frame: np.ndarray, search: Search) -> list[Detection] | None:
@@ -1654,6 +1768,8 @@ class Pipeline:
     def _forget_named_finds(self) -> None:
         """A new camera or frame size: the finds kept on screen and the open detector's tracks are old."""
         self._named = NamedFinds()
+        self._guard = PersonGuard()                 # the boxes and tracks it knows are in the old pixels
+        self._sure_tracks = set()
         self._named_tick = 0
         self._open_tracks_stale = True
 
@@ -1707,11 +1823,16 @@ class Pipeline:
 
     def _remember(self, frame: np.ndarray, detections: Sequence[Detection],
                   faces: Sequence[RecognizedFace], named: Sequence[Detection],
-                  epochs: tuple[int, int]) -> None:
+                  epochs: tuple[int, int], untold: Sequence[Detection] = (),
+                  people: Sequence[Box] = ()) -> None:
         """Tell the sighting log about every tracked detection of this frame.
 
         `named` are the named finds among the detections; `epochs` is
         (everyday epoch, named epoch). See memory_key for why they are kept apart.
+        `untold` are never told: the maybes, and the finds on a person (a person
+        is never an object, so nothing on them gets a picture). A named find
+        whose box touches any of the person and face boxes in `people` (a window
+        behind someone) is remembered without a picture.
         A memory error is logged once and the video goes on.
         """
         sightings = self._sightings
@@ -1724,13 +1845,17 @@ class Pipeline:
             for index, detection in enumerate(detections):
                 if detection.track_id is None:
                     continue                        # untracked: it cannot be followed, so not remembered
-                key = memory_key(detection, any(detection is find for find in named), *epochs)
+                if any(detection is find for find in untold):
+                    continue
+                is_named = any(detection is find for find in named)
+                key = memory_key(detection, is_named, *epochs)
                 person = detection.label == "person"
+                no_picture = person or (is_named and touches_any(detection.box, people))
                 face = owners.get(index)
                 sightings.seen(key, "person" if person else "object", detection.label,
                                self._person_card(face).name if face is not None else None,
                                place_of(detection.box, width), float(detection.confidence), wall_clock,
-                               None if person else self._picture_for(key, detection.box, frame, now))
+                               None if no_picture else self._picture_for(key, detection.box, frame, now))
             if self._pictures is not None:
                 self._pictures.forget_old(now)
         except Exception:
@@ -1988,22 +2113,32 @@ CardOf = Callable[[RecognizedFace], Person]     # the person a known face belong
 
 
 def objects_in_view(snapshot: WorldSnapshot, card_of: CardOf, found: Sequence[Detection] = (),
-                    discovered: Sequence[Detection] = ()) -> list[dict[str, Any]]:
+                    discovered: Sequence[Detection] = (), maybes: Sequence[Detection] = (),
+                    on_person: Sequence[Detection] = (), wanted_people: Collection[str] = ()) -> list[dict[str, Any]]:
     """One entry per detection: people first, then by label, then by track number.
 
     The entries of the detections in `found` (the visitor's own search) also
     get "found": true, those in `discovered` (auto-discover) "discovered": true.
+    A find in `maybes` also gets "maybe": true, one in `on_person` "on_person": true.
+    A person box whose recognised face is one of `wanted_people` (ids the
+    visitor typed a name of) gets "found": true too.
     """
     owners = face_owners(snapshot.detections, snapshot.faces)
     order = sorted(range(len(snapshot.detections)), key=lambda i: list_order(snapshot.detections[i]))
     entries = []
     for i in order:
-        detection = snapshot.detections[i]
-        entry = object_entry(detection, owners.get(i), snapshot.frame_size, card_of)
+        detection, face = snapshot.detections[i], owners.get(i)
+        entry = object_entry(detection, face, snapshot.frame_size, card_of)
         if any(detection is find for find in found):
             entry["found"] = True
+            if any(detection is find for find in maybes):
+                entry["maybe"] = True
         elif any(detection is find for find in discovered):
             entry["discovered"] = True
+        elif face is not None and face.person_id in wanted_people:
+            entry["found"] = True
+        if any(detection is find for find in on_person):
+            entry["on_person"] = True
         entries.append(entry)
     return entries
 
@@ -2150,26 +2285,180 @@ def boxed_every_day(name: str) -> bool:
         folded.endswith("es") and folded[:-2] in words)
 
 
-def on_a_person(find: Detection, people: Sequence[Box]) -> bool:
-    """True when a named find sits on an everyday person box: its centre inside one, or overlapping
-    one by more than PERSON_OVERLAP. Such a find is dropped, so a person keeps their own box,
-    name and rules (no picture kept, nothing sent when clicked)."""
+# ---- a named find and the people in view (M20) ----------------------------------------
+#
+# A person is never treated as an object: nothing that is a person or on a person gets a
+# picture in the memory, and a click on it never sends a cut-out anywhere.
+
+
+def people_boxes(detections: Sequence[Detection]) -> list[Box]:
+    """The boxes of the everyday person detections."""
+    return [detection.box for detection in detections if detection.label == "person"]
+
+
+def share_inside(box: Box, other: Box) -> float:
+    """How much of `box` lies inside `other`: 0.0 apart (or only touching), 1.0 wholly inside."""
+    inside = box_area((max(box[0], other[0]), max(box[1], other[1]), min(box[2], other[2]), min(box[3], other[3])))
+    whole = box_area(box)
+    return inside / whole if whole > 0 else 0.0
+
+
+def touches_any(box: Box, others: Sequence[Box]) -> bool:
+    """True when the box overlaps any of the others at all (only touching edges is not overlapping)."""
+    return any(share_inside(box, other) > 0 for other in others)
+
+
+def same_as_person(find: Detection, people: Sequence[Box]) -> bool:
+    """True when the find is a person: it overlaps a person (or face) box by more than
+    SAME_AS_PERSON and at least MOSTLY_INSIDE of the find lies inside that box.
+    Such a find is dropped: its name is only another word for that person. A wall
+    that holds a person is not the person (see on_person)."""
+    return any(overlap(find.box, box) > SAME_AS_PERSON and share_inside(find.box, box) >= MOSTLY_INSIDE
+               for box in people)
+
+
+def on_person(find: Detection, people: Sequence[Box]) -> bool:
+    """True when at least ON_PERSON_SHARE of the find's box lies inside one person (or face) box
+    (glasses, a shirt, keys held in front of the body). It is shown, but never a thing of
+    its own: a click on it is a click on that person, and the memory is not told about it."""
+    return any(share_inside(find.box, box) >= ON_PERSON_SHARE for box in people)
+
+
+def wearer_of(find: Detection, detections: Sequence[Detection],
+              faces: Sequence[RecognizedFace] = ()) -> int | None:
+    """The position of the person box the find is on, or None.
+
+    Inside two overlapping people it belongs to the one whose face box holds
+    the find's centre; with no such face, to the one holding most of it, and
+    of those that tie, the smallest box.
+    """
+    shares = {index: share_inside(find.box, d.box) for index, d in enumerate(detections) if d.label == "person"}
+    candidates = [index for index, share in shares.items() if share >= ON_PERSON_SHARE]
+    if not candidates:
+        return None
     middle = centre(find.box)
-    return any(contains(box, *middle) or overlap(find.box, box) > PERSON_OVERLAP for box in people)
+    by_face = [body_of(face, detections, faces) for face in faces if contains(face.box, *middle)]
+    by_face = [index for index in by_face if index in candidates]
+    best = max(shares[index] for index in candidates)
+    tied = by_face or [index for index in candidates if shares[index] == best]
+    return min(tied, key=lambda index: box_area(detections[index].box))
+
+
+def face_under(find: Detection, faces: Sequence[RecognizedFace]) -> RecognizedFace | None:
+    """The face the find is on (its box holds the find's centre, or most of the find), the smallest; or None."""
+    middle = centre(find.box)
+    under = [face for face in faces
+             if contains(face.box, *middle) or share_inside(find.box, face.box) >= ON_PERSON_SHARE]
+    return min(under, key=lambda face: box_area(face.box), default=None)
+
+
+class PersonGuard:
+    """Keeps a person from turning into an object on a frame where the detector misses them.
+
+    Only the loop thread uses it. It remembers the person and face boxes of the
+    last NAMED_HOLD_SECONDS, and which named tracks have been the person or on
+    a person. Such a track stays so until it ends or until NAMED_HOLD_SECONDS
+    have passed since a person or face box was last under it, whichever is later.
+
+    A find without a track number cannot be followed, so it is judged against
+    the boxes of the last NAMED_HOLD_SECONDS, and conservatively: it is on a
+    person when it overlaps any of those boxes at all.
+    """
+
+    def __init__(self) -> None:
+        self._boxes: list[tuple[Box, float]] = []           # (person or face box, when it was seen)
+        self._tracks: dict[int, tuple[str, float]] = {}     # track -> ("is" or "on", when a box was last under it)
+
+    def see(self, boxes: Sequence[Box], now: float) -> None:
+        """This frame's person and face boxes."""
+        self._boxes = [(box, seen) for box, seen in self._boxes if now - seen <= NAMED_HOLD_SECONDS]
+        self._boxes += [(box, now) for box in boxes]
+
+    def recent_boxes(self, now: float) -> list[Box]:
+        """The person and face boxes seen in the last NAMED_HOLD_SECONDS."""
+        return [box for box, seen in self._boxes if now - seen <= NAMED_HOLD_SECONDS]
+
+    def is_the_person(self, find: Detection, now: float) -> bool:
+        """True when the find is a person (see same_as_person), now or earlier in its track."""
+        if same_as_person(find, self.recent_boxes(now)):
+            self._mark(find, "is", now)
+            return True
+        return self._kind(find) == "is"
+
+    def on_a_person(self, find: Detection, now: float) -> bool:
+        """True when the find is on a person (see on_person), now or earlier in its track."""
+        boxes = self.recent_boxes(now)
+        if find.track_id is None:
+            return touches_any(find.box, boxes)
+        if on_person(find, boxes):
+            self._mark(find, "on", now)
+            return True
+        return self._kind(find) is not None
+
+    def forget_ended(self, live: Sequence[Detection], now: float) -> None:
+        """Forget the marks of tracks that ended (not among `live`) and had no person under them for a while."""
+        tracks = {find.track_id for find in live}
+        self._tracks = {track: mark for track, mark in self._tracks.items()
+                        if track in tracks or now - mark[1] <= NAMED_HOLD_SECONDS}
+
+    def _kind(self, find: Detection) -> str | None:
+        mark = self._tracks.get(find.track_id) if find.track_id is not None else None
+        return mark[0] if mark is not None else None
+
+    def _mark(self, find: Detection, kind: str, now: float) -> None:
+        if find.track_id is None:
+            return
+        if self._kind(find) == "is":
+            kind = "is"                             # once the person, always the person
+        self._tracks[find.track_id] = (kind, now)
+
+
+def is_sure(find: Detection, sure: float, sure_tracks: Collection[int] = ()) -> bool:
+    """True when the find is at or above `sure`, or its track once was (a dip does not make it a maybe)."""
+    return find.confidence >= sure or (find.track_id is not None and find.track_id in sure_tracks)
+
+
+def sure_tracks_now(finds: Sequence[Detection], earlier: Collection[int], sure: float) -> set[int]:
+    """The tracks among `finds` that are sure now or were before; the others ended."""
+    return {find.track_id for find in finds if find.track_id is not None and is_sure(find, sure, earlier)}
+
+
+def sure_or_maybe(finds: Sequence[tuple[Detection, float]], own: Sequence[str], sure: float,
+                  sure_tracks: Collection[int] = ()) -> tuple[tuple[Detection, float], ...]:
+    """The finds to show: every sure one (see is_sure), and for each of the visitor's `own`
+    names with no sure find its single most confident other find (a "maybe").
+
+    The rest are dropped, so a discovered name never gets a maybe.
+    """
+    maybes = []
+    for name in own:
+        mine = [item for item in finds if label_among(item[0].label, [name])]
+        if mine and not any(is_sure(item[0], sure, sure_tracks) for item in mine):
+            maybes.append(max(mine, key=lambda item: item[0].confidence))
+    return tuple(item for item in finds
+                 if is_sure(item[0], sure, sure_tracks) or any(item is maybe for maybe in maybes))
 
 
 def merge_named(everyday: Sequence[Detection], kept: NamedFinds, fresh: Sequence[Detection] | None,
-                search_round: int, now: float, names: Sequence[str] = ()) -> tuple[list[Detection], NamedFinds]:
+                search_round: int, now: float, names: Sequence[str] = (), own: Sequence[str] = (),
+                sure: float = 0.0, sure_tracks: Collection[int] = (),
+                is_person: Callable[[Detection], bool] | None = None) -> tuple[list[Detection], NamedFinds]:
     """Add the named finds to the frame's everyday detections. What it returns is what
     the whole page sees: the list, the clicks, the photos, the assistant and the memory.
 
     `fresh` is what the open detector found on this frame, or None when it did
-    not run; `names` are the names it is given in this round. The rules:
+    not run; `names` are the names it is given in this round, `own` the
+    visitor's own names among them, `sure` the open_confidence and
+    `sure_tracks` the tracks that once reached it. `is_person` says whether a
+    find is a person (the pipeline's PersonGuard); without it, same_as_person
+    on this frame's person boxes. The rules:
     - named track numbers are kept apart from the everyday ones (NAMED_ID_OFFSET is added);
     - a find stays on screen until it has not been seen for NAMED_HOLD_SECONDS;
     - from an earlier round only the finds of names still looked for are kept;
-    - a find on an everyday person box is dropped (see on_a_person);
-    - a find replaces an everyday box it overlaps by more than REPLACE_OVERLAP.
+    - a find that is a person is dropped; a find on a person stays (the pipeline marks it);
+    - below `sure` only one "maybe" per own name stays (see sure_or_maybe);
+    - a find replaces an everyday box it overlaps by more than REPLACE_OVERLAP,
+      but never a person box: a wall behind someone does not hide them.
 
     Returns the detections to show and the finds to keep for the next frame.
     """
@@ -2177,12 +2466,17 @@ def merge_named(everyday: Sequence[Detection], kept: NamedFinds, fresh: Sequence
         (find, seen_at) for find, seen_at in kept.finds if label_among(find.label, names))
     if fresh is not None:
         finds = renewed_finds(finds, [named_apart(detection) for detection in fresh], now)
-    people = [detection.box for detection in everyday if detection.label == "person"]
+    people = people_boxes(everyday)
+
+    def dropped(find: Detection) -> bool:
+        return is_person(find) if is_person is not None else same_as_person(find, people)
+
     finds = tuple((find, seen_at) for find, seen_at in finds
-                  if now - seen_at <= NAMED_HOLD_SECONDS and not on_a_person(find, people))
+                  if now - seen_at <= NAMED_HOLD_SECONDS and not dropped(find))
+    finds = sure_or_maybe(finds, own, sure, sure_tracks)
     named = [find for find, _seen_at in finds]
-    shown = [detection for detection in everyday
-             if all(overlap(detection.box, find.box) <= REPLACE_OVERLAP for find in named)]
+    shown = [detection for detection in everyday if detection.label == "person"
+             or all(overlap(detection.box, find.box) <= REPLACE_OVERLAP for find in named)]
     return shown + named, NamedFinds(search_round, finds)
 
 
@@ -2237,27 +2531,60 @@ def place_of(box: Box, width: int) -> str:
     return PLACES[max(third, 0)]
 
 
-def search_status(search: Search, found: Sequence[Detection], width: int, seen: bool = True) -> dict[str, Any]:
+def search_status(search: Search, found: Sequence[Detection], width: int, seen: bool = True,
+                  maybes: Sequence[Detection] = (), people: dict[str, list[Box]] | None = None) -> dict[str, Any]:
     """status()["search"]: the visitor's own names, their state, and which are in view and where.
 
     Discovered names are not reported here. `seen` is true once the finder
     has looked at a fresh frame for these names; until then found and missing
     are both empty, so the page holds its answer. For several finds of one
-    name the place is that of the most confident one.
+    name the place is that of the most confident one. A found entry has
+    "sure": false when its only find is one of `maybes`.
+
+    `people` gives, for each typed name that is a person's, the boxes of those
+    people in view (see people_in_view). Their entries have "person": true;
+    "people" lists those names, and is there only when some names are
+    people's. Every name is shown with its text as first answered (text_of).
     """
     state = own_state(search)
     looked = seen and state == "ready"
     in_view, missing = [], []
     if looked:
+        listed: set[str] = set()                # "mohamed" and "Mohamed Adel" are one person: listed once
         for name in search.names:
-            mine = [find for find in found if find.label.casefold() == name.casefold()]
-            if not mine:
-                missing.append(name)
+            person, text = person_named(search, name), text_of(search, name)
+            if text.casefold() in listed:
                 continue
-            best = max(mine, key=lambda find: find.confidence)
-            in_view.append({"name": name, "count": len(mine), "place": place_of(best.box, width)})
-    return {"names": list(search.names), "state": state, "note": search.note if state == "failed" else "",
-            "found": in_view, "missing": missing, "seen": looked}
+            listed.add(text.casefold())
+            entry = (person_entry(text, (people or {}).get(name, []), width) if person is not None
+                     else find_entry(name, text, found, width, maybes))
+            if entry is None:
+                missing.append(text)
+            else:
+                in_view.append(entry)
+    status = {"names": list(shown_names(search)), "state": state, "note": search.note if state == "failed" else "",
+              "found": in_view, "missing": missing, "seen": looked}
+    if search.people:
+        status["people"] = unique([text_of(search, person.typed) for person in search.people])
+    return status
+
+
+def find_entry(name: str, text: str, found: Sequence[Detection], width: int,
+               maybes: Sequence[Detection]) -> dict[str, Any] | None:
+    """A found entry (shown as `text`) for one name the open detector looks for, or None when it is not in view."""
+    mine = [find for find in found if find.label.casefold() == name.casefold()]
+    if not mine:
+        return None
+    best = max(mine, key=lambda find: find.confidence)
+    sure = any(not any(find is maybe for maybe in maybes) for find in mine)
+    return {"name": text, "count": len(mine), "place": place_of(best.box, width), "sure": sure}
+
+
+def person_entry(text: str, boxes: Sequence[Box], width: int) -> dict[str, Any] | None:
+    """A found entry (shown as `text`) for a person's name, or None when none of the people it means is in view."""
+    if not boxes:
+        return None
+    return {"name": text, "count": len(boxes), "place": place_of(boxes[0], width), "person": True, "sure": True}
 
 
 def own_state(search: Search) -> str:
@@ -2268,6 +2595,107 @@ def own_state(search: Search) -> str:
     if search.state == "loading" and search.own_ready:
         return "ready"
     return search.state
+
+
+# ---- a known person's name in Look for (M20) -------------------------------------------
+#
+# People are only ever recognised by their enrolled face. A typed name that is an enrolled
+# person's is answered by the recognised faces, never by the open detector.
+
+
+def plain(text: str) -> str:
+    """The text in one Unicode form, with single spaces, straight apostrophes and in small
+    letters, for comparing names: "sean o'brien" is "Sean O’Brien"."""
+    return " ".join(unicodedata.normalize("NFC", text).replace("’", "'").split()).casefold()
+
+
+def names_person(typed: str, person_id: str, name: str) -> bool:
+    """True when the typed name is this person's: their name as enrolled, their folder name
+    (underscores as spaces) or the first word of their name, in any case."""
+    wanted, full = plain(typed), plain(name)
+    first = full.split(" ")[0] if full else ""
+    return wanted in (full, plain(person_id.replace("_", " ")), first)
+
+
+def people_among(names: Sequence[str], enrolled: dict[str, str]) -> tuple[PersonName, ...]:
+    """The typed names that are enrolled people's (enrolled: person id -> name as enrolled).
+
+    A first name shared by several people means all of them. A name of
+    somebody who is not enrolled is not among them: it is an ordinary name.
+    """
+    people = []
+    for name in names:
+        ids = tuple(person_id for person_id, full in enrolled.items() if names_person(name, person_id, full))
+        if ids:
+            people.append(PersonName(name, shown_name(name, [enrolled[person_id] for person_id in ids]), ids))
+    return tuple(people)
+
+
+def shown_name(typed: str, names: Sequence[str]) -> str:
+    """How a person's name is shown: their name as enrolled. For several people of one
+    first name, that first name as enrolled (the typed name when they differ more)."""
+    if len({plain(name) for name in names}) == 1:
+        return names[0]
+    first = names[0].split()[0] if names[0].split() else typed
+    return first if plain(first) == plain(typed) else typed
+
+
+def person_named(search: Search, name: str) -> PersonName | None:
+    """The person a typed name of this search means, or None for an ordinary name."""
+    return next((person for person in search.people if person.typed == name), None)
+
+
+def text_of(search: Search, name: str) -> str:
+    """How one own name is shown: its text as first answered for this search when that is
+    known (Search.shown), else a person's name as enrolled, else the name itself."""
+    if len(search.shown) == len(search.names) and name in search.names:
+        return search.shown[search.names.index(name)]
+    person = person_named(search, name)
+    return person.shown if person is not None else name
+
+
+def shown_names(search: Search) -> tuple[str, ...]:
+    """The own names as the page shows them (see text_of), each once."""
+    return tuple(unique([text_of(search, name) for name in search.names]))
+
+
+def unique(names: Sequence[str]) -> list[str]:
+    """The names without repeats (in any case), the first one kept."""
+    kept: list[str] = []
+    for name in names:
+        if not label_among(name, kept):
+            kept.append(name)
+    return kept
+
+
+def people_in_view(people: Sequence[PersonName], detections: Sequence[Detection],
+                   faces: Sequence[RecognizedFace]) -> dict[str, list[Box]]:
+    """For each typed name that is a person's: where those people are, the surest face first.
+
+    Each one is found by their recognised face; the place is their person box,
+    or their face box when there is none.
+    """
+    owners = face_owners(detections, faces)
+    bodies = {face.person_id: detections[index].box for index, face in owners.items()}
+    surest: dict[str, RecognizedFace] = {}      # person id -> their surest face in view
+    for face in faces:
+        if face.is_known and (face.person_id not in surest or face.similarity > surest[face.person_id].similarity):
+            surest[face.person_id] = face
+    order = sorted(surest.values(), key=lambda face: -face.similarity)
+    return {person.typed: [bodies.get(face.person_id, face.box) for face in order
+                           if face.person_id in person.person_ids]
+            for person in people}
+
+
+def wanted_tracks(found: Sequence[Detection], maybes: Sequence[Detection], shown: Sequence[Detection],
+                  faces: Sequence[RecognizedFace], search: Search) -> list[int]:
+    """The track numbers drawn in the wanted colour: the sure finds of the own names, and the
+    person boxes of the people whose names were typed (their face box and name stay as they are)."""
+    sure = [find.track_id for find in found if not any(find is maybe for maybe in maybes)]
+    wanted_people = {person_id for person in search.people for person_id in person.person_ids}
+    people = [shown[index].track_id for index, face in face_owners(shown, faces).items()
+              if face.person_id in wanted_people]
+    return [track for track in sure + people if track is not None]
 
 
 # ---- what a click points at ----------------------------------------------------------
@@ -2326,8 +2754,20 @@ def smallest_box_at(view: View, px: float, py: float,
 
 
 def detection_target(view: View, index: int, card_of: CardOf) -> tuple[Target, Box]:
-    """An object, or a person (recognised when a known face belongs to their box)."""
+    """An object, or a person (recognised when a known face belongs to their box).
+
+    A named find on a person is never a thing of its own: it means that person
+    (their person box; on a face without one, what a click on that face means).
+    """
     detection = view.detections[index]
+    if any(detection is find for find in view.on_person):
+        wearer = wearer_of(detection, view.detections, view.faces)
+        if wearer is not None:
+            return detection_target(view, wearer, card_of)
+        face = face_under(detection, view.faces)
+        if face is not None:
+            return face_target(face, view, card_of)
+        return Target("person", "person", 0.0, None, b""), detection.box   # never an object, even alone
     confidence = float(detection.confidence)
     if detection.label != "person":
         return Target("object", detection.label, confidence, detection.track_id, b""), detection.box
@@ -2445,6 +2885,22 @@ def photo_span(start: float, end: float, limit: int) -> tuple[int, int]:
     begin = min(max(0, round(start)), limit - 1)
     finish = max(min(limit, round(end)), begin + 1)
     return begin, finish
+
+
+def cover_faces(frame: np.ndarray, faces: Sequence[Box]) -> np.ndarray:
+    """A copy of the frame with every face covered by a plain mid-grey block (FACE_COVER_GREY):
+    the face box grown by FACE_COVER_MARGIN on each side, kept inside the frame.
+
+    Every cut-out that may go to the assistant is cut from this copy, so no face leaves.
+    """
+    covered = frame.copy()
+    height, width = frame.shape[:2]
+    for x1, y1, x2, y2 in faces:
+        grow_x, grow_y = (x2 - x1) * FACE_COVER_MARGIN, (y2 - y1) * FACE_COVER_MARGIN
+        left, top = max(0, math.floor(x1 - grow_x)), max(0, math.floor(y1 - grow_y))
+        right, bottom = min(width, math.ceil(x2 + grow_x)), min(height, math.ceil(y2 + grow_y))
+        covered[top:bottom, left:right] = FACE_COVER_GREY
+    return covered
 
 
 def cut_out(frame: np.ndarray, box: Box) -> np.ndarray:

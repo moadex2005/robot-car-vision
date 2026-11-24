@@ -632,6 +632,9 @@
   .find-chip.is-found::before {
     content: ""; flex: none; width: 0.5em; height: 0.5em; border-radius: 50%; background: #ffd60a;
   }
+  /* A "maybe": quieter than a sure find, a dashed edge and a dimmer yellow. */
+  .find-chip.is-maybe { border-style: dashed; border-color: rgba(255, 214, 10, 0.55); }
+  .find-chip.is-maybe .find-chip-state { color: rgba(255, 214, 10, 0.8); }
   .find-chip.is-failed .find-chip-state { color: #ff6961; }
   @container (max-width: 520px) {
     .find-chip-state { display: none; }   /* a very narrow video: the names only, the state is in their title */
@@ -704,7 +707,9 @@
     content: ""; display: inline-block; width: 0.55em; height: 0.55em; margin-right: 0.45em;
     border-radius: 50%; background: #ffd60a; box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.35);
   }
-  /* A thing named by auto-discover: a small tag that says so. */
+  /* A "maybe": perhaps what the visitor is looking for. A dashed edge, and the small "maybe" tag. */
+  .thing.is-maybe { border-style: dashed; box-shadow: inset 0 1px 0 var(--glass-shine), var(--pill-shadow); }
+  /* A thing named by auto-discover (or a "maybe"): a small tag that says so. */
   .thing-tag {
     align-self: center;
     padding: 0.05rem 0.5rem; border-radius: 999px;
@@ -1735,7 +1740,7 @@
               </div>
             </div>
           </div>
-          <p class="privacy" id="privacy">A click on an object or on an empty spot sends a small cut-out of the picture to the assistant's API. A click on a person sends nothing. Follow-up questions about an object send the same cut-out again. A marked part is sent as the same cut-out with your outline drawn on it. Describe the scene sends the whole picture. QR codes and barcodes are read on this laptop, and the program sends their text nowhere. A picture sent for a click, for Describe or for Auto-discover can still show a code.</p>
+          <p class="privacy" id="privacy">A click on an object or on an empty spot sends a small cut-out of the picture to the assistant's API. A click on a person sends nothing. Faces in a cut-out are covered before it is sent. Follow-up questions about an object send the same cut-out again. A marked part is sent as the same cut-out with your outline drawn on it. Describe the scene sends the whole picture. QR codes and barcodes are read on this laptop, and the program sends their text nowhere. A picture sent for a click, for Describe or for Auto-discover can still show a code.</p>
         </div>
       </div>
 
@@ -2346,6 +2351,10 @@ const thingEntries = new Map();  // key -> the newest entry from the status, rea
 const missedPolls = new Map();   // key -> how many polls in a row it was not in the status
 let thingOrder = [];             // the keys in the order they are shown
 
+const MAYBE_TAG = "maybe";
+const MAYBE_TITLE = "Not sure: it may be something else";
+const ON_PERSON_TITLE = "On a person: a click shows the person";
+
 function readObject(raw) {
   const box = asList(raw.box).map(Number);
   return {
@@ -2355,7 +2364,9 @@ function readObject(raw) {
     box: box.length === 4 && box.every(Number.isFinite) ? box : null,
     name: raw.name == null ? "" : asText(raw.name),
     found: raw.found === true,        // one of the things the visitor is looking for
+    maybe: raw.maybe === true && raw.found === true,             // ... but the finder is not sure
     discovered: raw.discovered === true && raw.found !== true,   // named by auto-discover
+    onPerson: raw.on_person === true, // on a person: a click on it is a click on that person
   };
 }
 
@@ -2376,15 +2387,17 @@ const percent = (confidence) => Math.round(confidence * 100) + "%";
 // What one pill says: a recognised person by name and role, anything else by label, track and confidence.
 function thingText(entry, roles) {
   if (entry.name) {
-    return { name: entry.name, detail: roles.get(entry.name) || "", known: true, found: entry.found, discovered: false };
+    return { name: entry.name, detail: roles.get(entry.name) || "", known: true, found: entry.found, discovered: false,
+             maybe: false, onPerson: false };
   }
   const parts = [];
   if (entry.track_id !== null) parts.push("#" + entry.track_id);
   parts.push(percent(entry.confidence));
-  return { name: entry.label, detail: parts.join("  "), known: false, found: entry.found, discovered: entry.discovered };
+  return { name: entry.label, detail: parts.join("  "), known: false, found: entry.found, discovered: entry.discovered,
+           maybe: entry.maybe, onPerson: entry.onPerson };
 }
 
-// A pill: the name, the small "discovered" tag (hidden unless auto-discover named it), the detail.
+// A pill: the name, the small tag ("discovered" or "maybe", hidden for anything else), the detail.
 function thingItem(key) {
   const item = make("li");
   const button = make("button", "thing");
@@ -2443,10 +2456,17 @@ function drawObjects(status) {
     button.classList.toggle("is-known", thing.known);
     button.classList.toggle("is-gone", thing.gone);
     button.classList.toggle("is-found", thing.found);
+    button.classList.toggle("is-maybe", thing.maybe);
     button.classList.toggle("is-discovered", thing.discovered);
-    button.querySelector(".thing-tag").hidden = !thing.discovered;
-    if (thing.found) button.title = FOUND_TITLE;
-    else if (thing.discovered) button.title = DISCOVERED_TITLE;
+    const tag = button.querySelector(".thing-tag");
+    setText(tag, thing.maybe ? MAYBE_TAG : DISCOVERED_TAG);
+    tag.hidden = !thing.discovered && !thing.maybe;
+    const titles = [];
+    if (thing.maybe) titles.push(MAYBE_TITLE);
+    else if (thing.found) titles.push(FOUND_TITLE);
+    else if (thing.discovered) titles.push(DISCOVERED_TITLE);
+    if (thing.onPerson) titles.push(ON_PERSON_TITLE);
+    if (titles.length) button.title = titles.join(". ");
     else button.removeAttribute("title");
     return item;
   });
@@ -6141,7 +6161,10 @@ function readSearch(raw) {
     seen: search.seen === true,        // the finder has looked at a picture for these names
     found: asList(search.found).filter((entry) => entry && typeof entry === "object").map((entry) => ({
       name: asText(entry.name), count: Math.max(1, Math.floor(Number(entry.count)) || 1), place: asText(entry.place),
+      sure: entry.sure !== false,      // false: only a "maybe" is in view
+      person: entry.person === true,   // an enrolled person, found by their face
     })),
+    people: asList(search.people).map(asText).filter(Boolean),   // the names that are enrolled people's
   };
 }
 
@@ -6149,15 +6172,23 @@ const sameName = (a, b) => a.toLowerCase() === b.toLowerCase();
 const sameNames = (a, b) => a.length === b.length && a.every((name, i) => sameName(name, b[i]));
 const placeWords = (place) => PLACE_WORDS[place] || "in the picture";
 const foundEntry = (search, name) => search.found.find((entry) => sameName(entry.name, name)) || null;
+// A person's name is said as it is, with no "a" or "the" before it.
+const isPersonName = (search, name) => Boolean(search) && search.people.some((person) => sameName(person, name));
 
 // ---- the chips: one per name, saying what the status says ----
 
 function chipState(search, name) {
-  if (search.state === "loading") return { text: "loading the finder ...", found: false };
-  if (search.state === "failed") return { text: "could not start", found: false };
+  if (search.state === "loading") return { text: "loading the finder ...", found: false, maybe: false };
+  if (search.state === "failed") return { text: "could not start", found: false, maybe: false };
   const entry = foundEntry(search, name);
-  if (!entry) return { text: "not in view", found: false };
-  return { text: entry.count > 1 ? "found (" + entry.count + ")" : "found " + placeWords(entry.place), found: true };
+  if (!entry) return { text: "not in view", found: false, maybe: false };
+  if (entry.person) {
+    return { text: entry.count > 1 ? "in view (" + entry.count + ")" : "in view, " + placeWords(entry.place),
+             found: true, maybe: false };
+  }
+  if (!entry.sure) return { text: "maybe, " + placeWords(entry.place), found: false, maybe: true };
+  return { text: entry.count > 1 ? "found (" + entry.count + ")" : "found " + placeWords(entry.place), found: true,
+           maybe: false };
 }
 
 function chipItem() {
@@ -6179,6 +6210,7 @@ function drawChips(search) {
     setText(item.firstChild, chip.name);
     setText(item.lastChild, chip.text);
     item.classList.toggle("is-found", chip.found);
+    item.classList.toggle("is-maybe", chip.maybe);
     item.classList.toggle("is-failed", search.state === "failed");
     item.title = search.state === "failed" && search.note ? search.note : chip.name + ": " + chip.text;
     return item;
@@ -6247,21 +6279,37 @@ function joinWith(parts, word) {
   return parts.slice(0, -1).join(", ") + " " + word + " " + parts[parts.length - 1];
 }
 
+// "a window", "an umbrella", "some glasses": for something the finder is not sure about
+function someOf(name) {
+  return looksPlural(name) ? "some " + name : anyOf(name);
+}
+
 // "I can see the wifi router, on the right." / "I can see 2 bottles now, the clearest one on the left."
+// A person: "I can see Mohamed Adel, on the left." A maybe: "I think I can see a window, in the
+// middle, but I am not sure."
 function seenSentence(entry, now) {
   const when = now ? " now" : "";
+  if (entry.person && entry.count > 1) {
+    return "I can see " + entry.count + " people called " + entry.name + when + ", one " + placeWords(entry.place) + ".";
+  }
+  if (entry.person) return "I can see " + entry.name + when + ", " + placeWords(entry.place) + ".";
+  if (!entry.sure) {
+    return "I think I can see " + someOf(entry.name) + when + ", " + placeWords(entry.place) + ", but I am not sure.";
+  }
   if (entry.count > 1) {
     return "I can see " + entry.count + " " + pluralOf(entry.name) + when + ", the clearest one " + placeWords(entry.place) + ".";
   }
   return "I can see the " + entry.name + when + ", " + placeWords(entry.place) + ".";
 }
 
-// The answer to a request: what is in view, then what is not.
+// The answer to a request: what is in view, then what is not. A maybe counts as an answer.
+// "I can't see Mohamed Adel right now. I'll keep looking.": no "a" before a person's name.
 function findSentences(search, names) {
   const seen = names.map((name) => foundEntry(search, name)).filter(Boolean);
   const missing = names.filter((name) => !foundEntry(search, name));
   const parts = seen.map((entry) => seenSentence(entry, false));
-  if (missing.length) parts.push("I can't see " + joinWith(missing.map(anyOf), "or") + " right now. I'll keep looking.");
+  const missed = missing.map((name) => (isPersonName(search, name) ? name : anyOf(name)));
+  if (missing.length) parts.push("I can't see " + joinWith(missed, "or") + " right now. I'll keep looking.");
   return parts.join(" ");
 }
 
@@ -6355,19 +6403,24 @@ function answerCameraDown(mine) {
   if (finding === mine) finding = null;
 }
 
+// A name answered as missing, or only as a maybe, is waited for: its sure find is told later.
 function answerFind(mine, search) {
-  for (const name of mine.names) if (!foundEntry(search, name)) mine.waitingFor.add(name.toLowerCase());
+  for (const name of mine.names) {
+    const entry = foundEntry(search, name);
+    if (!entry || !entry.sure) mine.waitingFor.add(name.toLowerCase());
+  }
   findAnswered(mine, findSentences(search, mine.names), "answer");
 }
 
-// A name that was not in view when the answer was given: said once, the first time it is seen.
+// A name that was not in view (or only a maybe) when the answer was given: said once, the first
+// time it is surely seen.
 // It leaves waitingFor only when its sentence was really said or shown where the visitor sees it
 // (tellFound, or a conversation between two turns); until then the next status tries again.
 function tellNewlyFound(mine, search) {
   for (const name of mine.names) {
     const entry = foundEntry(search, name);
     const key = name.toLowerCase();
-    if (!entry || !mine.waitingFor.has(key)) continue;
+    if (!entry || !entry.sure || !mine.waitingFor.has(key)) continue;   // a maybe is not told again
     if (conversation) conversationOwes(conversation, mine, name);   // it says it between two turns
     else if (tellFound(mine, seenSentence(entry, true))) mine.waitingFor.delete(key);
   }
@@ -6398,7 +6451,7 @@ function findTimedOut(mine) {
     return;
   }
   for (const name of mine.names) mine.waitingFor.add(name.toLowerCase());
-  const names = joinWith(mine.names.map((name) => "the " + name), "and");
+  const names = joinWith(mine.names.map((name) => (isPersonName(mine.search, name) ? name : "the " + name)), "and");
   findAnswered(mine, "The finder is still loading; the first time takes about 15 seconds. " +
                      "I'll tell you when I can see " + names + ".", "answer");
 }

@@ -463,7 +463,8 @@ def test_the_answer_sentences_are_built_from_the_status():
     assert '"I can see the " + entry.name + when + ", " + placeWords(entry.place) + "."' in seen
     assert "pluralOf(entry.name)" in seen and '" now"' in seen
     words = between(page, "function findSentences(", "\n}\n")
-    assert '"I can\'t see " + joinWith(missing.map(anyOf), "or") + " right now. I\'ll keep looking."' in words
+    assert '"I can\'t see " + joinWith(missed, "or") + " right now. I\'ll keep looking."' in words   # M20
+    assert "isPersonName(search, name) ? name : anyOf(name)" in words     # no "a" before a person's name
     assert 'return (startsWithVowelSound(name) ? "an " : "a ") + name;' in page
     assert 'if (looksPlural(name)) return "any " + name;' in page
 

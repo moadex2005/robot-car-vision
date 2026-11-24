@@ -145,6 +145,9 @@ class FakeRecognizer:
     def person(self, person_id):
         return self.people.get(person_id)
 
+    def enrolled_ids(self):
+        return set()                        # nobody for Look for: tests/test_find_people.py has its own fake
+
 
 class NoPhone:
     """The network as the tests see it: nothing answers. Every address asked for is kept."""
@@ -2515,7 +2518,7 @@ def test_the_finds_stay_on_screen_between_runs_and_are_highlighted(make, monkeyp
     wanted_per_frame = []
     real_draw = pipeline_module.draw.draw_detections
 
-    def recording_draw(frame, detections, wanted=()):
+    def recording_draw(frame, detections, wanted=(), unsure=()):
         wanted_per_frame.append(sorted(wanted))
         real_draw(frame, detections, wanted)
 
@@ -2534,7 +2537,7 @@ def test_the_finds_stay_on_screen_between_runs_and_are_highlighted(make, monkeyp
 def test_without_a_search_draw_gets_no_highlights_and_nothing_is_found(make, monkeypatch):
     wanted_per_frame = []
     monkeypatch.setattr(pipeline_module.draw, "draw_detections",
-                        lambda frame, detections, wanted=(): wanted_per_frame.append(list(wanted)))
+                        lambda frame, detections, wanted=(), unsure=(): wanted_per_frame.append(list(wanted)))
     detector = FakeDetector()
     open_detector = FakeOpenDetector()
     pipeline = make(source=FakeSource(frames=5), detector=detector, open_detector=open_detector).start()
@@ -2554,8 +2557,9 @@ def test_status_says_what_was_found_where_and_what_is_missing(make):
                             open_detector=FakeOpenDetector(finds=finds))
     assert wait_until(lambda: search_of(pipeline)["found"])
     assert search_of(pipeline) == {"names": ["Wifi Router", "keys", "power bank"], "state": "ready", "note": "",
-                                   "found": [{"name": "Wifi Router", "count": 2, "place": "middle"},  # the surer one
-                                             {"name": "keys", "count": 1, "place": "left"}],
+                                   "found": [{"name": "Wifi Router", "count": 2, "place": "middle",  # the surer one
+                                              "sure": True},
+                                             {"name": "keys", "count": 1, "place": "left", "sure": True}],
                                    "missing": ["power bank"], "seen": True}
     json.dumps(pipeline.status())
 
@@ -2757,7 +2761,7 @@ def test_search_status_lists_found_and_missing_only_when_ready():
         "names": ["keys", "wallet"], "state": "loading", "note": "", "found": [], "missing": [], "seen": False}
     ready_search = replace(loading, state="ready")
     assert pipeline_module.search_status(ready_search, finds, 640)["found"] == [
-        {"name": "keys", "count": 2, "place": "left"}]
+        {"name": "keys", "count": 2, "place": "left", "sure": True}]
     assert pipeline_module.search_status(ready_search, finds, 640)["missing"] == ["wallet"]
 
 
@@ -3067,7 +3071,7 @@ def test_with_the_real_open_detector_a_typed_name_is_found(make, tmp_path):
     open_detector = detector_module.OpenDetector(settings, model=YoloeShaped())
     pipeline, _ = searching(make, names=["power bank"], open_detector=open_detector)
     assert wait_until(lambda: search_of(pipeline)["found"])
-    assert search_of(pipeline)["found"] == [{"name": "power bank", "count": 1, "place": "left"}]
+    assert search_of(pipeline)["found"] == [{"name": "power bank", "count": 1, "place": "left", "sure": True}]
     found = [o for o in pipeline.status()["objects"] if o.get("found")]
     assert [(o["label"], o["track_id"]) for o in found] == [("power bank", OFFSET + 5)]
     pipeline.search(["keys", "power bank"])
@@ -3150,15 +3154,17 @@ def test_names_that_only_contain_the_letters_of_a_people_word_are_fine(name):
 PERSON_SQUARE = (0, 0, 100, 100)
 
 
-@pytest.mark.parametrize("box, dropped", [
-    ((20, 20, 60, 60), True),          # inside the person
-    ((-10, -10, 110, 110), True),      # around the person: its centre is inside
-    ((40, 0, 170, 100), True),         # centre (105, 50) outside, but overlapping 0.35
-    ((60, 0, 200, 100), False),        # centre (130, 50) outside, overlapping 0.2
-    ((110, 0, 200, 100), False),       # beside the person
+@pytest.mark.parametrize("box, dropped, on_her", [     # M20: only a find that is the person is dropped
+    ((20, 20, 60, 60), False, True),        # inside the person: kept, but on her
+    ((-10, -10, 110, 110), False, True),    # around the person, 0.69 inside it: on her, not her (fix round D)
+    ((40, 0, 170, 100), False, False),      # overlapping 0.35, 46 % of it inside: an ordinary find
+    ((60, 0, 200, 100), False, False),      # overlapping 0.2
+    ((110, 0, 200, 100), False, False),     # beside the person
 ])
-def test_on_a_person(box, dropped):
-    assert pipeline_module.on_a_person(Detection("coat", 0.7, box, OFFSET + 1), [PERSON_SQUARE]) is dropped
+def test_on_a_person(box, dropped, on_her):
+    find = Detection("coat", 0.7, box, OFFSET + 1)
+    assert pipeline_module.same_as_person(find, [PERSON_SQUARE]) is dropped
+    assert pipeline_module.on_person(find, [PERSON_SQUARE]) is on_her
 
 
 def test_merge_drops_a_find_on_a_person_and_the_person_keeps_their_box():
@@ -3489,7 +3495,7 @@ def test_discovered_finds_are_not_drawn_in_the_search_colour(make, monkeypatch):
     wanted_per_frame = []
     real_draw = pipeline_module.draw.draw_detections
 
-    def recording_draw(frame, detections, wanted=()):
+    def recording_draw(frame, detections, wanted=(), unsure=()):
         wanted_per_frame.append((sorted(wanted), sorted(d.label for d in detections)))
         real_draw(frame, detections, wanted)
 

@@ -1181,10 +1181,11 @@ def create_app(pipeline: Any, assistant: Any, camera_file: Path | None = None,
             names = list(clean_names(names))          # the pipeline's own rules and messages
             if not names:
                 return jsonify(error=NOTHING_TO_FIND), 400
-            pipeline.search(names)                    # returns at once; the status says how it goes
+            shown = pipeline.search(names)            # returns at once; the status says how it goes
         except ValueError as error:
             return jsonify(error=str(error)), 400
-        return jsonify(ok=True, names=names)
+        # The names as the status shows them: a known person's name as they were enrolled.
+        return jsonify(ok=True, names=list(shown) if shown is not None else names)
 
     @app.delete("/api/search")
     def search_stop() -> Any:

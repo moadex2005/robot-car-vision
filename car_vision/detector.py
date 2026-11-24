@@ -82,6 +82,21 @@ def check_confidence(key: str, value: float) -> None:
         raise ConfigError(f"detector.{key} must be above 0 and at most 1, got {value}")
 
 
+def open_limits(settings: dict[str, Any]) -> tuple[float, float]:
+    """(open_confidence, open_maybe_confidence), both checked.
+
+    A find of the named search at or above the first is sure; one between the
+    two is only a "maybe". The maybe limit is above 0 and at most the sure one.
+    """
+    sure = float(require(settings, "open_confidence", (int, float)))
+    maybe = float(require(settings, "open_maybe_confidence", (int, float)))
+    check_confidence("open_confidence", sure)
+    if not 0.0 < maybe <= sure:
+        raise ConfigError(f"detector.open_maybe_confidence must be above 0 and at most "
+                          f"open_confidence ({sure}), got {maybe}")
+    return sure, maybe
+
+
 def check_image_size(size: int) -> None:
     """The model works on squares whose side is a multiple of 32."""
     if size <= 0 or size % 32 != 0:
@@ -301,13 +316,13 @@ class OpenDetector:
     def __init__(self, settings: dict[str, Any], model: Any = None) -> None:
         self.model_name: str = require(settings, "open_model", str)
         self.models_dir: str = require(settings, "models_dir", str)
-        self.confidence: float = float(require(settings, "open_confidence", (int, float)))
+        # detect() gives every find at or above the maybe limit; the pipeline decides which are sure.
+        self.confidence, self.maybe_confidence = open_limits(settings)
         self.image_size: int = require(settings, "image_size", int)
         self.tracker: str = require(settings, "tracker", str)
         self._wanted_device: str = require(settings, "device", str)
         if not self.model_name.strip():
             raise ConfigError("detector.open_model must name a model file such as yoloe-26s-seg.pt")
-        check_confidence("open_confidence", self.confidence)
         check_image_size(self.image_size)
         check_tracker(self.tracker)
         check_device_name(self._wanted_device)
@@ -366,7 +381,10 @@ class OpenDetector:
         self.reset_tracks()
 
     def detect(self, frame: np.ndarray) -> list[Detection]:
-        """Find the named things in one frame. Each label is one of the typed names."""
+        """Find the named things in one frame. Each label is one of the typed names.
+
+        Every find at or above open_maybe_confidence is given, also the unsure ones.
+        """
         if not self._names:
             return []
         if frame is None or getattr(frame, "size", 0) == 0:
@@ -379,7 +397,7 @@ class OpenDetector:
             frame,
             persist=True,
             tracker=self.tracker,
-            conf=self.confidence,
+            conf=self.maybe_confidence,
             imgsz=self.image_size,
             device=self._device,
             verbose=False,

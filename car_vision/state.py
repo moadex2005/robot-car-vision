@@ -27,6 +27,9 @@ class Detection:
     confidence: float     # 0.0 to 1.0
     box: Box
     track_id: int | None = None   # same number while the tracker follows the object
+    # The thing's own shape as corner points (x, y) in frame pixels, when the model gives one
+    # (the find-by-name detector does). Empty: only the box is known, so the box is drawn.
+    outline: tuple[tuple[int, int], ...] = ()
 
 
 @dataclass(frozen=True)

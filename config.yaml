@@ -63,6 +63,12 @@ lookout:
   output_price_per_million: 0.05
   spend_file: data/lookout.json   # today's count and estimated cost, kept across restarts
 
+codes:
+  enabled: true             # read QR codes and barcodes in the picture (on this laptop: no model, no internet)
+  every_n_frames: 5         # codes are looked for on every 5th frame to keep the video fast
+  max_width: 960            # a wider picture is shrunk to this width before it is searched
+  hold_seconds: 1.5         # a code stays on screen this long after it was last read
+
 reactions:
   greet_cooldown_seconds: 60        # greet the same person at most this often
   message_seconds: 4.0              # how long a greeting stays on screen

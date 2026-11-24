@@ -50,6 +50,7 @@ CONFIG = {
     "lookout": {"model": "fake/model:provider", "every_seconds": 10, "picture_width": 512, "max_names": 6,
                 "daily_budget_usd": 0.5, "input_price_per_million": 0.04,
                 "output_price_per_million": 0.05, "spend_file": "data/does-not-exist/lookout.json"},
+    "codes": {"enabled": False, "every_n_frames": 5, "max_width": 960, "hold_seconds": 1.5},
     "reactions": {"greet_cooldown_seconds": 60, "message_seconds": 4.0},
     "app": {"host": "127.0.0.1", "port": 5000, "jpeg_quality": 80, "log_file": "logs/test.log"},
 }

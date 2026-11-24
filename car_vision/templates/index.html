@@ -896,6 +896,16 @@
      clicked although the caption lets every other click through to the video. */
   .caption .answer-link { color: #64b5ff; pointer-events: auto; }
   .caption .answer-link:focus-visible { outline-color: #64b5ff; }
+  /* Bold, italic and code inside an answer (answerNodes): the words keep the colour around them,
+     and code is a quiet monospace word on a faint tint that suits the glass in both looks. */
+  .msg strong, .msg em, .details-content strong, .details-content em { color: inherit; }
+  .msg code, .details-content code {
+    font-family: "Cascadia Mono", Consolas, ui-monospace, monospace;
+    font-size: 0.88em;
+    background: var(--hairline);
+    border-radius: 6px;
+    padding: 0.08em 0.36em;
+  }
 
   .ask-form { display: flex; gap: 0.7rem; }
   .ask-form input, .camera-row input, .follow-form input {
@@ -2052,7 +2062,9 @@ function webLine(sources) {
 //   "... profile is <address>"   a link whose visible text is "link": the words before it already
 //                          say what it is (they end with a colon, "is", "at", "here" or "see")
 //   "... code on <address> today"   a link whose visible text is the site's name: "github.com"
-// Everything else stays plain text, exactly as written: this is not a Markdown renderer.
+// A small, fixed part of Markdown is shown as well (emphasisParts, below): **bold**, *italic*,
+// ***both***, `code`, a "# Title" line in bold and a "- item" line with a bullet. Everything
+// else stays plain text, exactly as written.
 // The rules that keep it safe:
 //   - nodes are made with createElement and textContent only, never from HTML;
 //   - a link is made only for an address that new URL() reads, with the protocol exactly
@@ -2061,13 +2073,17 @@ function webLine(sources) {
 //     in its title, so the visitor sees where it goes before clicking;
 //   - a label is cut at LINK_LABEL_CHARS; a label that names another site than the one the
 //     link goes to (a [bank.example](evil.example) trick) is replaced by the real site's name.
-// A bare address ends before trailing . , ) ; : ! ? (a ")" that closes a "(" inside the
-// address itself, as in a Wikipedia address, stays part of it).
+// A bare address ends before trailing . , ) ; : ! ? * (a ")" that closes a "(" inside the
+// address itself, as in a Wikipedia address, stays part of it; the stars of "**<address>**"
+// are marks, not part of it).
+// A link's label is plain words: a code span inside a label is shown as written, and that
+// Markdown link is then not made into one link.
 
 const LINK_LABEL_CHARS = 60;
 const LINK_PATTERN = /\[([^\[\]\n]+)\]\(([^\s()]*(?:\([^\s()]*\)[^\s()]*)*)\)|\bhttps?:\/\/[^\s<>"`]+/gi;
-const ADDRESS_END = ".,);:!?";
-const SAYS_WHAT_IT_IS = /(?::|\b(?:is|at|here|see))\s*$/i;   // "LinkedIn: ...", "His profile is ..."
+const ADDRESS_END = ".,);:!?*";
+// "LinkedIn: ...", "His profile is ...", "**Profile:** ..." (marks between the words and the address)
+const SAYS_WHAT_IT_IS = /(?::|\b(?:is|at|here|see))[*`\s]*$/i;
 const NAMED_SITE = /(?:\b[a-z][a-z0-9+.-]*:\/\/)?[\p{L}\p{N}-]+(?:\.[\p{L}\p{N}-]+)*\.\p{L}{2,}(?![\p{L}\p{N}-])/giu;
 
 // The address as a URL when the page may link to it, else null.
@@ -2085,13 +2101,15 @@ function webAddress(raw) {
 
 const siteName = (url) => url.hostname.replace(/^www\./i, "");
 
-// A bare address without the punctuation that ends the sentence around it.
+// A bare address without the punctuation that ends the sentence around it. The brackets are
+// counted once; each ")" taken off the end is one closed bracket fewer.
 function trimAddress(address) {
   let end = address.length;
+  const opened = address.split("(").length - 1;
+  let closed = address.split(")").length - 1;
   while (end > 0 && ADDRESS_END.includes(address[end - 1])) {
-    const head = address.slice(0, end);
-    const opened = head.split("(").length - 1, closed = head.split(")").length - 1;
     if (address[end - 1] === ")" && opened >= closed) break;   // it closes a bracket of the address
+    if (address[end - 1] === ")") closed -= 1;
     end -= 1;
   }
   return address.slice(0, end);
@@ -2163,8 +2181,213 @@ function linkNode(part) {
   return link;
 }
 
+// ---- bold, italic and code: the small part of Markdown that is shown ----
+//   **bold**   *italic*   ***bold and italic***   `code` (nothing inside it is shown as anything else)
+//   "# Title" to "###### Title"    the title in bold, the # marks gone
+//   "- item", "* item", "+ item"   "• item", with the indentation kept
+// A mark counts only where a writer means one. It opens at the start of a line or after a space
+// or one of MARK_OPEN_AFTER, and before a character that is not a space; it closes after a
+// character that is not a space, and before a space, the end of the line or one of
+// MARK_CLOSE_BEFORE. So "2 * 3 * 4", "5*4*3", "a ** b" and a lone "**" stay as written. A
+// backtick may also open after a "*" and close before one, so "**`name`**" is bold code.
+// Underscores are never marks ("file_name_here", "__init__"). Nothing crosses a line break, and a
+// mark without a partner on its line stays as written. Bold may hold italic, and italic bold.
+
+const MARK_OPEN_AFTER = "([{\"':-–";
+const MARK_CLOSE_BEFORE = ".,;:!?)]}\"'";
+const HEADING = /^(\s*)#{1,6}[ \t]+/;     // "## Title"; "#3 is the laptop" has no space and stays
+const BULLET = /^(\s*)[-*+](?=[ \t])/;    // "- item"; "1. item" stays as written
+const isSpace = (char) => /\s/.test(char);
+
+// `also`: more characters a mark may follow ("*" for a backtick).
+function markOpens(line, start, end, also = "") {
+  const before = line[start - 1], after = line[end];
+  const beside = start === 0 || isSpace(before) || MARK_OPEN_AFTER.includes(before) || also.includes(before);
+  return beside && after !== undefined && !isSpace(after);
+}
+
+// `also`: more characters a mark may stand before ("*" for a backtick).
+function markCloses(line, start, end, also = "") {
+  const before = line[start - 1], after = line[end];
+  const beside = after === undefined || isSpace(after) || MARK_CLOSE_BEFORE.includes(after) || also.includes(after);
+  return start > 0 && !isSpace(before) && beside;
+}
+
+// Where the code span that opens at `start` ends (its closing backtick), or -1 when it has none.
+function codeEnd(line, start) {
+  for (let end = line.indexOf("`", start + 2); end !== -1; end = line.indexOf("`", end + 1)) {
+    if (markCloses(line, end, end + 1, "*")) return end;
+  }
+  return -1;
+}
+
+// A mark ("*" or "**") added to the line's tokens. It closes the last waiting mark of its kind
+// when it may close; marks of the other kind that opened after that one never found a partner
+// and stay as written. `waiting` holds, for each kind, the token indexes of marks that may open.
+function addMark(tokens, waiting, mark, opens, closes) {
+  const token = { text: mark, mark };
+  const same = waiting[mark], other = waiting[mark === "*" ? "**" : "*"];
+  if (closes && same.length) {
+    const partner = same.pop();
+    tokens[partner].role = "open";
+    token.role = "close";
+    while (other.length && other[other.length - 1] > partner) other.pop();
+  } else if (opens) {
+    same.push(tokens.length);
+  }
+  tokens.push(token);
+}
+
+// "***" is two marks, "**" and "*". When it closes, the one that opened last closes first.
+function runMarks(run, waiting) {
+  if (run.length < 3) return [run];
+  const lastStar = waiting["*"].length ? waiting["*"][waiting["*"].length - 1] : -1;
+  const lastBold = waiting["**"].length ? waiting["**"][waiting["**"].length - 1] : -1;
+  return lastStar > lastBold ? ["*", "**"] : ["**", "*"];
+}
+
+// One line as tokens: words { text }, code { text, code: true } and marks { text, mark, role }.
+// Only a mark that found its partner has a role ("open" or "close").
+function lineTokens(line) {
+  const tokens = [];
+  const waiting = { "*": [], "**": [] };    // the indexes of the marks that may still open, by kind
+  let at = 0;
+  // Once a code span finds no closing backtick, no later one on this line can (it would look
+  // at fewer backticks), so the line is not searched again: a long line stays quick.
+  let codeCanClose = true;
+  while (at < line.length) {
+    let end = at;
+    while (end < line.length && line[end] !== "*" && line[end] !== "`") end += 1;
+    if (end > at) {
+      tokens.push({ text: line.slice(at, end) });
+    } else if (line[at] === "`") {
+      const opens = markOpens(line, at, at + 1, "*");
+      end = opens && codeCanClose ? codeEnd(line, at) : -1;
+      if (opens && end < 0) codeCanClose = false;
+      tokens.push(end > 0 ? { text: line.slice(at + 1, end), code: true } : { text: "`" });
+      end = end > 0 ? end + 1 : at + 1;
+    } else {
+      while (line[end] === "*") end += 1;
+      const run = line.slice(at, end);
+      if (run.length > 3) tokens.push({ text: run });       // "****" and longer are never marks
+      else {
+        const opens = markOpens(line, at, end), closes = markCloses(line, at, end);
+        for (const mark of runMarks(run, waiting)) addMark(tokens, waiting, mark, opens, closes);
+      }
+    }
+    at = end;
+  }
+  return tokens;
+}
+
+const plainPart = (text) => ({ text, strong: false, em: false, code: false });
+
+// A part added to the list; it joins the one before when the two look the same.
+function addPart(parts, part) {
+  const last = parts[parts.length - 1];
+  if (last && !last.code && !part.code && last.strong === part.strong && last.em === part.em) last.text += part.text;
+  else if (part.text) parts.push(part);
+}
+
+// The tokens of one line as parts: the marks that found a partner are gone, their words styled.
+function styledParts(tokens, bold) {
+  const parts = [];
+  let strong = 0, em = 0;
+  for (const token of tokens) {
+    if (token.role) {
+      const step = token.role === "open" ? 1 : -1;
+      if (token.mark === "**") strong += step;
+      else em += step;
+    } else {
+      addPart(parts, { text: token.text, strong: bold || strong > 0, em: em > 0, code: token.code === true });
+    }
+  }
+  return parts;
+}
+
+// One line: a heading in bold without its # marks, a bullet for "- ", then the marks inside it.
+function lineParts(line) {
+  const heading = line.match(HEADING);
+  if (heading) return [plainPart(heading[1]), ...styledParts(lineTokens(line.slice(heading[0].length)), true)];
+  const bullet = line.match(BULLET);
+  if (bullet) return [plainPart(bullet[1] + "•"), ...styledParts(lineTokens(line.slice(bullet[0].length)), false)];
+  return styledParts(lineTokens(line), false);
+}
+
+// The text as parts { text, strong, em, code }, with no page in it. Joined, the parts' text is
+// the text as it came without the marks that are shown (and "- " as "• ").
+function emphasisParts(text) {
+  const parts = [];
+  asText(text).split("\n").forEach((line, index) => {
+    if (index > 0) addPart(parts, plainPart("\n"));
+    for (const part of lineParts(line)) addPart(parts, part);
+  });
+  return parts;
+}
+
+// The words of a short text without its marks ("**Battery**" is "Battery"): a specification's name.
+const plainWords = (text) => emphasisParts(text).map((part) => part.text).join("");
+
+// A node inside the <code>, <em> and <strong> its part asks for.
+function styledNode(node, part) {
+  let outer = node;
+  for (const tag of ["code", "em", "strong"]) {
+    if (!part[tag]) continue;
+    const box = make(tag);
+    box.append(outer);
+    outer = box;
+  }
+  return outer;
+}
+
+// The words from `from` to `to` of the joined parts, each piece in the style of its own part.
+// `first` is the spot that holds `from`; the spots after it are looked at only up to `to`.
+function wordNodes(spots, first, from, to) {
+  const nodes = [];
+  for (let index = first; index < spots.length && spots[index].from < to; index += 1) {
+    const { part, from: start } = spots[index];
+    nodes.push(styledNode(document.createTextNode(part.text.slice(Math.max(from - start, 0), to - start)), part));
+  }
+  return nodes;
+}
+
+// Parts side by side as nodes, with the links found in their joined text. A link is shown in the
+// style of the part it starts in, so "**[LinkedIn](address)**" is a bold link.
+function linkedNodes(parts) {
+  const spots = [];                            // each part with where it starts and ends
+  let at = 0;
+  for (const part of parts) {
+    spots.push({ part, from: at, to: at + part.text.length });
+    at += part.text.length;
+  }
+  const nodes = [];
+  let first = 0;                               // the spot the next piece starts in
+  at = 0;
+  for (const piece of linkParts(parts.map((part) => part.text).join(""))) {
+    const end = at + piece.text.length;
+    while (spots[first].to <= at) first += 1;
+    if (piece.url) nodes.push(styledNode(linkNode(piece), spots[first].part));
+    else nodes.push(...wordNodes(spots, first, at, end));
+    at = end;
+  }
+  return nodes;
+}
+
+// An answer's nodes: its marks shown as bold, italic and code (emphasisParts), its links as short
+// clickable words (linkParts). Links are looked for between the code spans, in the words with the
+// marks already taken out: "**Profile:** <address>" reads "Profile: <address>" and gets "link".
 function answerNodes(text) {
-  return linkParts(text).map((part) => (part.url ? linkNode(part) : document.createTextNode(part.text)));
+  const nodes = [];
+  let words = [];                              // the parts since the last code span
+  for (const part of emphasisParts(text)) {
+    if (!part.code) {
+      words.push(part);
+      continue;
+    }
+    nodes.push(...linkedNodes(words), styledNode(document.createTextNode(part.text), part));
+    words = [];
+  }
+  return nodes.concat(linkedNodes(words));
 }
 
 function addAnswer(answer) {
@@ -2394,7 +2617,11 @@ function showInfo(info) {
   const specs = asList(info.specs).filter((spec) => spec && typeof spec === "object");
   if (specs.length) {
     const list = make("dl", "specs");
-    for (const spec of specs) list.append(make("dt", "", asText(spec.name)), make("dd", "", asText(spec.value)));
+    for (const spec of specs) {
+      const value = make("dd");
+      value.append(...answerNodes(asText(spec.value)));   // bold, code and links shown, never their marks
+      list.append(make("dt", "", plainWords(asText(spec.name))), value);
+    }
     nodes.push(list);
   }
   if (info.used_web) nodes.push(webLine(info.sources));
@@ -3368,7 +3595,9 @@ function readableLines(text) {
     .replace(/\bFrom the web\b:?/gi, " ")
     .split("\n")
     .map((line) => line.replace(/^\s*(#{1,6}|>|[-*+]|\d+[.)])\s+/, "")   // headings, quotes, bullets
-                       .replace(/[*_`~|#]+/g, " ")                        // emphasis, code, tables
+                       .replace(/(?<=[\p{L}\p{N}])[*`~]+(?=[\p{L}\p{N}])/gu, " ")   // "5*4*3": 5 4 3
+                       .replace(/[*`~]+/g, "")                            // emphasis, code: "**Battery:**" is "Battery:"
+                       .replace(/[|#]+/g, " ")                            // tables, headings; "_" stays (snake_case)
                        .replace(/\s+/g, " ").trim())
     .filter(Boolean)
     .map((line) => (/[.!?:;,]$/.test(line) ? line : line + "."));         // a short pause after each line

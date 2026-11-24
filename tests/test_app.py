@@ -1919,7 +1919,7 @@ def test_link_pattern_finds_markdown_links_and_bare_addresses(text, found):
 
 def test_template_ends_a_bare_address_before_the_sentence_goes_on():
     page = TEMPLATE.read_text(encoding="utf-8")
-    assert 'const ADDRESS_END = ".,);:!?";' in page
+    assert 'const ADDRESS_END = ".,);:!?*";' in page
     trim = between(page, "function trimAddress(", "\n}\n")
     assert 'if (address[end - 1] === ")" && opened >= closed) break;' in trim   # a bracket of the address stays
     says = re.search(r"const SAYS_WHAT_IT_IS = /(.+)/i;", page)
@@ -2135,7 +2135,7 @@ def test_template_cleans_text_for_the_ear():
     page = TEMPLATE.read_text(encoding="utf-8")
     ear = between(page, "function earText(", "function cutAtSentence(")
     assert r"/\bhttps?:\/\/\S+/gi" in ear and r"/\bFrom the web\b:?/gi" in ear
-    assert "[*_`~|#]+" in ear and "cutAtSentence(lines.join(\" \"), MAX_SPOKEN_CHARS)" in ear
+    assert ".replace(/[*`~]+/g, \"\")" in ear and "cutAtSentence(lines.join(\" \"), MAX_SPOKEN_CHARS)" in ear
 
 
 def test_template_chooses_a_natural_english_voice_and_speaks_english():

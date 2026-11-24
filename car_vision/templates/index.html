@@ -74,8 +74,9 @@
 
   /* ---- type, sizes and curves ---- */
   :root {
+    /* Arabic letters (an answer in Arabic): "Segoe UI" on Windows, Noto on phones, Tahoma last. */
     --font: "Segoe UI Variable Display", "Segoe UI", system-ui, -apple-system, "SF Pro Display",
-            "Helvetica Neue", Arial, sans-serif;
+            "Helvetica Neue", Arial, "Noto Sans Arabic", "Noto Naskh Arabic", Tahoma, sans-serif;
     --gutter: clamp(16px, 4vw, 64px);
     --nav-space: 84px;                  /* the fixed bar and its margin: anchors land below it */
     --radius-big: 32px;
@@ -235,6 +236,17 @@
   .theme-button .moon { display: none; }
   :root[data-theme="dark"] .theme-button .sun { display: none; }
   :root[data-theme="dark"] .theme-button .moon { display: block; }
+
+  /* ---- the language button: EN while answers are English, ع while they are Arabic ---- */
+  .language-button { font: inherit; font-size: 0.72rem; font-weight: 700; line-height: 1; }
+  .language-button[aria-pressed="true"] { font-size: 1.1rem; font-weight: 600; padding-bottom: 0.3em; }   /* ع has a tail below the line */
+  /* An answer that dir="auto" found to be right to left (Arabic): letters that join are never
+     spaced apart, and a specification's name keeps its gap on the side towards its value. */
+  .details-title:dir(rtl) { letter-spacing: 0; }
+  .specs:dir(rtl) dt { padding-right: 0; padding-left: 1rem; }
+  /* A value keeps to its name's side even when its own direction differs from the list's. */
+  .specs[dir="rtl"] dd { text-align: right; }
+  .specs[dir="ltr"] dd { text-align: left; }
   .nav .round { flex: none; }
 
   /* ---- voice: the Voice button, its box, the microphones and the caption ----
@@ -1472,6 +1484,9 @@
   </div>
   <button class="pill small secondary" id="cameraButton" type="button"
           aria-expanded="false" aria-controls="cameraBox">Camera</button>
+  <!-- The language of the assistant's answers: EN for English, ع for Arabic. The page's own words stay English. -->
+  <button class="round language-button" id="languageButton" type="button" aria-pressed="false"
+          aria-label="Answer in Arabic" title="Answer in Arabic">EN</button>
   <!-- Voice: opens the voice box (on and off, which voice). Shown only where the browser can speak. -->
   <button class="round voice-button" id="voiceButton" type="button" aria-expanded="false" aria-controls="voiceBox"
           aria-label="Voice" title="Voice: off" hidden>
@@ -1636,7 +1651,7 @@
           </div>
           <!-- The answer to a question asked by voice in the full view: solid, over the bottom of the video. -->
           <div class="caption" id="caption" aria-live="polite" hidden>
-            <p class="caption-question" id="captionQuestion"></p>
+            <p class="caption-question" id="captionQuestion" dir="auto"></p>
             <p class="caption-answer" id="captionAnswer"></p>
           </div>
           <!-- Look for: a thing by its name. While looking, one chip per name says how it goes. -->
@@ -1737,7 +1752,7 @@
               </button>
               <button class="pill small secondary" id="brushClear" type="button" hidden>Clear</button>
             </div>
-            <div class="details-title" id="detailTitle"></div>
+            <div class="details-title" id="detailTitle" dir="auto"></div>
             <div class="details-meta" id="detailMeta"></div>
             <div class="details-role" id="detailRole" hidden></div>
             <div class="details-content" id="detailContent"></div>
@@ -1747,7 +1762,7 @@
             <p class="quiet" id="followDone" hidden>That is ten questions about this one. Click it again to ask more.</p>
             <form class="follow-form" id="followForm" autocomplete="off">
               <label class="visually-hidden" for="followQuestion">Ask about this</label>
-              <input id="followQuestion" type="text" maxlength="{{ max_question_chars }}" placeholder="Ask about this">
+              <input id="followQuestion" type="text" maxlength="{{ max_question_chars }}" placeholder="Ask about this" dir="auto">
               <button class="round mic-button" id="followMic" type="button" aria-pressed="false"
                       aria-label="Ask about this by voice" title="Ask by voice" hidden>
                 <svg viewBox="0 0 24 24" aria-hidden="true">
@@ -1779,7 +1794,7 @@
       </ol>
       <form class="ask-form" id="askForm" autocomplete="off">
         <label class="visually-hidden" for="question">Your question</label>
-        <input id="question" type="text" maxlength="{{ max_question_chars }}" placeholder="Ask a question">
+        <input id="question" type="text" maxlength="{{ max_question_chars }}" placeholder="Ask a question" dir="auto">
         <button class="round mic-button" id="askMic" type="button" aria-pressed="false"
                 aria-label="Ask by voice" title="Ask by voice" hidden>
           <svg viewBox="0 0 24 24" aria-hidden="true">
@@ -1926,9 +1941,13 @@ const asText = (value) => (typeof value === "string" ? value : value == null ? "
 const asList = (value) => (Array.isArray(value) ? value : []);
 
 // The language of the assistant's answers: "en" or "ar". Every request for an answer sends
-// it, and the voice asks it which language to speak and to listen for.
+// it, and the voice asks it which language to speak and to listen for. The switch in the bar
+// sets it (see "the language of the answers"). Declared here, so it can be asked from the first
+// line of the script on; the choice is remembered in this browser and is English until chosen.
+const LANGUAGE_KEY = "answerLanguage";
+let arabicWanted = readStored(LANGUAGE_KEY) === "ar";
 function answerLanguage() {
-  return "en";
+  return arabicWanted ? "ar" : "en";
 }
 
 function setText(node, text) {
@@ -2734,11 +2753,30 @@ function scrollChat() {
 }
 
 // An answer's words with its links as short clickable words (answerNodes); anything else as it is.
+// An answer reads from right to left when it is mostly Arabic (textDirection); the visitor's own
+// question takes its direction from its first letter (dir="auto"), as text being typed does.
 function messageText(kind, text) {
+  if (kind === "question") return withOwnDirection(make("p", "text", text));
   if (kind !== "answer") return make("p", "text", text);
   const paragraph = make("p", "text");
+  paragraph.dir = textDirection(text);
   paragraph.append(...answerNodes(text));
   return paragraph;
+}
+
+// The node with dir="auto" (what the visitor typed).
+function withOwnDirection(node) {
+  node.dir = "auto";
+  return node;
+}
+
+// "rtl" when at least a third of the letters in the text are Arabic letters, else "ltr" (also
+// for a text with no letters). Unlike dir="auto" it does not hang on the first letter, so an
+// Arabic sentence that starts with "iPhone 15 Pro" still reads from right to left.
+function textDirection(text) {
+  const letters = asText(text).match(/\p{L}/gu) || [];
+  const arabic = letters.filter((letter) => /\p{Script=Arabic}/u.test(letter)).length;
+  return letters.length > 0 && arabic * 3 >= letters.length ? "rtl" : "ltr";
 }
 
 function addMessage(kind, text) {
@@ -2832,7 +2870,7 @@ function webLine(sources) {
 
 const LINK_LABEL_CHARS = 60;
 const LINK_PATTERN = /\[([^\[\]\n]+)\]\(([^\s()]*(?:\([^\s()]*\)[^\s()]*)*)\)|\bhttps?:\/\/[^\s<>"`]+/gi;
-const ADDRESS_END = ".,);:!?*";
+const ADDRESS_END = ".,);:!?*،؛؟»";      // with the Arabic comma, semicolon, question mark and »
 // "LinkedIn: ...", "His profile is ...", "**Profile:** ..." (marks between the words and the address)
 const SAYS_WHAT_IT_IS = /(?::|\b(?:is|at|here|see))[*`\s]*$/i;
 const NAMED_SITE = /(?:\b[a-z][a-z0-9+.-]*:\/\/)?[\p{L}\p{N}-]+(?:\.[\p{L}\p{N}-]+)*\.\p{L}{2,}(?![\p{L}\p{N}-])/giu;
@@ -2944,8 +2982,8 @@ function linkNode(part) {
 // Underscores are never marks ("file_name_here", "__init__"). Nothing crosses a line break, and a
 // mark without a partner on its line stays as written. Bold may hold italic, and italic bold.
 
-const MARK_OPEN_AFTER = "([{\"':-–";
-const MARK_CLOSE_BEFORE = ".,;:!?)]}\"'";
+const MARK_OPEN_AFTER = "([{\"':-–«";
+const MARK_CLOSE_BEFORE = ".,;:!?)]}\"'،؛؟»۔";   // with the Arabic comma, semicolon, question mark, » and full stop
 const HEADING = /^(\s*)#{1,6}[ \t]+/;     // "## Title"; "#3 is the laptop" has no space and stays
 const BULLET = /^(\s*)[-*+](?=[ \t])/;    // "- item"; "1. item" stays as written
 const isSpace = (char) => /\s/.test(char);
@@ -3218,7 +3256,7 @@ async function askChat(question) {
   setBusy(true);
   const thinking = addThinking();
   try {
-    const { response, data } = await postJson("/api/ask", { question });
+    const { response, data } = await postJson("/api/ask", { question, language: answerLanguage() });
     if (data && typeof data.error === "string") {
       chatProblem(data.error);
     } else if (response.ok && data && typeof data.text === "string") {
@@ -3314,6 +3352,7 @@ function titleFor(target) {
 function showWaiting() {
   setPhoto(null);
   detailTitle.textContent = "Looking";
+  detailTitle.dir = "auto";      // until an answer's card sets it (showInfo)
   detailMeta.textContent = "";
   setRole("");
   detailContent.replaceChildren();
@@ -3361,17 +3400,25 @@ function personIntro(person) {
 function showInfo(info) {
   const name = asText(info.name);
   if (name) detailTitle.textContent = name;
+  const specs = asList(info.specs).filter((spec) => spec && typeof spec === "object");
+  // The title and the list take the direction of the whole card, so an Arabic card puts each
+  // specification's name on the right of its value even when the first name is "CPU".
+  const cardText = [info.summary, ...specs.flatMap((spec) => [spec.name, spec.value])].map(asText).join(" ");
+  const card = textDirection(cardText);
+  detailTitle.dir = card;
   const nodes = [];
   if (asText(info.summary)) {
     const summary = make("p");
+    summary.dir = textDirection(info.summary);
     summary.append(...answerNodes(asText(info.summary)));   // its links as short clickable words
     nodes.push(summary);
   }
-  const specs = asList(info.specs).filter((spec) => spec && typeof spec === "object");
   if (specs.length) {
     const list = make("dl", "specs");
+    list.dir = card;
     for (const spec of specs) {
       const value = make("dd");
+      value.dir = textDirection(spec.value);
       value.append(...answerNodes(asText(spec.value)));   // bold, code and links shown, never their marks
       list.append(make("dt", "", plainWords(asText(spec.name))), value);
     }
@@ -3394,7 +3441,7 @@ async function inspect(body, key, from) {
   showWaiting();
   let reply;
   try {
-    reply = await postJson("/api/inspect", body);
+    reply = await postJson("/api/inspect", { ...body, language: answerLanguage() });   // a kept description only in this language
   } catch (error) {
     if (mine === lookup) showProblem("Program not running: the click could not be sent.");
     return;
@@ -3423,7 +3470,7 @@ async function describe(id, mine) {
   showLooking();
   let reply;
   try {
-    reply = await postJson("/api/describe", { id });
+    reply = await postJson("/api/describe", { id, language: answerLanguage() });
   } catch (error) {
     if (mine === lookup) showProblem("Program not running: the look-up could not be sent.");
     return;
@@ -3856,7 +3903,7 @@ followPart.addEventListener("click", () => askFollowUp(PART_QUESTION, false));
 async function askFollowUp(question, typed) {
   if (!question || followId === null || followQuestion.disabled) return;
   const id = followId, mine = lookup;
-  const body = { id, question };
+  const body = { id, question, language: answerLanguage() };
   const strokes = markedStrokes();
   if (strokes) body.strokes = strokes;          // only points: the server draws them on its own photo
   if (typed) followQuestion.value = "";
@@ -3933,6 +3980,30 @@ systemDark.addEventListener("change", () => {
   if (chosenTheme() === null) applyTheme(systemDark.matches ? "dark" : "light", true);
 });
 applyTheme(shownTheme(), false);
+
+// ---- the language of the answers --------------------------------------------------
+//
+// The round button in the bar, between Camera and Voice: EN while the assistant answers in
+// English, ع while it answers in Arabic. A press switches. Only the assistant's answers change
+// language; the page's own words stay English. The choice is remembered in this browser, and
+// it is English until the visitor chooses Arabic.
+
+const languageButton = byId("languageButton");   // the choice itself: arabicWanted, beside answerLanguage()
+
+function showLanguage() {
+  const label = arabicWanted ? "Answer in English" : "Answer in Arabic";   // what a press does
+  languageButton.textContent = arabicWanted ? "ع" : "EN";
+  languageButton.setAttribute("aria-pressed", arabicWanted ? "true" : "false");
+  languageButton.setAttribute("aria-label", label);
+  languageButton.title = label;
+}
+
+languageButton.addEventListener("click", () => {
+  arabicWanted = !arabicWanted;
+  store(LANGUAGE_KEY, arabicWanted ? "ar" : null);
+  showLanguage();
+});
+showLanguage();
 
 // ---- the camera box: the phone's address --------------------------------------
 
@@ -5003,6 +5074,7 @@ function showCaption(question, answer, isProblem, ms) {
   captionQuestion.hidden = !question;
   if (typeof answer === "string") setText(captionAnswer, answer);
   else captionAnswer.replaceChildren(...answer);
+  captionAnswer.dir = textDirection(captionAnswer.textContent);   // right to left when mostly Arabic
   captionAnswer.hidden = !captionAnswer.textContent;
   captionAnswer.classList.toggle("problem", isProblem);
   caption.hidden = false;
@@ -5321,7 +5393,7 @@ function setSceneBusy(isBusy, hadFocus) {
 // The answer, or the problem, from /api/scene as { text, isProblem }.
 async function askForScene() {
   try {
-    const { response, data } = await postJson("/api/scene", {});
+    const { response, data } = await postJson("/api/scene", { language: answerLanguage() });
     if (data && typeof data.error === "string") return { text: data.error, isProblem: true };
     if (response.ok && data && typeof data.text === "string") return { text: data.text, isProblem: false };
     return { text: "The program gave no answer (status " + response.status + "). Please try again.", isProblem: true };

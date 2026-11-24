@@ -121,8 +121,8 @@ def test_code_may_sit_inside_bold_and_a_long_line_is_searched_once():
 
 def test_a_mark_opens_and_closes_only_beside_the_characters_the_spec_names():
     page = page_text()
-    assert set(js_string(page, "MARK_OPEN_AFTER")) == set("([{\"':-–")
-    assert set(js_string(page, "MARK_CLOSE_BEFORE")) == set(".,;:!?)]}\"'")
+    assert set(js_string(page, "MARK_OPEN_AFTER")) == set("([{\"':-–«")
+    assert set(js_string(page, "MARK_CLOSE_BEFORE")) == set(".,;:!?)]}\"'،؛؟»۔")
     opens = between(page, "function markOpens(", "\n}\n")
     assert "start === 0 || isSpace(before) || MARK_OPEN_AFTER.includes(before) || also.includes(before)" in opens
     assert "after !== undefined && !isSpace(after)" in opens

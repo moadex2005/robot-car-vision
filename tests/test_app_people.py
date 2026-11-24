@@ -77,7 +77,7 @@ class FakeAssistant:
         if self.reload_error is not None:
             raise self.reload_error
 
-    def describe_scene(self, image):
+    def describe_scene(self, image, language="en"):
         self.scenes.append(image)
         if self.scene_error is not None:
             raise self.scene_error
@@ -475,7 +475,7 @@ def test_the_scene_button_sits_on_the_video_and_answers_in_caption_chat_and_voic
     assert 'addMessage("question", SCENE_QUESTION);' in scene and "addAnswer({ text });" in scene
     assert 'answerArrived("scene", text, isProblem);' in scene             # caption, and say() when voice is on
     assert 'const SCENE_QUESTION = "Describe the scene";' in page
-    assert 'postJson("/api/scene", {})' in page                            # no picture from the browser
+    assert 'postJson("/api/scene", { language: answerLanguage() })' in page   # no picture from the browser
     assert page.count("Describe the scene sends the whole picture.") == 2  # under the list and in the footer
 
 

@@ -14,7 +14,8 @@ an object the visitor clicked, with the detector's label, and reads back a
 name, a short description and a few specifications. It has no memory and its
 own system prompt. `Assistant.describe_scene` is the same kind of call for the
 whole camera picture: two or three sentences about what the car sees, with no
-web search.
+web search. Each of the four calls answers in English, or in Arabic when the
+page's switch asks for it (`language="ar"`).
 
 This is the only module that imports the `anthropic` library. `Assistant`
 talks to an `LLMClient`, so a fake (in the tests) or another provider can
@@ -360,6 +361,60 @@ def labels_in_view(state: WorldState, max_age_seconds: float) -> list[str]:
     return sorted({d.label for d in snap.detections if d.label != "person"})
 
 
+# ---- the language of one answer ------------------------------------------------
+#
+# The page's switch asks for English ("en") or Arabic ("ar") answers. English sends
+# exactly what was always sent. Arabic adds one short instruction, written in Arabic,
+# after the text of the message being answered now; the system prompts stay the same,
+# so the chat's cached prompt and its conversation are not changed by the switch.
+
+LANGUAGES = ("en", "ar")
+ARABIC_STYLES = ("standard", "egyptian")     # assistant.arabic_style in config.yaml
+
+# "Answer this message in Modern Standard Arabic instead of English, in simple, clear sentences."
+# "Answer this message in everyday Egyptian Arabic instead of English, as people speak it every day."
+ARABIC_STYLE_WORDS = {
+    "standard": "أجب عن هذه الرسالة باللغة العربية الفصحى بدلاً من الإنجليزية، بجمل بسيطة وواضحة.",
+    "egyptian": "أجب عن هذه الرسالة باللهجة المصرية العامية بدلاً من الإنجليزية، "
+                "كما يتكلمها الناس في حياتهم اليومية.",
+}
+# "Write people's names, product names, model numbers, units and web addresses as they are
+# normally written, and do not add a translation of them or write how they sound in other letters."
+ARABIC_RULES = (
+    "اكتب أسماء الأشخاص وأسماء المنتجات وأرقام الطرازات والوحدات وعناوين المواقع كما تُكتب عادةً، "
+    "ولا تُضف لها ترجمة ولا تكتب نطقها بحروف أخرى."
+)
+# For `describe` only, where the headings are real: "Keep the headings NAME, ABOUT and SPECS in
+# English exactly as they are, and write what follows them in Arabic."
+ARABIC_HEADINGS = "اترك العناوين NAME و ABOUT و SPECS بالإنجليزية كما هي تماماً، واكتب ما بعدها بالعربية."
+
+
+def check_language(language: Any) -> str:
+    """The language, or ValueError when it is not "en" or "ar"."""
+    if not isinstance(language, str) or language not in LANGUAGES:
+        raise ValueError('The answer language must be "en" (English) or "ar" (Arabic).')
+    return language
+
+
+def language_instruction(language: str, style: str) -> str:
+    """What the model is told about the language of this one answer: empty for English.
+
+    `style` is assistant.arabic_style: "standard" or "egyptian". A wrong language or
+    style is a ValueError.
+    """
+    check_language(language)
+    if style not in ARABIC_STYLES:
+        raise ValueError('The Arabic style must be "standard" or "egyptian".')
+    if language == "en":
+        return ""
+    return ARABIC_STYLE_WORDS[style] + " " + ARABIC_RULES
+
+
+def with_instruction(text: str, instruction: str) -> str:
+    """The text, followed by the language instruction when there is one."""
+    return f"{text}\n\n{instruction}" if instruction else text
+
+
 # ---- describing one object ---------------------------------------------------
 
 
@@ -396,15 +451,24 @@ UNKNOWN_OBJECT = "Unknown object"
 DESCRIBE_BUSY_MESSAGE = ("The assistant is still busy looking up the previous object. "
                          "Please wait and try again.")
 
-# A key line of the answer: NAME, ABOUT or SPECS in any letter case, perhaps in
-# Markdown bold or after a heading mark, then a colon. It is never a bullet.
-KEY_LINE = re.compile(r"^\s*#*\s*(?:\*\*)?\s*(name|about|specifications|specs)\s*(?:\*\*)?\s*:"
-                      r"\s*(?:\*\*)?(.*)$", re.IGNORECASE)
+# The key words of an answer, also as an Arabic answer may translate them.
+KEYS = {"name": "name", "about": "about", "specifications": "specs", "specs": "specs",
+        "الاسم": "name", "نبذة": "about", "الوصف": "about", "عن": "about", "المواصفات": "specs"}
+COLONS = ":：﹕"             # the colon, the full-width colon and the small colon
+# Invisible marks that set the direction of text (LRM, RLM, ALM, embeddings, isolates). An
+# Arabic answer may carry them; they are taken out before anything is read.
+DIRECTION_MARKS = re.compile("[‎‏؜‪-‮⁦-⁩]")
+# A key line of the answer: NAME, ABOUT or SPECS (or an Arabic key word) in any letter case,
+# perhaps in Markdown bold or after a heading mark, then a colon. It is never a bullet.
+KEY_LINE = re.compile(r"^\s*#*\s*(?:\*\*)?\s*(name|about|specifications|specs|الاسم|نبذة|الوصف|عن|المواصفات)"
+                      rf"\s*(?:\*\*)?\s*[{COLONS}]\s*(?:\*\*)?(.*)$", re.IGNORECASE)
 # The specs heading alone on its line, without a colon: "## Specs", "**SPECS**", "Specifications".
-SPECS_HEADING = re.compile(r"^\s*#*\s*(?:\*\*)?\s*(?:specifications|specs)\s*(?:\*\*)?\s*$",
+SPECS_HEADING = re.compile(r"^\s*#*\s*(?:\*\*)?\s*(?:specifications|specs|المواصفات)\s*(?:\*\*)?\s*$",
                            re.IGNORECASE)
-# "Sources:" after the specs: the end of the answer's parts.
-SOURCES_LINE = re.compile(r"^\s*#*\s*(?:\*\*)?\s*sources?\s*(?:\*\*)?\s*:", re.IGNORECASE)
+# "Sources:" (or "المصادر:") after the specs: the end of the answer's parts.
+SOURCES_LINE = re.compile(rf"^\s*#*\s*(?:\*\*)?\s*(?:sources?|المصادر|المصدر)\s*(?:\*\*)?\s*[{COLONS}]",
+                          re.IGNORECASE)
+SPEC_COLON = re.compile(f"[{COLONS}]")
 # A bullet: "-", "*", "•", an en or em dash, or a number such as "1." or "1)".
 BULLET = re.compile(r"^\s*(?:[-*•–—]|\d+[.)])\s+")
 
@@ -431,8 +495,11 @@ def parse_object_info(text: str, label: str | None) -> tuple[str, str, tuple[tup
     bullets. Spec lines without a colon, or named like a link, are skipped;
     a "Sources:" line ends the specs; only the first six specs are kept.
     An empty or missing NAME gives the label's name. An answer with no key
-    line at all becomes the summary as a whole.
+    line at all becomes the summary as a whole. An Arabic answer may use Arabic
+    key words (see KEYS), "المصادر:" for the sources and a full-width or small
+    colon; its invisible direction marks are taken out first.
     """
+    text = DIRECTION_MARKS.sub("", text)
     name, about, specs = "", [], []
     part = ""                     # where we are: "name", "about", "specs", or "end" after Sources
     found_a_key = False
@@ -461,8 +528,7 @@ def answer_key(line: str) -> tuple[str, str]:
     """("name" | "about" | "specs", the rest of the line) for a key line, else ("", "")."""
     match = KEY_LINE.match(line)
     if match:
-        key = match.group(1).lower()
-        return ("specs" if key == "specifications" else key), without_bold(match.group(2))
+        return KEYS[match.group(1).lower()], without_bold(match.group(2))
     if SPECS_HEADING.match(line):
         return "specs", ""
     return "", ""
@@ -483,9 +549,9 @@ def add_spec(specs: list[tuple[str, str]], line: str) -> None:
 def spec_pair(line: str) -> tuple[str, str] | None:
     """One "- name: value" line as (name, value), or None when it is not one."""
     body = without_bold(BULLET.sub("", line))
-    if ":" not in body:
+    if not SPEC_COLON.search(body):
         return None
-    name, value = (part.strip() for part in body.split(":", 1))
+    name, value = (part.strip() for part in SPEC_COLON.split(body, 1))
     if not name or not value or looks_like_link(name):
         return None
     return name, value
@@ -666,8 +732,12 @@ class Assistant:
         require(settings, "web_search_max_uses", int)
         self.history_turns: int = require(settings, "history_turns", int)
         self.seen_within_seconds = float(require(settings, "seen_within_seconds", (int, float)))
+        self.arabic_style: str = require(settings, "arabic_style", str)
         if provider != "anthropic":
             raise ConfigError(f"assistant.provider must be 'anthropic', got {provider!r}")
+        if self.arabic_style not in ARABIC_STYLES:
+            raise ConfigError(f"assistant.arabic_style must be one of {ARABIC_STYLES}, "
+                              f"got {self.arabic_style!r}")
 
         self._notes_path = resolve_path(notes_file)
         self._people_dir = resolve_path(people_dir)
@@ -679,9 +749,13 @@ class Assistant:
         self._history: list[Turn] = []
         self._exchanges = 0      # question-answer pairs in the current conversation
 
-    def ask(self, question: str) -> Answer:
-        """Answer one question. Waits a while if another question is still being answered."""
+    def ask(self, question: str, language: str = "en") -> Answer:
+        """Answer one question. Waits a while if another question is still being answered.
+
+        `language` is "en" or "ar": the language of this answer only.
+        """
         text = check_question(question)
+        instruction = self._instruction(language)
         self._acquire()
         try:
             # The history is only ever added to. Once it holds history_turns
@@ -690,10 +764,13 @@ class Assistant:
             fresh = self._exchanges >= self.history_turns
             earlier = [] if fresh else self._history
             content = self._user_content(text, with_memory=True)
-            turns = earlier + [{"role": "user", "content": content}]
-            reply = self._client.complete(self._system, turns, self.web_search)
+            # The language instruction goes with the question answered now only: the history
+            # keeps the turn without it, exactly as an English turn is kept.
+            asked = {"role": "user", "content": with_instruction(content, instruction)}
+            kept = {"role": "user", "content": content}
+            reply = self._client.complete(self._system, earlier + [asked], self.web_search)
             # Only a finished answer is kept; a failed question leaves the history as it was.
-            self._history = turns + list(reply.new_turns)
+            self._history = earlier + [kept] + list(reply.new_turns)
             self._exchanges = 1 if fresh else self._exchanges + 1
             return Answer(text=reply.text, used_web=reply.used_web,
                           sources=unique(reply.sources))
@@ -725,13 +802,17 @@ class Assistant:
         finally:
             self._lock.release()
 
-    def describe(self, image: bytes, label: str | None = None) -> ObjectInfo:
+    def describe(self, image: bytes, label: str | None = None, language: str = "en") -> ObjectInfo:
         """Say what the object in one JPEG picture is. `label` is the detector's
         label, or None when the visitor clicked where the detector found nothing.
 
         One call with no memory: the chat history is neither sent nor changed.
+        In Arabic the NAME, ABOUT and SPECS headings stay English; what follows them is Arabic.
         """
-        turns = [user_turn(label_text(label), check_image(image))]
+        instruction = self._instruction(language)
+        if instruction:
+            instruction += " " + ARABIC_HEADINGS
+        turns = [user_turn(with_instruction(label_text(label), instruction), check_image(image))]
         reply = self._look_up(DESCRIBE_PROMPT, turns, self.web_search)
         name, summary, specs = parse_object_info(reply.text, label)
         return ObjectInfo(name=name, summary=summary, specs=specs,
@@ -739,7 +820,7 @@ class Assistant:
 
     def follow_up(self, image: bytes, label: str | None, info: ObjectInfo | None,
                   earlier: Sequence[tuple[str, str]], question: str,
-                  marked: bytes | None = None) -> Answer:
+                  marked: bytes | None = None, language: str = "en") -> Answer:
         """Answer one more question about a clicked thing.
 
         The whole short conversation is sent again on every call, as plain text:
@@ -747,21 +828,24 @@ class Assistant:
         earlier (question, answer) pairs and the new question. `marked` is the
         same picture with the visitor's magenta outline; it goes with the new
         question. Nothing is kept, and the chat history is neither sent nor changed.
+        The language instruction, when there is one, goes with the new question.
         """
+        instruction = self._instruction(language)
         marked_copy = None if marked is None else check_image(marked)
-        turns = follow_up_turns(check_image(image), label_text(label), info,
-                                check_earlier(earlier), check_question(question), marked_copy)
+        turns = follow_up_turns(check_image(image), label_text(label), info, check_earlier(earlier),
+                                with_instruction(check_question(question), instruction), marked_copy)
         reply = self._look_up(FOLLOW_UP_PROMPT, turns, self.web_search)
         return Answer(text=reply.text, used_web=reply.used_web, sources=unique(reply.sources))
 
-    def describe_scene(self, image: bytes) -> Answer:
+    def describe_scene(self, image: bytes, language: str = "en") -> Answer:
         """Say in two or three sentences what the whole camera picture shows.
 
         One call with no memory and no web search. The picture goes with the
         same camera lines `ask` sends; the chat history is neither sent nor changed.
         """
+        instruction = self._instruction(language)
         picture = check_image(image)
-        turns = [user_turn(self._user_content(SCENE_REQUEST), picture)]
+        turns = [user_turn(self._user_content(with_instruction(SCENE_REQUEST, instruction)), picture)]
         reply = self._look_up(SCENE_PROMPT, turns, allow_web=False)
         return Answer(text=reply.text, used_web=reply.used_web, sources=unique(reply.sources))
 
@@ -773,6 +857,10 @@ class Assistant:
             return self._client.complete(system, turns, allow_web)
         finally:
             self._describe_lock.release()
+
+    def _instruction(self, language: str) -> str:
+        """The language instruction for one call (empty for English), or ValueError."""
+        return language_instruction(language, self.arabic_style)
 
     def _acquire(self) -> None:
         if not self._lock.acquire(timeout=LOCK_WAIT_SECONDS):

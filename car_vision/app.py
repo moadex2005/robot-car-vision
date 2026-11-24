@@ -69,7 +69,7 @@ from flask import Flask, Response, abort, jsonify, redirect, render_template, re
 from werkzeug.exceptions import HTTPException
 from werkzeug.serving import WSGIRequestHandler, make_server
 
-from car_vision.assistant import MAX_IMAGE_BYTES, Assistant, AssistantError, ObjectInfo
+from car_vision.assistant import LANGUAGES, MAX_IMAGE_BYTES, Assistant, AssistantError, ObjectInfo
 from car_vision.config import ConfigError, load_config, require, resolve_path, section
 from car_vision.door import (LONGEST_PASSWORD, PASSWORD_VARIABLE, DoorError, PhoneDoor, can_be_typed,
                              ensure_certificate, is_loopback, lan_addresses, minutes_words, read_password,
@@ -150,17 +150,17 @@ class UnavailableAssistant:
     def __init__(self, reason: str) -> None:
         self.reason = reason
 
-    def ask(self, question: str) -> Any:
+    def ask(self, question: str, language: str = "en") -> Any:
         raise AssistantError(self.reason)
 
-    def describe(self, image: bytes, label: str | None = None) -> Any:
+    def describe(self, image: bytes, label: str | None = None, language: str = "en") -> Any:
         raise AssistantError(self.reason)
 
     def follow_up(self, image: bytes, label: str | None, info: Any, earlier: Any, question: str,
-                  marked: bytes | None = None) -> Any:
+                  marked: bytes | None = None, language: str = "en") -> Any:
         raise AssistantError(self.reason)
 
-    def describe_scene(self, image: bytes) -> Any:
+    def describe_scene(self, image: bytes, language: str = "en") -> Any:
         raise AssistantError(self.reason)
 
     def reset(self) -> None:
@@ -284,15 +284,26 @@ class LookupGate:
                     del self._gates[key]             # nobody waits for this object any more
 
 
-def cache_key(inspection: Inspection) -> tuple[int, int, str] | None:
+def cache_key(inspection: Inspection, language: str = "en") -> tuple[int, int, str, str] | None:
     """Only tracked objects are cached: an area or an untracked box may be anything next time.
 
     The epoch is part of the key: track numbers start again when the picture size or
     the camera changes, and track 3 then may be another object with the same label.
+    The language is part of it too: a thing looked up in English is looked up again in Arabic.
     """
     if inspection.kind != "object" or inspection.track_id is None:
         return None
-    return inspection.epoch, inspection.track_id, inspection.label
+    return inspection.epoch, inspection.track_id, inspection.label, language
+
+
+LANGUAGE_PROBLEM = 'The answer language must be "en" (English) or "ar" (Arabic), like {"language": "ar"}.'
+
+
+def read_language(body: Any) -> str | None:
+    """The answer language a request body asks for: "en" when it names none, None when it
+    names something other than "en" or "ar"."""
+    language = body.get("language", "en") if isinstance(body, dict) else "en"
+    return language if isinstance(language, str) and language in LANGUAGES else None
 
 
 # ---- turning answers into JSON -------------------------------------------------------------
@@ -810,8 +821,11 @@ def create_app(pipeline: Any, assistant: Any, camera_file: Path | None = None,
         problem = question_problem(question)
         if problem is not None:
             return jsonify(error=problem), 400
+        language = read_language(body)
+        if language is None:
+            return jsonify(error=LANGUAGE_PROBLEM), 400
         try:
-            answer = assistant.ask(question)
+            answer = assistant.ask(question, language=language)
         except ValueError as error:                   # the assistant's own check of the question
             return jsonify(error=str(error)), 400
         except AssistantError as error:               # no key, no internet, busy, refusal ...
@@ -832,9 +846,13 @@ def create_app(pipeline: Any, assistant: Any, camera_file: Path | None = None,
 
     @app.post("/api/inspect")
     def inspect_click() -> Any:
-        click = read_click(request.get_json(silent=True))
+        body = request.get_json(silent=True)
+        click = read_click(body)
         if isinstance(click, str):
             return jsonify(error=click), 400
+        language = read_language(body)                 # a description kept in another language is not shown
+        if language is None:
+            return jsonify(error=LANGUAGE_PROBLEM), 400
         try:
             target = pipeline.target(**click)
         except Exception as error:                    # never show a traceback on the page
@@ -845,7 +863,7 @@ def create_app(pipeline: Any, assistant: Any, camera_file: Path | None = None,
         inspection = Inspection(target.kind, target.label, target.track_id, target.photo,
                                 person_name=target.person.name if target.person is not None else None,
                                 epoch=int(getattr(target, "epoch", 0)))   # older Targets have no epoch
-        key = cache_key(inspection)
+        key = cache_key(inspection, language)
         cached = answers.get(key) if key is not None else None
         if cached is not None:                         # the page shows it at once: it is this click's description
             inspection = replace(inspection, info=object_info(cached))
@@ -871,14 +889,17 @@ def create_app(pipeline: Any, assistant: Any, camera_file: Path | None = None,
             return jsonify(error=CLICK_AGAIN), 404
         if inspection.kind == "person":
             return jsonify(error="People are not looked up: their picture is never sent."), 400
-        key = cache_key(inspection)
+        language = read_language(body)
+        if language is None:
+            return jsonify(error=LANGUAGE_PROBLEM), 400
+        key = cache_key(inspection, language)
         if key is None:                               # an area or an untracked box: never cached
-            reply, code = look_up(assistant, inspection)
+            reply, code = look_up(assistant, inspection, language)
         else:
             with gate.one_at_a_time(key):             # a second click on the same object waits here
                 reply, code = answers.get(key), 200
                 if reply is None:
-                    reply, code = look_up(assistant, inspection)
+                    reply, code = look_up(assistant, inspection, language)
                     if "error" not in reply:
                         answers.put(key, reply)
         if "error" not in reply:                      # kept for the follow-up questions
@@ -900,6 +921,9 @@ def create_app(pipeline: Any, assistant: Any, camera_file: Path | None = None,
         problem = question_problem(question)
         if problem is not None:
             return jsonify(error=problem), 400
+        language = read_language(body)
+        if language is None:
+            return jsonify(error=LANGUAGE_PROBLEM), 400
         # One question at a time for each clicked thing, so its conversation stays in order.
         with gate.one_at_a_time(("follow_up", inspection_id)):
             inspection = inspections.get(inspection_id)
@@ -912,7 +936,7 @@ def create_app(pipeline: Any, assistant: Any, camera_file: Path | None = None,
             if len(inspection.pairs) >= MAX_FOLLOW_UPS:
                 return jsonify(error=TOO_MANY_FOLLOW_UPS), 400
             strokes = marking_of_a_part(inspection, strokes)
-            reply, code = answer_follow_up(assistant, inspection, question, strokes)
+            reply, code = answer_follow_up(assistant, inspection, question, strokes, language)
             if "error" not in reply:                  # a failed question is not kept
                 kept = MARKED_PREFIX + question if strokes is not None else question
                 inspections.add_pair(inspection_id, kept, reply["text"])
@@ -1067,11 +1091,14 @@ def create_app(pipeline: Any, assistant: Any, camera_file: Path | None = None,
 
     @app.post("/api/scene")
     def scene() -> Any:
+        language = read_language(request.get_json(silent=True))
+        if language is None:
+            return jsonify(error=LANGUAGE_PROBLEM), 400
         photo = pipeline.scene_photo()                # the server's own picture: none comes from the browser
         if photo is None:
             return jsonify(error=NO_PICTURE), 503
         try:
-            answer = assistant.describe_scene(photo)
+            answer = assistant.describe_scene(photo, language=language)
         except ValueError as error:
             return jsonify(error=str(error)), 400
         except AssistantError as error:               # no key, no internet, busy, refusal ...
@@ -1238,11 +1265,11 @@ def create_app(pipeline: Any, assistant: Any, camera_file: Path | None = None,
     return app
 
 
-def look_up(assistant: Any, inspection: Inspection) -> tuple[dict[str, Any], int]:
-    """Ask the assistant what the photo shows: (the JSON answer, the HTTP status)."""
+def look_up(assistant: Any, inspection: Inspection, language: str = "en") -> tuple[dict[str, Any], int]:
+    """Ask the assistant what the photo shows, in this language: (the JSON answer, the HTTP status)."""
     log.info("Looking up %s", f"a {inspection.label}" if inspection.label else "a clicked area")
     try:
-        return info_json(assistant.describe(inspection.photo, inspection.label or None)), 200
+        return info_json(assistant.describe(inspection.photo, inspection.label or None, language=language)), 200
     except ValueError as error:                   # the assistant's own check of the picture or label
         return {"error": str(error)}, 400
     except AssistantError as error:               # no key, no internet, busy, refusal ...
@@ -1254,13 +1281,15 @@ def look_up(assistant: Any, inspection: Inspection) -> tuple[dict[str, Any], int
 
 
 def answer_follow_up(assistant: Any, inspection: Inspection, question: str,
-                     strokes: list[list[tuple[float, float]]] | None = None) -> tuple[dict[str, Any], int]:
+                     strokes: list[list[tuple[float, float]]] | None = None,
+                     language: str = "en") -> tuple[dict[str, Any], int]:
     """Ask one more question about a clicked thing: (the JSON answer, the HTTP status).
 
     An object or an area: the assistant gets the stored photo, label, description
     and earlier questions, and with brush strokes also a copy of the photo with
     the marked part outlined. A recognised person: only text goes to the chat,
-    with a sentence naming them; their picture is never sent anywhere.
+    with a sentence naming them; their picture is never sent anywhere. The answer
+    is in `language` ("en" or "ar").
     """
     if inspection.kind == "person":
         named = f"This question is about {inspection.person_name}, who the camera recognises. {question}"
@@ -1271,12 +1300,12 @@ def answer_follow_up(assistant: Any, inspection: Inspection, question: str,
     try:
         if inspection.kind == "person":
             log.info("Answering a follow-up question about a recognised person")
-            answer = assistant.ask(named)
+            answer = assistant.ask(named, language=language)
         else:
             log.info("Answering a follow-up question about %s%s",
                      f"a {inspection.label}" if inspection.label else "a clicked area",
                      " (a marked part)" if strokes is not None else "")
-            answer = ask_about_object(assistant, inspection, question, strokes)
+            answer = ask_about_object(assistant, inspection, question, strokes, language)
     except ValueError as error:                   # the assistant's own check of the question or picture
         return {"error": str(error)}, 400
     except AssistantError as error:               # no key, no internet, busy, refusal ...
@@ -1305,16 +1334,18 @@ def marking_of_a_part(inspection: Inspection,
 
 
 def ask_about_object(assistant: Any, inspection: Inspection, question: str,
-                     strokes: list[list[tuple[float, float]]] | None) -> Any:
+                     strokes: list[list[tuple[float, float]]] | None, language: str = "en") -> Any:
     """The assistant's answer about an object or an area, with the marked copy when there are strokes.
 
     The marking is drawn here on the server's own photo; the browser sent only the points.
     """
     photo, label = inspection.photo, inspection.label or None
     if strokes is None:
-        return assistant.follow_up(photo, label, inspection.info, inspection.pairs, question)
+        return assistant.follow_up(photo, label, inspection.info, inspection.pairs, question,
+                                   language=language)
     marked = mark_photo(photo, strokes, max_bytes=MAX_IMAGE_BYTES)   # never over what the assistant takes
-    return assistant.follow_up(photo, label, inspection.info, inspection.pairs, question, marked=marked)
+    return assistant.follow_up(photo, label, inspection.info, inspection.pairs, question, marked=marked,
+                               language=language)
 
 
 def mjpeg_stream(pipeline: Any, clock: Callable[[], float] = time.monotonic,

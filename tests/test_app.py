@@ -134,7 +134,7 @@ class FakeAssistant:
         self.marked = []                    # the marked copy given with every follow_up call, or None
         self.resets = 0
 
-    def follow_up(self, image, label, info, earlier, question, marked=None):
+    def follow_up(self, image, label, info, earlier, question, marked=None, language="en"):
         self.follow_ups.append((image, label, info, earlier, question))
         self.marked.append(marked)
         error = self.follow_up_errors.pop(0) if self.follow_up_errors else None
@@ -142,13 +142,13 @@ class FakeAssistant:
             raise error
         return Answer(f"Answer {len(self.follow_ups)}", used_web=True, sources=("https://example.org/w",))
 
-    def describe(self, image, label=None):
+    def describe(self, image, label=None, language="en"):
         self.looked_up.append((image, label))
         if self.describe_error is not None:
             raise self.describe_error
         return self.info
 
-    def ask(self, question):
+    def ask(self, question, language="en"):
         self.questions.append(question)
         if self.error is not None:
             raise self.error
@@ -527,7 +527,7 @@ def test_after_the_track_numbers_start_again_the_same_track_is_looked_up_again()
 
 
 def test_the_cache_key_holds_the_epoch_and_a_target_without_one_is_epoch_0():
-    assert app_module.cache_key(Inspection("object", "laptop", 7, PHOTO, epoch=3)) == (3, 7, "laptop")
+    assert app_module.cache_key(Inspection("object", "laptop", 7, PHOTO, epoch=3)) == (3, 7, "laptop", "en")
     assert app_module.cache_key(Inspection("area", "", None, PHOTO, epoch=3)) is None
     client = client_for(pipeline=FakePipeline(target=LAPTOP))     # a Target from before epochs
     assert client.post("/api/inspect", json={"x": 0.5, "y": 0.5}).status_code == 200
@@ -541,7 +541,7 @@ class SlowAssistant(FakeAssistant):
         self.started = threading.Event()
         self.go_on = threading.Event()
 
-    def describe(self, image, label=None):
+    def describe(self, image, label=None, language="en"):
         self.started.set()
         assert self.go_on.wait(5)
         return super().describe(image, label)
@@ -1764,8 +1764,8 @@ def test_template_has_the_phone_picture_row():
 def test_template_has_the_follow_up_chat():
     page = rendered_page()
     assert '<label class="visually-hidden" for="followQuestion">Ask about this</label>' in page
-    assert '<input id="followQuestion" type="text" maxlength="2000" placeholder="Ask about this">' in page
-    assert "const body = { id, question };" in page                   # the id and the question ...
+    assert '<input id="followQuestion" type="text" maxlength="2000" placeholder="Ask about this" dir="auto">' in page
+    assert "const body = { id, question, language: answerLanguage() };" in page   # the id and the question ...
     assert "if (strokes) body.strokes = strokes;" in page              # ... and the points of a marking
     assert 'postJson("/api/follow_up", body)' in page
     assert "MAX_FOLLOW_UPS = 10" in page
@@ -1919,7 +1919,7 @@ def test_link_pattern_finds_markdown_links_and_bare_addresses(text, found):
 
 def test_template_ends_a_bare_address_before_the_sentence_goes_on():
     page = TEMPLATE.read_text(encoding="utf-8")
-    assert 'const ADDRESS_END = ".,);:!?*";' in page
+    assert 'const ADDRESS_END = ".,);:!?*،؛؟»";' in page
     trim = between(page, "function trimAddress(", "\n}\n")
     assert 'if (address[end - 1] === ")" && opened >= closed) break;' in trim   # a bracket of the address stays
     says = re.search(r"const SAYS_WHAT_IT_IS = /(.+)/i;", page)

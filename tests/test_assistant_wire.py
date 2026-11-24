@@ -76,7 +76,8 @@ def settings(tmp_path: Path) -> dict[str, Any]:
     return {"provider": "anthropic", "model": "claude-sonnet-5-5", "effort": "low",
             "max_tokens": 16000, "notes_file": str(notes),
             "people_dir": str(tmp_path / "people"), "web_search": True,
-            "web_search_max_uses": 3, "history_turns": 10, "seen_within_seconds": 3.0}
+            "web_search_max_uses": 3, "history_turns": 10, "seen_within_seconds": 3.0,
+            "arabic_style": "standard"}
 
 
 def bot_on(settings: dict[str, Any], wire: Wire) -> assistant.Assistant:

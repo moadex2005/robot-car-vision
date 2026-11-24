@@ -93,6 +93,7 @@ def settings(notes_path: Path, people_dir: Path) -> dict[str, Any]:
         "web_search_max_uses": 3,
         "history_turns": 10,
         "seen_within_seconds": 3.0,
+        "arabic_style": "standard",
     }
 
 

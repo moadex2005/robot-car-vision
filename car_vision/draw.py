@@ -15,6 +15,7 @@ from collections.abc import Iterable, Sequence
 import cv2
 import numpy as np
 
+from car_vision.codes import Code
 from car_vision.faces import Person
 from car_vision.state import Detection, RecognizedFace
 
@@ -297,3 +298,24 @@ def _fit_text(text: str, max_width: int, scale: float, thickness: int) -> str:
         if cv2.getTextSize(cut, FONT, scale, thickness)[0][0] <= max_width:
             return cut
     return ELLIPSIS
+
+
+# ---- QR codes and barcodes -----------------------------------------------------
+
+CODE_COLOR = (255, 170, 0)   # (blue, green, red): one fixed colour for every code
+CODE_CAPTIONS = {"qr": "QR code", "barcode": "barcode"}
+
+
+def draw_codes(frame: np.ndarray, codes: Iterable[Code]) -> None:
+    """A closed line around each code and the caption 'QR code' or 'barcode' at its top-left corner.
+
+    The line goes through the code's four corners (through its box when it
+    does not have four). The code's own text is never drawn: a stranger wrote it.
+    """
+    thickness = scaled(BOX_THICKNESS, drawing_scale(frame.shape[1]))
+    for code in codes:
+        x1, y1, x2, y2 = code.box
+        corners = code.corners if len(code.corners) == 4 else ((x1, y1), (x2, y1), (x2, y2), (x1, y2))
+        outline = np.array(corners, dtype=np.int32).reshape(-1, 1, 2)
+        cv2.polylines(frame, [outline], True, CODE_COLOR, thickness)
+        draw_caption(frame, CODE_CAPTIONS.get(code.kind, "code"), x1, y1, CODE_COLOR)

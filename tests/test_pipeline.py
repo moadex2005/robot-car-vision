@@ -56,7 +56,7 @@ CONFIG = {
 }
 
 STATUS_KEYS = {"source", "connected", "fps", "device", "recognition", "notes",
-               "people", "objects", "reactions", "phone_url", "phone_picture", "camera"}
+               "people", "objects", "codes", "reactions", "phone_url", "phone_picture", "camera"}
 
 PERSON = Detection("person", 0.9, (100, 60, 260, 300), 1)
 CHAIRS = [Detection("chair", 0.8, (400, 200, 500, 340), 2), Detection("chair", 0.7, (520, 200, 600, 340), 3)]

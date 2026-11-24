@@ -264,6 +264,7 @@ def test_draw_module_imports_only_cv2_numpy_and_state():
     text = (ROOT / "car_vision" / "draw.py").read_text(encoding="utf-8")
     imports = [line.strip() for line in text.splitlines() if line.startswith(("import ", "from "))]
     allowed = {"from __future__ import annotations", "from collections.abc import Iterable, Sequence",
-               "import cv2", "import numpy as np", "from car_vision.faces import Person",
+               "import cv2", "import numpy as np", "from car_vision.codes import Code",
+               "from car_vision.faces import Person",
                "from car_vision.state import Detection, RecognizedFace"}
     assert set(imports) <= allowed

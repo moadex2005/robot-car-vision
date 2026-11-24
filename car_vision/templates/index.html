@@ -689,6 +689,44 @@
     background: var(--accent-soft); color: var(--accent);
     font-size: 0.72rem; font-weight: 600; letter-spacing: 0.02em; white-space: nowrap;
   }
+  /* QR codes and barcodes in view: a row of the same pills under the In view pills, and a small
+     card with the code's text under it. On the page the card is glass; in the full view the row
+     sits at the right just above the pills, the card rises above the row, and both are solid
+     (they lie over the moving picture). */
+  .code-row { margin-top: 0.75rem; }
+  .code-row .thing-name::before {
+    content: ""; display: inline-block; width: 0.55em; height: 0.55em; margin-right: 0.45em;
+    border-radius: 2px; background: #00aaff;          /* the colour of the codes' outline on the video */
+  }
+  .code-card {
+    width: min(30rem, 100%); margin: 0.9rem auto 0; padding: 0.95rem 1.1rem 1.05rem;
+    border-radius: var(--radius);
+    text-align: left;
+    animation: box-in 0.35s var(--ease-out);
+  }
+  .code-card-top { display: flex; align-items: center; justify-content: space-between; gap: 0.8rem; margin-bottom: 0.55rem; }
+  .code-text {
+    margin: 0; max-height: 9.5em; overflow-y: auto; overscroll-behavior: contain;
+    overflow-wrap: anywhere; font-size: 0.95rem; line-height: 1.45;
+    user-select: text; -webkit-user-select: text;
+  }
+  .code-text:focus-visible { outline-offset: 2px; border-radius: 6px; }
+  .code-note { margin: 0.45rem 0 0; color: var(--grey); font-size: 0.82rem; line-height: 1.4; }
+  .code-actions { display: flex; flex-wrap: wrap; gap: 0.5rem; margin-top: 0.85rem; }
+  .stage.is-full .codes {
+    position: absolute; right: clamp(10px, 1.4vw, 22px); bottom: calc(100% - 10px);
+    max-width: min(30rem, 50%); margin: 0;
+    display: flex; flex-direction: column-reverse; align-items: flex-end;
+  }
+  .stage.is-full .code-row { max-width: 100%; margin: 0; }
+  .stage.is-full .code-row > li:first-child { margin-left: 0; }
+  .stage.is-full .code-row > li:last-child { margin-right: 0; }
+  .stage.is-full .code-card {
+    margin: 0 0 0.3rem; pointer-events: auto;
+    background: var(--glass-solid);
+    -webkit-backdrop-filter: none;
+    backdrop-filter: none;
+  }
   .quiet { margin: 0; color: var(--grey); }
   .privacy { margin: 1.1rem auto 0; max-width: 38rem; color: var(--grey); font-size: 0.85rem; line-height: 1.45; }
 
@@ -1323,7 +1361,26 @@
           <p class="discover-privacy" id="discoverPrivacy" hidden>Auto-discover sends a small picture of the whole view to a Hugging Face model every few seconds. Anyone in view is in that picture.</p>
           <ul class="things" id="things"></ul>
           <p class="quiet" id="nothing">Nothing detected right now</p>
-          <p class="privacy" id="privacy">A click on an object or on an empty spot sends a small cut-out of the picture to the assistant's API. A click on a person sends nothing. Follow-up questions about an object send the same cut-out again. A marked part is sent as the same cut-out with your outline drawn on it. Describe the scene sends the whole picture.</p>
+          <!-- QR codes and barcodes in view: one pill each; a click opens the card with its text. -->
+          <div class="codes" id="codes">
+            <ul class="things code-row" id="codeRow" aria-label="Codes in view" hidden></ul>
+            <div class="code-card glass" id="codeCard" role="region" aria-labelledby="codeKind" hidden>
+              <div class="code-card-top">
+                <span class="details-label" id="codeKind">QR code</span>
+                <button class="round" id="codeClose" type="button" title="Close (Esc)">
+                  <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3 3l10 10M13 3 3 13" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+                  <span class="visually-hidden">Close</span>
+                </button>
+              </div>
+              <p class="code-text" id="codeText" tabindex="-1"></p>
+              <p class="code-note" id="codeNote" hidden>This text was shortened or cleaned, so it may not be exactly what the code holds.</p>
+              <div class="code-actions">
+                <a class="pill primary small" id="codeOpen" target="_blank" rel="noopener noreferrer" hidden>Open link</a>
+                <button class="pill secondary small" id="codeCopy" type="button"><span id="codeCopyWord" aria-live="polite">Copy</span></button>
+              </div>
+            </div>
+          </div>
+          <p class="privacy" id="privacy">A click on an object or on an empty spot sends a small cut-out of the picture to the assistant's API. A click on a person sends nothing. Follow-up questions about an object send the same cut-out again. A marked part is sent as the same cut-out with your outline drawn on it. Describe the scene sends the whole picture. QR codes and barcodes are read on this laptop, and the program sends their text nowhere. A picture sent for a click, for Describe or for Auto-discover can still show a code.</p>
         </div>
       </div>
 
@@ -1789,6 +1846,7 @@ video.addEventListener("mouseleave", () => video.classList.remove("is-clickable"
 video.addEventListener("click", (event) => {
   if (cameraIsOff) return;
   const point = pointOnPicture(event);
+  if (point && openCodeAt(point)) return;      // a click on a code opens its card; nothing is sent
   if (point) inspect(point, null, video);
 });
 
@@ -2089,6 +2147,7 @@ function setOnline(isOnline) {
   // Show nothing stale: no list, no banners, no old numbers.
   forgetDrawn();
   clearObjects();
+  clearCodes();
   greetings.replaceChildren();
   notes.replaceChildren();
   pictureRow.hidden = true;
@@ -2114,6 +2173,7 @@ async function poll() {
     drawStatusLine(status);
     drawCamera(status);
     drawObjects(status);
+    drawCodes(status);
     drawReactions(status);
     phoneUrl = asText(status.phone_url);
     drawConnecting(status);
@@ -2128,6 +2188,214 @@ async function poll() {
     setTimeout(poll, Math.max(0, POLL_MS - (performance.now() - started)));
   }
 }
+
+// ---- codes: QR codes and barcodes in view ----------------------------------
+//
+// The text of a code was written by a stranger. It is shown here and nowhere else: never
+// spoken, never sent to the server or the assistant, and it goes in only through textContent.
+// Open link is offered only when the status gives a link and webAddress() takes it too, and a
+// link is never opened by itself: the visitor clicks it. A text the server had to shorten or
+// clean ("altered") is never a link, and the card says so. The card keeps its code after that
+// code has left the view, until it is closed or another code is clicked, so it can be copied.
+
+const CODE_PREVIEW_CHARS = 28;
+const COPY_NOTE_MS = 2000;
+const CODE_NAMES = { qr: "QR code", barcode: "Barcode" };
+const codeRow = byId("codeRow"), codeCard = byId("codeCard"), codeKind = byId("codeKind");
+const codeText = byId("codeText"), codeNote = byId("codeNote"), codeOpen = byId("codeOpen");
+const codeCopy = byId("codeCopy"), codeCopyWord = byId("codeCopyWord"), codeClose = byId("codeClose");
+const codeItems = new Map();     // key -> the <li> already on the page, reused so a press or focus is never lost
+let codesInView = [];            // the newest status's codes; a click on the video looks here
+let openCode = null;             // the code whose card is open, or null
+let copyTimer = 0;
+
+// One code from the status, or null when it is not a QR code or a barcode with text.
+function readCode(raw) {
+  if (!raw || (raw.kind !== "qr" && raw.kind !== "barcode")) return null;
+  const text = asText(raw.text);
+  if (!text) return null;
+  const box = asList(raw.box).map(Number);
+  return {
+    kind: raw.kind,
+    format: asText(raw.format),
+    text,
+    link: raw.link == null ? "" : asText(raw.link),
+    altered: raw.altered === true,      // shortened or cleaned by the server: maybe not what the code holds
+    box: box.length === 4 && box.every(Number.isFinite) ? box : null,
+  };
+}
+
+// A code is known by its kind and text; the same code twice in view gets a number too.
+function withCodeKeys(codes) {
+  const counts = new Map();
+  return codes.map((code) => {
+    const name = code.kind + " " + code.text;
+    const number = (counts.get(name) || 0) + 1;
+    counts.set(name, number);
+    return { ...code, key: name + " " + number };
+  });
+}
+
+// Where Open link goes, or null: an unaltered text, a link in the status, and webAddress() agrees.
+const codeUrl = (code) => (code.link && !code.altered ? webAddress(code.link) : null);
+
+// At most CODE_PREVIEW_CHARS characters, with "…" when cut.
+function cutPreview(text) {
+  const letters = Array.from(text);
+  if (letters.length <= CODE_PREVIEW_CHARS) return text;
+  return letters.slice(0, CODE_PREVIEW_CHARS).join("") + "…";
+}
+
+// What a pill says after its kind: a link's site name, else the first characters of the text.
+function codePreview(code) {
+  const url = codeUrl(code);
+  return cutPreview(url ? siteName(url) : code.text);
+}
+
+// "QR code", "Barcode", or "Barcode · EAN-13".
+function codeKindName(code) {
+  const format = code.kind === "barcode" ? code.format.replace(/_/g, "-") : "";
+  return format ? CODE_NAMES[code.kind] + " · " + format : CODE_NAMES[code.kind];
+}
+
+function codeItem(key) {
+  const item = make("li");
+  const button = make("button", "thing");
+  button.type = "button";
+  button.setAttribute("aria-controls", "codeCard");
+  button.setAttribute("aria-expanded", "false");
+  button.append(make("span", "thing-name"), make("span", "thing-detail"));
+  button.addEventListener("click", () => {
+    const code = codesInView.find((one) => one.key === key);
+    if (code) openCodeCard(code);
+  });
+  item.append(button);
+  return item;
+}
+
+function drawCodes(status) {
+  codesInView = withCodeKeys(asList(status.codes).map(readCode).filter((code) => code !== null));
+  const shown = codesInView.map((code) => ({ key: code.key, name: CODE_NAMES[code.kind], preview: codePreview(code) }));
+  if (!changed("codes", shown)) return;
+  const keys = new Set(shown.map((code) => code.key));
+  for (const key of [...codeItems.keys()]) {
+    if (!keys.has(key)) codeItems.delete(key);
+  }
+  const items = shown.map((code) => {
+    let item = codeItems.get(code.key);
+    if (!item) {
+      item = codeItem(code.key);
+      codeItems.set(code.key, item);
+    }
+    setText(item.firstChild.firstChild, code.name);
+    setText(item.firstChild.lastChild, code.preview);
+    return item;
+  });
+  // Only a different list of pills is put in again; the same pills stay, with their focus.
+  const same = items.length === codeRow.children.length && items.every((item, i) => codeRow.children[i] === item);
+  if (!same) codeRow.replaceChildren(...items);
+  codeRow.hidden = items.length === 0;
+  markOpenCode();
+}
+
+function markOpenCode() {
+  for (const [key, item] of codeItems) {
+    const open = openCode !== null && openCode.key === key;
+    item.firstChild.classList.toggle("is-open", open);
+    item.firstChild.setAttribute("aria-expanded", open ? "true" : "false");
+  }
+}
+
+function openCodeCard(code) {
+  openCode = code;
+  setText(codeKind, codeKindName(code));
+  setText(codeText, code.text);
+  codeText.scrollTop = 0;
+  codeNote.hidden = !code.altered;
+  const url = codeUrl(code);
+  codeOpen.hidden = url === null;
+  if (url) {
+    codeOpen.href = url.href;
+    codeOpen.title = url.href;            // the full address, before it is clicked
+  } else {
+    codeOpen.removeAttribute("href");
+    codeOpen.removeAttribute("title");
+  }
+  showCopyWord("Copy");
+  codeCard.hidden = false;
+  markOpenCode();
+  codeText.focus({ preventScroll: true });   // a screen reader reads the text at once
+}
+
+// Close the card; true when one was open (so Escape closed it). With giveFocusBack, focus that
+// was in the card (or nowhere) goes back to the code's pill when it is still there, else to the video.
+function closeCodeCard(giveFocusBack) {
+  if (codeCard.hidden) return false;
+  const item = codeItems.get(openCode.key);
+  const focusWasHere = codeCard.contains(document.activeElement) || document.activeElement === document.body;
+  codeCard.hidden = true;
+  openCode = null;
+  showCopyWord("Copy");
+  markOpenCode();
+  if (giveFocusBack && focusWasHere) {
+    if (item && item.isConnected && !codeRow.hidden) item.firstChild.focus({ preventScroll: true });
+    else video.focus({ preventScroll: true });
+  }
+  return true;
+}
+
+// A click on the video inside a code's box opens that code's card (the smallest box wins).
+// True when one did; then nothing is sent.
+function openCodeAt(point) {
+  let best = null, bestArea = Infinity;
+  for (const code of codesInView) {
+    if (!code.box) continue;
+    const [x1, y1, x2, y2] = code.box;
+    const area = (x2 - x1) * (y2 - y1);
+    const inside = point.x >= x1 && point.x <= x2 && point.y >= y1 && point.y <= y2;
+    if (inside && area < bestArea) {
+      best = code;
+      bestArea = area;
+    }
+  }
+  if (best === null) return false;
+  openCodeCard(best);
+  return true;
+}
+
+// The Copy button's word; it sits in an aria-live element, so a screen reader hears the change.
+function showCopyWord(word) {
+  clearTimeout(copyTimer);
+  setText(codeCopyWord, word);
+}
+
+async function copyCode() {
+  const code = openCode;
+  if (code === null) return;
+  let copied = false;
+  try {
+    if (navigator.clipboard) {
+      await navigator.clipboard.writeText(code.text);   // the text as the card shows it
+      copied = true;
+    }
+  } catch (error) {
+    copied = false;                       // no permission, or the page is not in focus
+  }
+  if (openCode !== code) return;          // closed, or another code opened meanwhile
+  showCopyWord(copied ? "Copied" : "Could not copy");
+  copyTimer = setTimeout(() => showCopyWord("Copy"), COPY_NOTE_MS);
+}
+
+function clearCodes() {
+  closeCodeCard(false);
+  codeRow.replaceChildren();
+  codeRow.hidden = true;
+  codeItems.clear();
+  codesInView = [];
+}
+
+codeClose.addEventListener("click", () => closeCodeCard(true));
+codeCopy.addEventListener("click", copyCode);
 
 // ---- the chat ------------------------------------------------------------
 
@@ -5726,6 +5994,7 @@ function closeTopmost() {
     closeVoiceBox(true);
     return;
   }
+  if (closeCodeCard(true)) return;
   // Then the full view; the details panel stays open.
   if (fullView) {
     leaveFullView();

@@ -85,6 +85,10 @@ is written although nothing else comes. A thread of its own puts the log's
 summary into the WorldState every few seconds, where the assistant reads it.
 stop() closes the log, which writes what is still open.
 
+QR codes and barcodes (codes.CodeReader): on every few frames the loop reads
+the codes in the clean frame, keeps them on screen for a moment, draws their
+outline and lists them in status()["codes"]. Their text goes to the page only.
+
 Every part can be handed in from outside, so the tests run the loop with
 fakes and need no camera, model or graphics card.
 """
@@ -105,6 +109,7 @@ import cv2
 import numpy as np
 
 from car_vision import draw
+from car_vision.codes import Code, CodeReader, checked_settings, web_link
 from car_vision.config import ConfigError, require, resolve_path, section
 from car_vision.detector import Detector
 from car_vision.enroll import encode_people, save_enrolment
@@ -221,6 +226,8 @@ MEMORY_SHARE_SECONDS = 5.0               # the memory's summary goes into the Wo
 PICTURE_EVERY_SECONDS = 5.0              # the sighting log is given a new picture of a thing at most this often
 PICTURE_FORGET_SECONDS = 10.0            # ... and a thing not seen for this long is forgotten by the timer
 PICTURE_MAX_SIDE = 160                   # the picture's longer side, in pixels
+
+MOST_CODES = 8                           # status()["codes"] lists at most this many, the largest first
 
 
 @dataclass(frozen=True)
@@ -380,7 +387,7 @@ class Pipeline:
                  reactions=None, state: WorldState | None = None,
                  source_factory: SourceFactory | None = None,
                  phone_fetch: Fetch | None = None,
-                 open_detector=None, sightings=None, lookout=None) -> None:
+                 open_detector=None, sightings=None, lookout=None, code_reader=None) -> None:
         recognizer_settings = section(config, "recognizer")
         self.every_n_frames: int = require(recognizer_settings, "every_n_frames", int)
         if self.every_n_frames < 1:
@@ -401,6 +408,13 @@ class Pipeline:
         keep_days = float(require(memory_settings, "keep_days", (int, float)))
         min_seconds = float(require(memory_settings, "min_seconds", (int, float)))
         keep_pictures = require(memory_settings, "pictures", bool)
+        # QR codes and barcodes (M16): read with OpenCV alone. Off: no reader, nothing is read.
+        code_settings = section(config, "codes")
+        self.codes_on: bool = require(code_settings, "enabled", bool)
+        self.code_every_n_frames, _max_width, self.code_hold_seconds = checked_settings(code_settings)
+        self._code_reader = None
+        if self.codes_on:
+            self._code_reader = code_reader if code_reader is not None else CodeReader(code_settings)
         # Auto-discover: the pipeline reads only what it needs itself; Lookout checks the rest.
         self._lookout_settings = section(config, "lookout")
         self.look_every_seconds = float(require(self._lookout_settings, "every_seconds", (int, float)))
@@ -492,6 +506,11 @@ class Pipeline:
         self._open_tracks_stale = False        # the open detector must start its tracks again first
         self._pictures = PictureTimer(min_seconds) if keep_pictures else None
         self._memory_failed = False            # a memory error was logged already
+        self._codes: dict[tuple[str, str], tuple[Code, float]] = {}   # (kind, text) -> newest read, when read
+        self._codes_failed = False             # a code reader error was logged already
+        self._code_reads: list[float] = []     # when the reader last ran, the two newest times
+        # Under self._lock: the codes drawn on the last frame shown, and that frame's (width, height).
+        self._shown_codes: tuple[tuple[Code, ...], tuple[int, int]] = ((), (0, 0))
 
     # ---- public ------------------------------------------------------------
 
@@ -668,6 +687,7 @@ class Pipeline:
             search, found, discovered = self._search, self._found, self._discovered
             looked = search.names and self._looked_for == search.names
             discovery, discovered_names = self._discovery, self._discovered_list_locked()
+            codes, code_frame_size = self._shown_codes
         # While the stream is down nothing new is seen, so old sightings are left out,
         # and so is everything seen by the camera used before the last switch.
         seen_at = snapshot.detections_at
@@ -686,6 +706,7 @@ class Pipeline:
             "notes": list(self._notes),
             "people": self._people(snapshot) if fresh else [],
             "objects": objects_in_view(snapshot, self._person_card, found, discovered) if fresh else [],
+            "codes": codes_in_view(codes, code_frame_size) if fresh else [],
             "reactions": [{"kind": r.kind, "text": r.text} for r in on_screen] if fresh else [],
             "error": error,
             "search": search_status(search, found, snapshot.frame_size[0], bool(looked and fresh)),
@@ -1422,6 +1443,7 @@ class Pipeline:
         self._everyday_epoch += 1
         self._view = None
         self._found = self._discovered = ()
+        self._shown_codes = ((), (0, 0))
         self._looked_for = None                 # the finder has not looked at the new camera yet
         self._error = None
         self._on_screen = []
@@ -1471,6 +1493,7 @@ class Pipeline:
         self._lost_line = None
         self._frame_size = None
         self._forget_named_finds()
+        self._forget_codes()
         if self._last_drawn is not None and self._drawn_from != generation:
             self._last_drawn = np.full_like(self._last_drawn, DARK_LEVEL)
             self._drawn_from = generation
@@ -1502,11 +1525,13 @@ class Pipeline:
         # The visitor's own finds stand out in yellow; discovered ones are drawn like everyday ones.
         found = tuple(find for find in named if label_among(find.label, search.names))
         discovered = tuple(find for find in named if not label_among(find.label, search.names))
+        codes = self._codes_to_show(frame, index, now)
 
         # The boxes are drawn on a copy: the camera's own frame goes into the view untouched.
         drawn = frame.copy()
         draw.draw_detections(drawn, shown, wanted=[d.track_id for d in found if d.track_id is not None])
         draw.draw_faces(drawn, faces)
+        draw.draw_codes(drawn, codes)
         jpeg = self._encode(drawn)
         height, width = frame.shape[:2]
         with self._lock:                        # state, picture, view and reactions change together
@@ -1524,6 +1549,7 @@ class Pipeline:
             memory_epochs = (self._everyday_epoch, self._named_epoch)
             self._view = View(frame, tuple(shown), tuple(faces), epoch)
             self._found, self._discovered = found, discovered
+            self._shown_codes = (codes, (width, height))
             if looked and current.names == search.names:
                 self._looked_for = search.names     # the page may answer now: the finder has looked
             self._on_screen = list(on_screen)
@@ -1571,6 +1597,7 @@ class Pipeline:
         if resized:
             self._memory = FaceMemory()
             self._forget_named_finds()              # their boxes are in the old size's pixels too
+            self._forget_codes()                    # ... and so are the codes'
             with self._lock:
                 self._epoch += 1
                 self._everyday_epoch += 1
@@ -1629,6 +1656,52 @@ class Pipeline:
         self._named = NamedFinds()
         self._named_tick = 0
         self._open_tracks_stale = True
+
+    # ---- codes (the loop thread) -------------------------------------------------
+    #
+    # A code's text was written by a stranger: it goes to the page (status()["codes"])
+    # and nowhere else. It is never logged, never put into the WorldState (so the
+    # assistant never hears of it) and never told to the memory.
+
+    def _codes_to_show(self, frame: np.ndarray, index: int, now: float) -> tuple[Code, ...]:
+        """The codes to draw on this frame, read from the clean frame on every
+        code_every_n_frames-th frame and kept for a while after their last read (see _code_keep_seconds)."""
+        if self._code_reader is None:
+            return ()
+        if index % self.code_every_n_frames == 0:
+            self._code_reads = (self._code_reads + [now])[-2:]
+            for code in self._read_codes(frame):
+                self._codes[(code.kind, code.text)] = (code, now)    # the newest box wins
+        keep = self._code_keep_seconds()
+        self._codes = {key: (code, read_at) for key, (code, read_at) in self._codes.items()
+                       if now - read_at <= keep}
+        return tuple(code for code, _read_at in self._codes.values())
+
+    def _code_keep_seconds(self) -> float:
+        """How long a code stays after its last read: code_hold_seconds, or twice the time
+        between the reader's last two runs when that is longer.
+
+        At a low frame rate the reader runs seldom (5 frames at 3 frames a second
+        take 1.7 s); without this a code held still would vanish between two reads.
+        """
+        if len(self._code_reads) < 2:
+            return self.code_hold_seconds
+        return max(self.code_hold_seconds, 2 * (self._code_reads[1] - self._code_reads[0]))
+
+    def _forget_codes(self) -> None:
+        """A new camera or frame size: the codes kept on screen and the reader's rhythm are old."""
+        self._codes = {}
+        self._code_reads = []
+
+    def _read_codes(self, frame: np.ndarray) -> list[Code]:
+        """What the reader finds; [] when it raises (logged once, without any text: the video goes on)."""
+        try:
+            return list(self._code_reader.read(frame))
+        except Exception as error:
+            if not self._codes_failed:
+                self._codes_failed = True
+                log.warning("Reading the codes failed (%s); the video goes on without them", type(error).__name__)
+            return []
 
     # ---- the memory (the loop thread) --------------------------------------------
 
@@ -1963,6 +2036,21 @@ def box_fractions(box: Box, size: tuple[int, int]) -> list[float]:
     x1, y1, x2, y2 = box
     return [round(min(max(value / whole, 0.0), 1.0), 3)
             for value, whole in ((x1, width), (y1, height), (x2, width), (y2, height))]
+
+
+def codes_in_view(codes: Sequence[Code], size: tuple[int, int]) -> list[dict[str, Any]]:
+    """status()["codes"]: at most MOST_CODES codes, the largest box first, e.g.
+    {"kind": "qr", "format": "", "text": "...", "link": "..." or None, "altered": False,
+     "box": [x1, y1, x2, y2] fractions}.
+
+    A text that cleaning changed ("altered") is never a link: the address shown
+    might not be the one the code holds.
+    """
+    largest_first = sorted(codes, key=lambda code: box_area(code.box), reverse=True)
+    return [{"kind": code.kind, "format": code.format, "text": code.text,
+             "link": None if code.altered else web_link(code.text), "altered": code.altered,
+             "box": box_fractions(code.box, size)}
+            for code in largest_first[:MOST_CODES]]
 
 
 # ---- looking for things by name --------------------------------------------------------

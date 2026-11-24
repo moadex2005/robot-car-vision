@@ -34,6 +34,13 @@ Start it with
 
 and open the address it prints. Ctrl+C stops it. The page is served on
 app.host only (127.0.0.1 in config.yaml), so only this laptop can open it.
+
+The phone door: with phone_door.enabled in config.yaml, the same page is also
+served over HTTPS on phone_door.port to the whole network, behind the password
+PAGE_PASSWORD from .env (door.py has the parts). Only that second server marks its
+requests as coming through the phone door (environ["car_vision.door"]); nothing a
+browser sends can. Through it, every address but /door needs a signed-in session.
+The laptop's own door stays exactly as it was: no password, and no /door.
 """
 
 from __future__ import annotations
@@ -45,6 +52,7 @@ import math
 import re
 import secrets
 import socket
+import ssl
 import sys
 import threading
 import time
@@ -56,11 +64,16 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
-from flask import Flask, Response, jsonify, render_template, request
+import cv2
+from flask import Flask, Response, abort, jsonify, redirect, render_template, request
 from werkzeug.exceptions import HTTPException
+from werkzeug.serving import WSGIRequestHandler, make_server
 
 from car_vision.assistant import MAX_IMAGE_BYTES, Assistant, AssistantError, ObjectInfo
 from car_vision.config import ConfigError, load_config, require, resolve_path, section
+from car_vision.door import (LONGEST_PASSWORD, PASSWORD_VARIABLE, DoorError, PhoneDoor, can_be_typed,
+                             ensure_certificate, is_loopback, lan_addresses, minutes_words, read_password,
+                             read_settings)
 from car_vision.faces import PERSON_ID
 from car_vision.marking import NEARLY_ALL, mark_photo, marked_share
 from car_vision.people import MAX_LINE, MAX_LINES, MAX_NAME, MAX_ROLE, MAX_STORY, PeopleBook
@@ -609,6 +622,98 @@ def interval_words(seconds: float | None) -> str:
     return str(int(seconds)) if float(seconds).is_integer() else f"{seconds:g}"
 
 
+# ---- the phone door ------------------------------------------------------------
+
+DOOR_ENVIRON = "car_vision.door"  # set to "phone" by the phone door's server only (through_phone_door)
+PHONE = "phone"
+DOOR_PAGE = "/door"
+DOOR_PAGES = frozenset({DOOR_PAGE, "/door/leave"})   # the only addresses open without a session
+DOOR_COOKIE = "car_vision_door"
+MAX_PASSWORD_CHARS = LONGEST_PASSWORD   # a longer one is wrong without being compared
+DOOR_BODY_BYTES = 4 * 1024        # the most a phone may send to /door and /door/leave
+PHONE_BODY_BYTES = 3 * 1024 * 1024   # ... and to any other address
+TOO_BIG = "That request is too big, or does not say its size."
+SIGN_IN_FIRST = "Sign in first."
+ONLY_ON_THE_LAPTOP = "This page opens only on the laptop itself."
+WRONG_PASSWORD = "That is not the password."
+PASSWORD_SHAPE = 'Send the password as JSON, like {"password": "..."}.'
+DOOR_OFF = ("The phone door is off. Set phone_door.enabled to true in config.yaml and "
+            f"{PASSWORD_VARIABLE} in .env, then start the program again.")
+NOT_A_DOOR_ADDRESS = "That is not an address of the phone door."
+NO_NETWORK = ("This laptop has no private network address. Join the phone's hotspot or "
+              "the same Wi-Fi as the phone, then start the program again.")
+DOOR_SOCKET_SECONDS = 10          # a phone-door connection waits at most this long for the client
+DOOR_CLOSE_SECONDS = 3.0          # closing the door at the end never takes longer
+NOT_LOCAL = ("app.host must be this laptop itself (127.0.0.1, localhost or ::1), got {host!r}. "
+             "To open the page on a phone or another computer, use phone_door in config.yaml.")
+QR_EDGE = 2                       # white modules added to the encoder's own 2, so 4 in all
+QR_SCALE = 8                      # pixels for each module: about 260 pixels for an address
+
+
+def from_the_laptop() -> bool:
+    """True only for a request through the laptop's own door: not marked by the phone door's
+    server (see through_phone_door), and from this computer itself. Anything else is a phone's."""
+    return request.environ.get(DOOR_ENVIRON) != PHONE and is_loopback(request.remote_addr)
+
+
+def body_too_big(method: str, path: str, length: int | None) -> bool:
+    """True when a phone's request body must be refused before it is read: a change that does
+    not say its size, or a body above the limit for this address."""
+    if length is None:
+        return method in CHANGING_METHODS
+    return length > (DOOR_BODY_BYTES if path in DOOR_PAGES else PHONE_BODY_BYTES)
+
+
+def answer(message: str, code: int) -> Any:
+    """A JSON error that is never kept by the browser."""
+    response = jsonify(error=message)
+    response.status_code = code
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+def door_refusal(method: str, origin: str | None, mimetype: str, host_url: str) -> tuple[str, int] | None:
+    """refusal() for the sign-in addresses, which are not under /api/: the same two rules."""
+    if origin is not None and origin != own_origin(host_url):
+        return OTHER_WEBSITE, 403
+    if method in CHANGING_METHODS and mimetype != "application/json":
+        return NOT_JSON, 415
+    return None
+
+
+def sign_in_first(path: str) -> Any:
+    """The answer to a phone without a session: 401 for data and video, the sign-in page otherwise."""
+    if path.startswith("/api/") or path == "/video" or path.startswith("/video/"):
+        return answer(SIGN_IN_FIRST, 401)
+    return redirect(DOOR_PAGE)
+
+
+def typed_password() -> str | None:
+    """The password from a POST /door body {"password": "<text>"}, or None for anything else:
+    no JSON, other JSON, JSON nested too deep to read, or text that cannot be typed."""
+    try:
+        body = request.get_json(silent=True)
+    except RecursionError:                        # silent=True covers only ValueError
+        return None
+    given = body.get("password") if isinstance(body, dict) else None
+    return given if isinstance(given, str) and can_be_typed(given) else None
+
+
+def too_many_tries(door: PhoneDoor) -> str:
+    return f"Too many tries. Wait {minutes_words(door.settings.pause_seconds)}."
+
+
+def qr_png(text: str) -> bytes:
+    """A PNG of a QR code for this text, black on white with a white edge."""
+    code = cv2.QRCodeEncoder.create().encode(text)
+    code = cv2.copyMakeBorder(code, QR_EDGE, QR_EDGE, QR_EDGE, QR_EDGE, cv2.BORDER_CONSTANT, value=255)
+    code = cv2.resize(code, None, fx=QR_SCALE, fy=QR_SCALE, interpolation=cv2.INTER_NEAREST)
+    ok, png = cv2.imencode(".png", code)
+    if not ok:
+        raise RuntimeError("The QR code could not be made into a PNG.")
+    return png.tobytes()
+
+
 # ---- the web server ------------------------------------------------------------
 
 
@@ -623,7 +728,8 @@ def question_problem(question: str) -> str | None:
 
 
 def create_app(pipeline: Any, assistant: Any, camera_file: Path | None = None,
-               people: PeopleBook | None = None, discover_every: float | None = None) -> Flask:
+               people: PeopleBook | None = None, discover_every: float | None = None,
+               door: Any = None) -> Flask:
     """The Flask app for one pipeline and one assistant (real ones, or fakes in the tests).
 
     `camera_file` is where /api/camera remembers the phone's address; with None
@@ -631,6 +737,8 @@ def create_app(pipeline: Any, assistant: Any, camera_file: Path | None = None,
     book of person folders; with None the page hides its People section and those
     routes answer with a plain error. `discover_every` is lookout.every_seconds,
     only for the words beside the Auto-discover switch ("looking every 10 s").
+    `door` is the phone door (a door.PhoneDoor: the password, the sessions and the
+    tries); with None there is no phone door, and nothing comes through one.
     """
     app = Flask(__name__)
     inspections = InspectionStore()
@@ -650,6 +758,26 @@ def create_app(pipeline: Any, assistant: Any, camera_file: Path | None = None,
             return None
         message, code = refused
         return jsonify(error=message), code
+
+    @app.before_request
+    def phone_door_guard() -> Any:
+        """Through the phone door only a signed-in phone gets further; /door is open to sign in.
+        Through the laptop's door /door is not there (404), and nothing else changes."""
+        if from_the_laptop():
+            if request.path in DOOR_PAGES:
+                abort(404)
+            return None
+        if body_too_big(request.method, request.path, request.content_length):
+            return answer(TOO_BIG, 413)               # refused before a byte of it is read
+        if door is None:                              # no phone door: only the laptop opens the page
+            return answer(ONLY_ON_THE_LAPTOP, 401)
+        if request.path in DOOR_PAGES:
+            refused = door_refusal(request.method, request.headers.get("Origin"), request.mimetype,
+                                   request.host_url)
+            return None if refused is None else (jsonify(error=refused[0]), refused[1])
+        if door.sessions.valid(request.cookies.get(DOOR_COOKIE)):
+            return None
+        return sign_in_first(request.path)
 
     @app.get("/")
     def page() -> str:
@@ -1018,6 +1146,74 @@ def create_app(pipeline: Any, assistant: Any, camera_file: Path | None = None,
             log.info("The camera's memory was emptied from the page")
         return jsonify(ok=True)
 
+    # ---- the phone door: signing in (phone door only; phone_door_guard sends the laptop a 404) --
+
+    @app.get("/door")
+    def door_page() -> Any:
+        if door.sessions.valid(request.cookies.get(DOOR_COOKIE)):
+            return redirect("/")                      # already signed in
+        response = Response(render_template("door.html", max_password_chars=MAX_PASSWORD_CHARS))
+        response.headers["Cache-Control"] = "no-store"
+        return response
+
+    @app.post("/door")
+    def door_sign_in() -> Any:
+        """The password, compared only by door.matches. Too many wrong ones: a pause.
+
+        Every try counts as wrong (door.throttle.take) until the password is right, also a
+        body that is not a password at all.
+        """
+        who = request.remote_addr or "unknown"        # from the connection, never from a header
+        if not door.throttle.take(who):               # also when this one would be right
+            return jsonify(error=too_many_tries(door)), 429
+        given = typed_password()
+        if given is None:
+            log.warning("A sign-in at the phone door sent no password (from %s)", who)
+            return jsonify(error=PASSWORD_SHAPE), 400
+        if len(given) > MAX_PASSWORD_CHARS or not door.matches(given):
+            log.warning("A wrong password was typed at the phone door (from %s)", who)
+            return jsonify(error=WRONG_PASSWORD), 403
+        door.throttle.passed(who)
+        response = jsonify(ok=True)
+        response.set_cookie(DOOR_COOKIE, door.sessions.open(), max_age=int(door.settings.session_seconds),
+                            path="/", secure=True, httponly=True, samesite="Strict")
+        log.info("A phone signed in at the phone door (from %s)", who)
+        return response
+
+    @app.post("/door/leave")
+    def door_leave() -> Any:
+        door.sessions.close(request.cookies.get(DOOR_COOKIE))
+        response = jsonify(ok=True)
+        response.delete_cookie(DOOR_COOKIE, path="/", secure=True, httponly=True, samesite="Strict")
+        return response
+
+    # ---- the phone door as the laptop sees it (laptop's door only) -------------------------
+
+    @app.get("/api/door")
+    def door_status() -> Any:
+        """Whether a phone can open the page, and at which addresses; or why not."""
+        if not from_the_laptop():
+            abort(404)
+        if door is None:
+            payload: dict[str, Any] = {"open": False, "why": DOOR_OFF}
+        elif door.addresses:
+            payload = {"open": True, "addresses": list(door.addresses)}
+        else:
+            payload = {"open": False, "why": door.why}
+        response = jsonify(payload)
+        response.headers["Cache-Control"] = "no-store"
+        return response
+
+    @app.get("/api/door/qr")
+    def door_qr() -> Any:
+        """A QR code of one of the phone door's own addresses, never of anything else."""
+        if not from_the_laptop():
+            abort(404)
+        address = request.args.get("address", "")
+        if door is None or address not in door.addresses:
+            return jsonify(error=NOT_A_DOOR_ADDRESS), 400
+        return Response(qr_png(address), mimetype="image/png", headers={"Cache-Control": "no-store"})
+
     @app.errorhandler(HTTPException)
     def http_error(error: HTTPException) -> Any:
         """An unknown /api/ address or a wrong method gets a JSON answer, not an HTML page."""
@@ -1285,6 +1481,132 @@ def open_browser_soon(url: str) -> None:
     timer.start()
 
 
+def through_phone_door(app: Any) -> Callable[[dict, Any], Any]:
+    """The app as the phone door's server runs it: every request is marked as one through the
+    phone door. Only this wrapper sets the mark; the browser has no way to set it."""
+    def marked(environ: dict, start_response: Any) -> Any:
+        environ[DOOR_ENVIRON] = PHONE
+        return app(environ, start_response)
+    return marked
+
+
+def open_phone_door(app: Flask, door: PhoneDoor | None) -> Any | None:
+    """Start the phone door's HTTPS server in a thread of its own and print its one line.
+
+    None when there is no door, or when it could not open: then one plain line says
+    why (the Camera box shows the same), and the program runs on without the door.
+    """
+    if door is None:
+        return None
+    try:
+        server = start_door_server(app, door)
+    except DoorError as error:                        # a plain message that says what to do
+        line = f"Phone door closed: {error}"
+    except Exception as error:                        # anything else: its kind only, never its text
+        line = f"Phone door closed: {type(error).__name__} while opening it. The page runs on without it."
+    else:
+        print(f"Phone door: {'  '.join(door.addresses)}  (password: {PASSWORD_VARIABLE} in .env)")
+        return server
+    door.shut(line)
+    print(line)
+    return None
+
+
+def start_door_server(app: Flask, door: PhoneDoor) -> Any:
+    """Read the password, find the addresses, make the certificate, and serve on 0.0.0.0:<port>."""
+    port = door.settings.port
+    door.set_password(read_password())
+    addresses = lan_addresses()
+    if not addresses:
+        raise DoorError(NO_NETWORK)
+    certificate, key = ensure_certificate(door.settings.certificate_dir, addresses)
+    context = tls_context(certificate, key)
+    if already_serving("127.0.0.1", port):            # Windows would let a second server bind the port
+        raise DoorError(f"Port {port} is taken by another program. Stop it, or choose another "
+                        "phone_door.port in config.yaml.")
+    try:
+        server = make_door_server(app, "0.0.0.0", port, context)
+    except OSError as error:
+        raise DoorError(f"The phone door cannot use port {port} ({type(error).__name__}). Stop the program "
+                        "that uses it, or choose another phone_door.port in config.yaml.") from None
+    threading.Thread(target=server.serve_forever, name="phone door", daemon=True).start()
+    door.opened([f"https://{address}:{port}/" for address in addresses])
+    return server
+
+
+class PhoneDoorHandler(WSGIRequestHandler):
+    """werkzeug's request handler for one phone-door connection, in that connection's own thread.
+
+    The TLS handshake happens here, not in the accept loop that every phone shares, so a
+    client that connects and sends nothing holds up only its own thread. Every wait on
+    the connection (the handshake, reading a request, an idle keep-alive) ends after
+    DOOR_SOCKET_SECONDS; socketserver sets that time limit from `timeout`.
+    """
+
+    timeout = DOOR_SOCKET_SECONDS
+
+    def handle(self) -> None:
+        try:
+            self.connection.do_handshake()
+        except (OSError, ValueError) as error:        # too slow, the certificate refused, not TLS at all
+            self.log_error("The TLS handshake did not finish (%s)", type(error).__name__)
+            return
+        super().handle()
+
+    def log_error(self, format: str, *args: Any) -> None:
+        """Slow or dropped connections are common on a network: logged quietly, not as errors."""
+        self.log("info", format, *args)
+
+
+def make_door_server(app: Flask, host: str, port: int, context: ssl.SSLContext) -> Any:
+    """werkzeug's threaded server for the phone door, with TLS done by PhoneDoorHandler."""
+    server = make_server(host, port, through_phone_door(app), threaded=True, request_handler=PhoneDoorHandler)
+    server.socket = wrap_listener(server.socket, context)
+    server.ssl_context = context                      # so each request's environ says https
+    return server
+
+
+def wrap_listener(listener: socket.socket, context: ssl.SSLContext) -> ssl.SSLSocket:
+    """TLS on the listening socket, without a handshake inside accept()."""
+    return context.wrap_socket(listener, server_side=True, do_handshake_on_connect=False)
+
+
+def tls_context(certificate: Path, key: Path) -> ssl.SSLContext:
+    """The server's TLS settings with this certificate; a DoorError when the files do not load."""
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    try:
+        context.load_cert_chain(certificate, key)
+    except OSError as error:                          # ssl.SSLError is an OSError too
+        raise DoorError(f"The certificate in {certificate.parent} could not be loaded "
+                        f"({type(error).__name__}). Delete the files in that folder and start again.") from None
+    return context
+
+
+def close_phone_door(server: Any | None) -> bool:
+    """Stop the phone door's server, waiting at most DOOR_CLOSE_SECONDS; never hangs the program.
+
+    False when it did not stop in time: its threads are daemon threads, so it ends with
+    the program anyway.
+    """
+    if server is None:
+        return True
+    closer = threading.Thread(target=shut_down, args=(server,), name="phone door closing", daemon=True)
+    closer.start()
+    closer.join(DOOR_CLOSE_SECONDS)
+    if closer.is_alive():
+        print("The phone door did not close in time; it stops with the program.")
+        return False
+    return True
+
+
+def shut_down(server: Any) -> None:
+    try:
+        server.shutdown()
+        server.server_close()
+    except OSError:                                   # the program is stopping anyway
+        pass
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     for stream in (sys.stdout, sys.stderr):
@@ -1294,8 +1616,11 @@ def main(argv: list[str] | None = None) -> int:
         config = with_overrides(load_config(), args)
         settings = section(config, "app")
         host: str = require(settings, "host", str)
+        if not is_loopback(host):                     # the laptop's door stays on the laptop
+            raise ConfigError(NOT_LOCAL.format(host=host))
         port: int = require(settings, "port", int)
         log_file = resolve_path(require(settings, "log_file", str))
+        door_settings = read_settings(config)         # None when phone_door.enabled is false
     except ConfigError as error:
         print(f"Cannot start: {error}")
         return 1
@@ -1320,8 +1645,10 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Cannot start: {error}")
         return 1
     assistant = build_assistant(config, pipeline)
+    door = PhoneDoor(door_settings) if door_settings is not None else None
     app = create_app(pipeline, assistant, camera_file, build_people_book(config),
-                     discover_every=discover_interval(config))
+                     discover_every=discover_interval(config), door=door)
+    door_server = open_phone_door(app, door)          # None when the door is off or could not open
 
     pipeline.start()
     print(f"Demo page: {url}   (Ctrl+C stops the program)")
@@ -1337,7 +1664,10 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     finally:
         print("Stopping ...")
-        pipeline.stop()
+        try:
+            close_phone_door(door_server)             # at most DOOR_CLOSE_SECONDS
+        finally:
+            pipeline.stop()
     return 0
 
 

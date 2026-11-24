@@ -304,6 +304,12 @@
   .camera-result { margin: 0.45rem 0 0; min-height: 1.4em; font-size: 0.9rem; font-weight: 500; }
   .camera-result.problem { color: var(--warn); }
   .camera-box hr { border: 0; border-top: 1px solid var(--hairline); margin: 0.9rem 0; }
+  /* The phone door: each address with its QR code, side by side while they fit. */
+  .camera-box .door-part .field-label { margin-top: 0; }
+  .camera-box .door-addresses { display: flex; flex-wrap: wrap; gap: 0.9rem; }
+  .camera-box .door-address { margin: 0; display: grid; justify-items: center; gap: 0.35rem; }
+  .camera-box .door-qr { display: block; width: 140px; height: 140px; border-radius: 12px; background: #ffffff; image-rendering: pixelated; }
+  .camera-box .door-address figcaption { font-size: 0.85rem; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; user-select: all; }
 
   /* The picture size the phone sends: a plain select (keyboard and screen readers work as usual). */
   .picture-row { margin-top: 0.9rem; }
@@ -1218,6 +1224,19 @@
     <span class="switch-track" aria-hidden="true"></span>
     <span>Delay test</span>
   </label>
+  <!-- The phone door: shown when /api/door says it is open (asked once, when the box first opens). -->
+  <div class="door-part" id="doorPart" hidden>
+    <hr>
+    <p class="field-label">Open on your phone</p>
+    <div class="door-addresses" id="doorAddresses"></div>
+    <p class="camera-help">Same network. The phone warns once about the certificate; continue, then type the password.</p>
+  </div>
+  <p class="camera-help door-shut" id="doorShut" hidden></p>
+  <!-- Through the phone door: no addresses, a Sign out button instead. -->
+  <div class="door-leave" id="doorLeave" hidden>
+    <hr>
+    <button class="pill small secondary" id="doorSignOut" type="button">Sign out</button>
+  </div>
 </div>
 
 <!-- The voice box: opened by the Voice button in the bar. -->
@@ -2172,6 +2191,7 @@ async function poll() {
   const timer = setTimeout(() => controller.abort(), STATUS_TIMEOUT_MS);
   try {
     const response = await fetch("/api/status", { cache: "no-store", signal: controller.signal });
+    if (response.status === 401) window.location.replace("/door");   // the phone's session ended: sign in again
     if (!response.ok) throw new Error("status " + response.status);
     const status = await response.json();
     setOnline(true);
@@ -3629,6 +3649,7 @@ function openCameraBox() {
   cameraBox.hidden = false;
   cameraButton.setAttribute("aria-expanded", "true");
   if (!cameraAddress.value) cameraAddress.value = shortAddress(phoneUrl);
+  askDoor();                           // once: whether and where a phone can open this page
   cameraAddress.focus({ preventScroll: true });
   cameraAddress.select();
 }
@@ -3804,6 +3825,62 @@ function setDelayTest(on) {
   }
 }
 delaySwitch.addEventListener("change", () => setDelayTest(delaySwitch.checked));
+
+// ---- the phone door in the camera box -------------------------------------------
+//
+// Asked once, when the box is first opened. Through the laptop's own door, /api/door says
+// whether a phone can open this page, and where: each address is shown with its QR code.
+// Through the phone door /api/door is not there (404), so the box offers Sign out instead.
+
+const doorPart = byId("doorPart"), doorAddresses = byId("doorAddresses"), doorShut = byId("doorShut");
+const doorLeave = byId("doorLeave"), doorSignOut = byId("doorSignOut");
+const DOOR_ADDRESS = /^https:\/\/[0-9.]+:[0-9]+\/$/;   // the only kind of address the server gives
+let doorAsked = false;
+
+async function askDoor() {
+  if (doorAsked) return;
+  doorAsked = true;
+  try {
+    const { response, data } = await getJson("/api/door");
+    if (response.status === 404) {
+      doorLeave.hidden = false;          // this page came through the phone door
+    } else if (response.ok && data && data.open === true) {
+      drawDoor(asList(data.addresses).map(asText).filter((address) => DOOR_ADDRESS.test(address)));
+    } else if (response.ok && data) {
+      setText(doorShut, asText(data.why));
+      doorShut.hidden = doorShut.textContent === "";
+    } else {
+      doorAsked = false;                 // asked again the next time the box opens
+    }
+  } catch (error) {
+    doorAsked = false;
+  }
+}
+
+function drawDoor(addresses) {
+  const items = addresses.map((address) => {
+    const item = make("figure", "door-address");
+    const picture = make("img", "door-qr");
+    picture.alt = "QR code for " + address;
+    picture.width = 140;
+    picture.height = 140;
+    picture.src = "/api/door/qr?address=" + encodeURIComponent(address);
+    item.append(picture, make("figcaption", "", address));
+    return item;
+  });
+  doorAddresses.replaceChildren(...items);
+  doorPart.hidden = items.length === 0;
+}
+
+doorSignOut.addEventListener("click", async () => {
+  doorSignOut.disabled = true;
+  try {
+    await postJson("/door/leave", {});
+  } catch (error) {
+    // the sign-in page comes next all the same
+  }
+  window.location.replace("/door");
+});
 
 // ---- full view ------------------------------------------------------------------
 //

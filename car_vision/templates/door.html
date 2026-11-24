@@ -1,0 +1,252 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<meta name="referrer" content="no-referrer">
+<title>Sign in · Robot car vision</title>
+<script>
+  // The phone door's sign-in page. It has one password field and one button, and loads
+  // nothing from anywhere else. The look is chosen before anything is drawn: the visitor's
+  // choice from the page's sun and moon button, else what the system asks for.
+  (function () {
+    let theme = null;
+    try {
+      theme = window.localStorage.getItem("theme");
+    } catch (error) {
+      theme = null;                      // storage blocked: the page works without it
+    }
+    if (theme !== "light" && theme !== "dark") {
+      theme = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+    }
+    document.documentElement.dataset.theme = theme;
+  })();
+</script>
+<style>
+  /* ---- colours: the same two looks as the page itself ---- */
+  :root, :root[data-theme="light"] {
+    color-scheme: light;
+    --page: #f5f5f7;
+    --text: #1d1d1f;
+    --grey: #6e6e73;
+    --hairline: rgba(0, 0, 0, 0.1);
+    --field: rgba(255, 255, 255, 0.85);
+    --accent: #0066cc;
+    --accent-text: #ffffff;
+    --warn: #d70015;
+    --glass: rgba(255, 255, 255, 0.6);
+    --glass-solid: rgba(255, 255, 255, 0.94);
+    --glass-edge: rgba(255, 255, 255, 0.75);
+    --glass-shine: rgba(255, 255, 255, 0.9);
+    --shadow: 0 30px 80px rgba(0, 0, 0, 0.1), 0 2px 8px rgba(0, 0, 0, 0.04);
+    --blob-one: rgba(0, 113, 227, 0.22);
+    --blob-two: rgba(191, 90, 242, 0.16);
+    --blob-three: rgba(48, 209, 88, 0.14);
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --page: #000000;
+    --text: #f5f5f7;
+    --grey: #a1a1a6;
+    --hairline: rgba(255, 255, 255, 0.16);
+    --field: rgba(255, 255, 255, 0.08);
+    --accent: #2997ff;
+    --accent-text: #000000;
+    --warn: #ff453a;
+    --glass: rgba(30, 30, 32, 0.58);
+    --glass-solid: rgba(30, 30, 32, 0.95);
+    --glass-edge: rgba(255, 255, 255, 0.12);
+    --glass-shine: rgba(255, 255, 255, 0.16);
+    --shadow: 0 30px 90px rgba(0, 0, 0, 0.6), 0 2px 8px rgba(0, 0, 0, 0.3);
+    --blob-one: rgba(10, 132, 255, 0.3);
+    --blob-two: rgba(191, 90, 242, 0.22);
+    --blob-three: rgba(48, 209, 88, 0.12);
+  }
+
+  :root {
+    --font: "Segoe UI Variable Display", "Segoe UI", system-ui, -apple-system, "SF Pro Display",
+            "Helvetica Neue", Arial, sans-serif;
+    --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+    --spring: cubic-bezier(0.34, 1.56, 0.64, 1);
+  }
+
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0;
+    min-height: 100%;
+    display: grid;
+    place-items: center;
+    padding: max(16px, env(safe-area-inset-top)) 16px max(16px, env(safe-area-inset-bottom));
+    background: var(--page);
+    color: var(--text);
+    font-family: var(--font);
+    font-size: 17px;
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+    overflow-x: hidden;
+  }
+  :focus-visible { outline: 3px solid var(--accent); outline-offset: 3px; }
+
+  /* ---- soft colour shapes behind the glass; they stand still ---- */
+  .backdrop { position: fixed; inset: 0; z-index: -1; overflow: hidden; pointer-events: none; }
+  .blob { position: absolute; border-radius: 50%; }
+  .blob.one {
+    width: 80vmax; height: 80vmax; left: -30vmax; top: -30vmax;
+    background: radial-gradient(closest-side, var(--blob-one), transparent);
+  }
+  .blob.two {
+    width: 70vmax; height: 70vmax; right: -30vmax; top: 20vh;
+    background: radial-gradient(closest-side, var(--blob-two), transparent);
+  }
+  .blob.three {
+    width: 60vmax; height: 60vmax; left: 10vw; bottom: -36vmax;
+    background: radial-gradient(closest-side, var(--blob-three), transparent);
+  }
+
+  /* ---- the card: liquid glass ---- */
+  .card {
+    width: min(400px, 100%);
+    padding: 2.4rem 1.8rem 2rem;
+    border-radius: 32px;
+    background: var(--glass-solid);
+    border: 1px solid var(--glass-edge);
+    box-shadow: inset 0 1px 0 var(--glass-shine), var(--shadow);
+    text-align: center;
+    animation: card-in 0.7s var(--ease-out) both;
+  }
+  @supports ((-webkit-backdrop-filter: blur(1px)) or (backdrop-filter: blur(1px))) {
+    .card {
+      background: var(--glass);
+      -webkit-backdrop-filter: blur(28px) saturate(180%);
+      backdrop-filter: blur(28px) saturate(180%);
+    }
+  }
+  @keyframes card-in { from { opacity: 0; transform: translateY(16px) scale(0.98); } to { opacity: 1; transform: none; } }
+
+  .mark {
+    display: grid; place-items: center;
+    width: 56px; height: 56px; margin: 0 auto 1.2rem;
+    border-radius: 18px;
+    background: linear-gradient(160deg, var(--accent), #5e5ce6);
+    color: #ffffff;
+    box-shadow: 0 10px 24px rgba(0, 102, 204, 0.28);
+  }
+  .mark svg { width: 28px; height: 28px; }
+  .brand { margin: 0; font-size: 0.8rem; font-weight: 600; letter-spacing: 0.14em; text-transform: uppercase; color: var(--grey); }
+  h1 { margin: 0.35rem 0 0.4rem; font-size: 2rem; font-weight: 650; letter-spacing: -0.02em; line-height: 1.15; }
+  .lead { margin: 0 0 1.6rem; color: var(--grey); }
+
+  form { display: grid; gap: 0.8rem; }
+  label { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+  input {
+    width: 100%;
+    padding: 0.85rem 1.2rem;
+    border-radius: 999px;
+    border: 1px solid var(--hairline);
+    background: var(--field);
+    color: var(--text);
+    font: inherit;
+    font-size: 1.05rem;              /* 16 px or more: phones do not zoom in on the field */
+    text-align: center;
+  }
+  input:focus-visible { outline: 3px solid var(--accent); outline-offset: 1px; }
+  button {
+    padding: 0.85rem 1.2rem;
+    border: 0;
+    border-radius: 999px;
+    background: var(--accent);
+    color: var(--accent-text);
+    font: inherit;
+    font-size: 1.05rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: transform 0.45s var(--spring), opacity 0.2s;
+  }
+  button:hover { transform: translateY(-1px) scale(1.02); }
+  button:active { transform: scale(0.97); transition-duration: 0.12s; }
+  button:disabled { opacity: 0.5; cursor: progress; transform: none; }
+  .result { min-height: 1.5em; margin: 0.9rem 0 0; font-size: 0.95rem; font-weight: 500; color: var(--warn); }
+
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after { animation: none !important; transition: none !important; }
+  }
+</style>
+</head>
+<body>
+<div class="backdrop" aria-hidden="true"><span class="blob one"></span><span class="blob two"></span><span class="blob three"></span></div>
+
+<main class="card">
+  <div class="mark" aria-hidden="true">
+    <svg viewBox="0 0 24 24">
+      <rect x="5" y="10.5" width="14" height="10" rx="3" fill="currentColor"/>
+      <path d="M8.2 10.5V8a3.8 3.8 0 0 1 7.6 0v2.5" fill="none" stroke="currentColor" stroke-width="2.2"/>
+    </svg>
+  </div>
+  <p class="brand">Robot Car Vision</p>
+  <h1>Sign in</h1>
+  <p class="lead">Type the password to watch on this phone.</p>
+  <form id="doorForm" autocomplete="on">
+    <label for="password">Password</label>
+    <input id="password" name="password" type="password" autocomplete="current-password" required
+           maxlength="{{ max_password_chars }}" placeholder="Password" autofocus>
+    <button id="signIn" type="submit">Sign in</button>
+  </form>
+  <p class="result" id="result" role="status" aria-live="polite"></p>
+</main>
+
+<script>
+"use strict";
+
+// Every piece of text from the server goes in with textContent, never as HTML.
+
+const form = document.getElementById("doorForm");
+const field = document.getElementById("password");
+const button = document.getElementById("signIn");
+const result = document.getElementById("result");
+
+function showResult(text) {
+  result.textContent = text;
+}
+
+// The password goes to the server as JSON in the request's body, never in the address.
+async function signIn() {
+  const response = await fetch("/door", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ password: field.value }),
+    cache: "no-store",
+  });
+  let data = null;
+  try {
+    data = await response.json();
+  } catch (error) {
+    data = null;
+  }
+  return { response, data };
+}
+
+form.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  if (button.disabled) return;
+  button.disabled = true;
+  showResult("");
+  try {
+    const { response, data } = await signIn();
+    if (response.ok && data && data.ok === true) {
+      window.location.replace("/");
+      return;
+    }
+    const error = data && typeof data.error === "string" ? data.error : "Please try again.";
+    showResult(error);
+    field.select();
+  } catch (error) {
+    showResult("The laptop does not answer. Is the program still running?");
+  } finally {
+    button.disabled = false;
+  }
+});
+</script>
+</body>
+</html>

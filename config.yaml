@@ -22,6 +22,7 @@ detector:
   tracker: bytetrack.yaml   # gives each object a number that follows it
   open_model: yoloe-26s-seg.pt   # finds things by a typed name ("Look for" on the page); loaded on first use
   open_confidence: 0.35     # lower finds more but also more wrong things (at 0.25 one router was "found" four times)
+  open_maybe_confidence: 0.20   # a thing you looked for that scores between this and open_confidence is shown as "maybe"
   open_every_n_frames: 3    # the named search is slower, so it runs on every 3rd frame
 
 recognizer:
@@ -46,6 +47,7 @@ assistant:
   web_search_max_uses: 3
   history_turns: 10         # how many earlier question-answer pairs are sent along
   seen_within_seconds: 3.0  # a person counts as "in front of the camera" this long after the last sighting
+  arabic_style: standard    # with the page's Arabic switch on: standard (Modern Standard Arabic) or egyptian (everyday Egyptian Arabic)
 
 memory:
   file: data/memory.sqlite3 # what the camera saw and when; stays on this laptop
@@ -68,6 +70,31 @@ codes:
   every_n_frames: 5         # codes are looked for on every 5th frame to keep the video fast
   max_width: 960            # a wider picture is shrunk to this width before it is searched
   hold_seconds: 1.5         # a code stays on screen this long after it was last read
+
+voice:
+  hosted: true              # offer a hosted voice and hosted listening on the page (needs HF_TOKEN in .env)
+  provider: deepinfra       # the Hugging Face inference provider that serves both models below
+  speech_model: "hexgrad/Kokoro-82M"   # text to speech; it speaks English, not Arabic
+  speech_voice: af_heart    # a voice of that model: af_heart (American woman), bm_george (British man)
+  listen_model: "openai/whisper-large-v3-turbo"   # speech to text; English and Arabic
+  max_spoken_chars: 600     # one request speaks at most this many characters
+  max_listen_seconds: 20    # one recorded question is at most this long
+  daily_budget_usd: 0.25    # hosted speech stops for the day when the estimated cost reaches this
+  speech_price_per_million_chars: 0.99   # the listed prices in dollars, used for the estimate
+  listen_price_per_minute: 0.0002
+  spend_file: data/voice.json   # today's count and estimated cost, kept across restarts
+
+watch:
+  max_names: 4              # watch for at most this many things at once
+  again_after_seconds: 60   # the same thing is announced again only after it was away this long
+
+phone_door:
+  enabled: false            # true: the page can also be opened from a phone on the same network, behind a password
+  port: 5443                # the phone opens https://<this laptop's address>:5443
+  certificate_dir: data/door    # a certificate is made here on first use; the phone warns once that it does not know it
+  session_hours: 12         # a phone stays signed in this long
+  max_tries: 5              # this many wrong passwords from one phone, then ...
+  pause_minutes: 5          # ... it must wait this long
 
 reactions:
   greet_cooldown_seconds: 60        # greet the same person at most this often

@@ -15,6 +15,8 @@ data/people/*
 data/people.json
 data/camera.json
 data/lookout.json
+data/voice.json
+data/door/
 data/memory.sqlite3*
 data/people.removed/
 data/knowledge.md.bak

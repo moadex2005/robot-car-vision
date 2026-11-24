@@ -1604,6 +1604,12 @@ function make(tag, className, text) {
 const asText = (value) => (typeof value === "string" ? value : value == null ? "" : String(value));
 const asList = (value) => (Array.isArray(value) ? value : []);
 
+// The language of the assistant's answers: "en" or "ar". Every request for an answer sends
+// it, and the voice asks it which language to speak and to listen for.
+function answerLanguage() {
+  return "en";
+}
+
 function setText(node, text) {
   if (node.textContent !== text) node.textContent = text;
 }

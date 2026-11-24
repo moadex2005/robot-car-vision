@@ -218,8 +218,10 @@ def test_every_change_the_page_sends_is_json():
     assert "options.body = JSON.stringify(body === undefined ? {} : body);" in send
     script = page[page.index('<script>\n"use strict";'):]
     fetches = [m.start() for m in re.finditer(r"\bfetch\(", script)]
+    # M23: the hosted voice's two requests (tests/test_app_voice.py checks what they send).
     allowed = [between(script, name, "\n}\n") for name in
-               ("async function postJson(", "async function sendJson(", "async function poll(")]
+               ("async function postJson(", "async function sendJson(", "async function poll(",
+                "async function fetchClip(", "async function sendRecording(")]
     for position in fetches:
         assert any(script.index(body) <= position < script.index(body) + len(body) for body in allowed), position
     assert 'fetch("/api/status", { cache: "no-store", signal: controller.signal })' in script   # a GET

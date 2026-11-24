@@ -22,6 +22,8 @@ the video, or a sentence like "find my keys") and stops it; the page follows the
 search in the status. /api/memory gives what the camera remembers (the Timeline),
 a small picture of a remembered object, and empties the memory. /api/discover
 switches auto-discover on and off (a small hosted model names what is in view).
+/api/voice/say and /api/voice/hear are the hosted voice (voice.py): an answer's
+text in, its sound out, and a recorded question in, its words out.
 
 Only this page may change anything: every POST, PUT and DELETE under /api/ must
 be sent as JSON, which a plain form on another website cannot do, and a request
@@ -80,6 +82,7 @@ from car_vision.people import MAX_LINE, MAX_LINES, MAX_NAME, MAX_ROLE, MAX_STORY
 from car_vision.phone import load_remembered, phone_url, remember, same_phone
 from car_vision.pipeline import Pipeline, clean_names, first_line
 from car_vision.stream import SOURCES
+from car_vision.voice import OFF, HostedVoice, VoiceError
 
 log = logging.getLogger(__name__)
 
@@ -139,6 +142,13 @@ CAMERA_POWER_SHAPE = 'Send {"on": true} or {"on": false}.'
 CHANGING_METHODS = frozenset({"POST", "PUT", "DELETE"})   # these must come from this page, as JSON
 NOT_JSON = 'Send the request as JSON (Content-Type: application/json), with {} when there is nothing to send.'
 OTHER_WEBSITE = "Requests from other websites are refused."
+
+HEAR_PATH = "/api/voice/hear"    # the one changing request that is not JSON: its body is a WAV recording
+MAX_RECORDING_BYTES = 2_000_000  # a recording above this is refused before it is read
+SAY_SHAPE = 'Send the text to speak as JSON, like {"text": "Hello."}.'
+HEAR_LANGUAGES = ("en", "ar")
+NO_RECORDING_SIZE = "Send the recording with its size (Content-Length)."
+RECORDING_TOO_LARGE = f"The recording is too large: at most {MAX_RECORDING_BYTES // 1_000_000} MB."
 
 
 class UnavailableAssistant:
@@ -606,12 +616,17 @@ def refusal(method: str, path: str, origin: str | None, mimetype: str, host_url:
     Another website open in the same browser can send a plain form post to this
     server (a form cannot send JSON), and a browser names that website in the
     Origin header. So: a request from another origin is 403, and a POST, PUT or
-    DELETE under /api/ that is not JSON is 415.
+    DELETE under /api/ that is not JSON is 415. The one exception is the
+    recording of a spoken question, posted to HEAR_PATH as audio/wav: no form
+    can send that type, and another website's script that tries is stopped by
+    the browser (and by the Origin check above).
     """
     if not path.startswith("/api/"):
         return None
     if origin is not None and origin != own_origin(host_url):
         return OTHER_WEBSITE, 403
+    if method == "POST" and path == HEAR_PATH and mimetype == "audio/wav":
+        return None                   # the recording of a question; a form cannot send audio/wav either
     if method in CHANGING_METHODS and mimetype != "application/json":
         return NOT_JSON, 415
     return None
@@ -624,6 +639,15 @@ def discover_interval(config: dict[str, Any]) -> float | None:
     if not is_number(every) or not 0 < every < 86400:
         return None
     return float(every)
+
+
+def voice_json(voice: Any) -> dict[str, Any]:
+    """What GET /api/voice tells the page: whether there is a hosted voice, today's uses and cost, its limits."""
+    if voice is None:
+        return {"hosted": False}
+    return {"hosted": True, "uses": int(voice.uses_today), "spent_usd": round(float(voice.spent_today), 6),
+            "budget_usd": float(voice.budget), "max_chars": int(voice.max_chars),
+            "max_seconds": int(voice.max_seconds)}
 
 
 def interval_words(seconds: float | None) -> str:
@@ -740,7 +764,7 @@ def question_problem(question: str) -> str | None:
 
 def create_app(pipeline: Any, assistant: Any, camera_file: Path | None = None,
                people: PeopleBook | None = None, discover_every: float | None = None,
-               door: Any = None) -> Flask:
+               voice: Any = None, door: Any = None) -> Flask:
     """The Flask app for one pipeline and one assistant (real ones, or fakes in the tests).
 
     `camera_file` is where /api/camera remembers the phone's address; with None
@@ -748,6 +772,8 @@ def create_app(pipeline: Any, assistant: Any, camera_file: Path | None = None,
     book of person folders; with None the page hides its People section and those
     routes answer with a plain error. `discover_every` is lookout.every_seconds,
     only for the words beside the Auto-discover switch ("looking every 10 s").
+    `voice` is the HostedVoice behind /api/voice; with None the page offers only
+    the browser's own voice and listening.
     `door` is the phone door (a door.PhoneDoor: the password, the sessions and the
     tries); with None there is no phone door, and nothing comes through one.
     """
@@ -1142,6 +1168,48 @@ def create_app(pipeline: Any, assistant: Any, camera_file: Path | None = None,
         log.info("Auto-discover was switched %s from the page", "on" if on else "off")
         return jsonify(ok=True, on=on)
 
+    # ---- the hosted voice: speech and listening through Hugging Face ---------------------
+    # A VoiceError is a 200 with {"error", "kind"}, so the page quietly uses the browser's voice.
+
+    @app.get("/api/voice")
+    def voice_status() -> Any:
+        payload = voice_json(voice)
+        response = jsonify(payload)
+        response.headers["Cache-Control"] = "no-store"
+        return response
+
+    @app.post("/api/voice/say")
+    def voice_say() -> Any:
+        body = request.get_json(silent=True)
+        text = body.get("text") if isinstance(body, dict) else None
+        if not isinstance(text, str):
+            return jsonify(error=SAY_SHAPE), 400
+        if voice is None:
+            return jsonify(error=OFF, kind="off")
+        try:
+            sound = voice.say(text)
+        except VoiceError as error:
+            return jsonify(error=str(error), kind=error.kind)
+        return Response(sound, mimetype="audio/mpeg", headers={"Cache-Control": "no-store"})
+
+    @app.post("/api/voice/hear")
+    def voice_hear() -> Any:
+        language = request.args.get("language", "en")
+        if language not in HEAR_LANGUAGES:
+            return jsonify(error="The language must be en or ar."), 400
+        size = request.content_length
+        if size is None:
+            return jsonify(error=NO_RECORDING_SIZE), 411
+        if size > MAX_RECORDING_BYTES:              # refused before the body is read into memory
+            return jsonify(error=RECORDING_TOO_LARGE), 413
+        if voice is None:
+            return jsonify(error=OFF, kind="off")
+        try:
+            text = voice.hear(request.get_data(cache=False), language)
+        except VoiceError as error:
+            return jsonify(error=str(error), kind=error.kind)
+        return jsonify(text=text)
+
     # ---- the camera's memory ---------------------------------------------------------------
 
     @app.get("/api/memory")
@@ -1456,6 +1524,18 @@ def build_people_book(config: dict[str, Any]) -> PeopleBook | None:
     return PeopleBook(photos_dir, photos_dir.with_name(photos_dir.name + ".removed"))
 
 
+def build_hosted_voice(config: dict[str, Any]) -> HostedVoice | None:
+    """The hosted voice when voice.hosted is true; None when it is off or a setting is wrong (one line says which)."""
+    settings = config.get("voice")
+    if not isinstance(settings, dict) or settings.get("hosted") is not True:
+        return None
+    try:
+        return HostedVoice(settings)
+    except ConfigError as error:
+        print(f"The hosted voice is off: {error}")
+        return None
+
+
 def already_serving(host: str, port: int, timeout: float = PORT_CHECK_SECONDS) -> bool:
     """True when something already answers on host:port, e.g. a copy of this program.
 
@@ -1676,9 +1756,10 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Cannot start: {error}")
         return 1
     assistant = build_assistant(config, pipeline)
+    voice = build_hosted_voice(config)               # None: the page uses only the browser's own voice
     door = PhoneDoor(door_settings) if door_settings is not None else None
     app = create_app(pipeline, assistant, camera_file, build_people_book(config),
-                     discover_every=discover_interval(config), door=door)
+                     discover_every=discover_interval(config), voice=voice, door=door)
     door_server = open_phone_door(app, door)          # None when the door is off or could not open
 
     pipeline.start()

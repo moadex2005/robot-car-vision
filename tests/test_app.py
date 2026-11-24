@@ -2053,13 +2053,14 @@ def test_template_has_the_voice_button_its_box_the_microphones_and_the_caption()
         assert tag.startswith("<button") and 'type="button"' in tag and "aria-label=" in tag, tag
         assert re.search(r"\shidden\b", tag), tag
     # Near the chat and in the footer; each sentence shown only where its API exists.
+    # (M23 added a sentence for each hosted switch; tests/test_app_voice.py checks them.)
     line = ('<p class="voice-privacy" hidden><span class="privacy-listen" hidden>' + LISTEN_PRIVACY +
-            '</span> <span class="privacy-speak" hidden>' + SPEAK_PRIVACY + "</span></p>")
+            '</span> <span class="privacy-speak" hidden>' + SPEAK_PRIVACY + '</span> <span class="privacy-hosted-listen"')
     assert page.count(line) == 2
     draw = between(page, "function drawVoicePrivacy()", "\n}\n")
-    assert 'querySelectorAll(".privacy-listen")) part.hidden = Recognition === null;' in draw
+    assert 'querySelectorAll(".privacy-listen")) part.hidden = Recognition === null || hostedListen;' in draw
     assert 'querySelectorAll(".privacy-speak")) part.hidden = speech === null;' in draw
-    assert "line.hidden = Recognition === null && speech === null;" in draw
+    assert "line.hidden = Recognition === null && speech === null && !hostedListen && !hostedSpeak;" in draw
     for function in ("function setUpVoice()", "function loseSpeech()", "function loseListening()"):
         assert "drawVoicePrivacy();" in between(page, function, "\n}\n"), function
 
@@ -2075,7 +2076,9 @@ def test_template_feature_detects_speaking_and_listening():
     assert "try {" in listening and 'typeof found === "function"' in listening
     setup = between(page, "function setUpVoice()", "setUpVoice();\n")
     assert "voiceButton.hidden = speech === null;" in setup
-    assert "button.hidden = Recognition === null;" in setup and "drawVoicePrivacy();" in setup
+    # M23: the microphones are shown when the browser's listening or hosted listening is possible.
+    assert "drawListening();" in setup and "drawVoicePrivacy();" in setup
+    assert "button.hidden = !canListen;" in between(page, "function drawListening()", "\n}\n")
     # A call that throws hides its controls instead of breaking the page.
     assert "loseSpeech();" in between(page, "function startTalking(", "function utterance(")
     assert "loseListening();" in between(page, "function startListening(", "function beginHearing(")
@@ -2126,7 +2129,7 @@ def test_template_speaks_each_answer_once_and_never_an_error():
     assert describe.index("if (mine !== lookup) return;") < describe.index("showInfo(data)")
     # One thing at a time: a new one replaces the old one.
     speak = between(page, "function speak(", "function startTalking(")
-    assert "if (!speech || hearing) return;" in speak                    # never while listening
+    assert "if ((!speech && !speaksHosted()) || hearing) return;" in speak   # never while listening (M23: or hosted)
     assert speak.index("hush();") < speak.index("setTimeout(() => startTalking(talk), SPEAK_DELAY_MS)")
     assert "MAX_SPOKEN_CHARS = 600" in page and "PIECE_CHARS = 160" in page
 
@@ -2156,7 +2159,7 @@ def test_template_remembers_voice_in_storage_and_waits_for_the_first_click():
     assert storage.count("try {") == 2 and storage.count("catch (error)") == 2
     assert "window.localStorage.getItem(key)" in storage and "window.localStorage.setItem(key, value)" in storage
     assert 'let voiceWanted = readStored(VOICE_KEY) === "on";' in page        # off by default
-    assert "const voiceActive = () => speech !== null && voiceWanted && pageTouched;" in page
+    assert "const voiceActive = () => (speech !== null || speaksHosted()) && voiceWanted && pageTouched;" in page
     assert 'window.addEventListener("pointerdown", notePageTouched' in page
     assert 'window.addEventListener("keydown", notePageTouched' in page
     assert "if (!on) hush();" in page                                          # switching off hushes
@@ -2241,9 +2244,13 @@ def test_template_has_the_conversation_switch_only_where_listening_exists():
     assert 'let conversationWanted = readStored(CONVERSATION_KEY) === "on";' in script   # off by default
     assert 'store(CONVERSATION_KEY, on ? "on" : "off");' in script
     setup = between(script, "function setUpVoice()", "setUpVoice();\n")
-    assert "conversationRow.hidden = Recognition === null;" in setup
+    # M23: shown where the browser's listening or hosted listening is possible (drawListening).
+    assert "drawListening();" in setup
+    draw = between(script, "function drawListening()", "\n}\n")
+    assert "const canListen = Recognition !== null || listensHosted();" in draw
+    assert "conversationRow.hidden = !canListen;" in draw
     lose = between(script, "function loseListening()", "\n}\n")
-    assert "conversationRow.hidden = true;" in lose and 'conversationNext(conversation, "stop")' in lose
+    assert "drawListening();" in lose and 'conversationNext(conversation, "stop")' in lose
 
 
 def test_template_conversation_decides_its_next_state_in_one_place():
@@ -2305,7 +2312,7 @@ def test_template_conversation_never_listens_while_the_page_speaks():
     for function in ("function talkEnded(", "function hush(", "function loseSpeech("):
         assert "talkStopped();" in between(page, function, "\n}\n"), function
     speaking = between(page, "function toSpeaking(", "\n}\n")
-    assert 'if (speech) speak(answer, "answer");' in speaking               # even with "Speak the answers" off
+    assert 'if (speech || speaksHosted()) speak(answer, "answer");' in speaking   # even with "Speak the answers" off
     assert "if (!talking) waitThenListen(conv);" in speaking
     # The answer is spoken by the conversation, never a second time by say().
     arrived = between(page, "function answerArrived(", "\n}\n")

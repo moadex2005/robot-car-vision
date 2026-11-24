@@ -8,13 +8,17 @@ A phone on the car streams its camera to this laptop. The laptop labels objects,
 .venv\Scripts\python.exe -m car_vision.app --open
 ```
 
+Or double-click the **Robot Car Vision** shortcut on the desktop: see "One start button" below. [RUNBOOK.md](RUNBOOK.md) is one page of what to show at a demo and what to do when something fails.
+
 - **Live video** with a box, a label and a track number on every object the detector finds.
 - **In view**: a list of those objects. Click one in the list, or click it in the video.
-- **Details panel**: a small photo of what you clicked, what it is, a short description and its specifications. For a person the camera recognises, it shows what you wrote about them in their `about.md` instead.
+- **Details panel**: a small photo of what you clicked, what it is, a short description and its specifications. For a person the camera recognises, it shows one short line that introduces them instead.
+- **Camera off and on**: the round camera button at the top right of the video. Off really lets go of the camera: the laptop camera's light goes out, or the phone's stream is closed, and no model runs. The page says `Camera off`. Press it again, or **Turn on**, to start the same camera again. The camera is always on when the program starts.
+- **QR codes and barcodes**: a code in view is marked in the video and gets a pill under the In view list. Click the pill, or the code in the video, to read what it says; **Copy** copies it, and **Open link** appears when it is a plain web address. Nothing is opened by itself.
 - **Ask about this**: a small chat at the bottom of the details panel, for more questions about the thing you clicked. Each thing keeps its own short conversation (up to 10 questions).
-- **Chat**: type a question; the assistant answers from `data/knowledge.md` and searches the web when the notes do not have the answer.
+- **Chat**: type a question; the assistant answers from `data/knowledge.md` and searches the web when the notes do not have the answer. Bold, italic, code words and bullet lists in an answer are shown as such, not as `**` marks.
 - **Mark a part**: under the photo in the details panel. Switch the brush on, paint over a part of the photo, then ask about it or press **What is this part?**. The assistant gets the same cut-out with your marked area outlined. Not offered for people.
-- **Look for**: the field on the video. Type what to find, for example `power bank, keys`, and press Find. The camera then looks for those things by name, whatever they are: found ones get a bright yellow box and each word says `found on the right` or `not in view`. You can also type or say `find my keys` or `where is the remote` in the chat or into a microphone, and the page answers `I can see the keys, on the left.` Press Stop to end the search.
+- **Look for**: the field on the video. Type what to find, for example `power bank, keys`, and press Find. The camera then looks for those things by name, whatever they are: found ones are drawn in bright yellow with their own outline, not a box, and each word says `found on the right` or `not in view`. You can also type or say `find my keys` or `where is the remote` in the chat or into a microphone, and the page answers `I can see the keys, on the left.` Press Stop to end the search.
 - **Auto-discover**: a switch beside the In view heading, off until you turn it on. Every 10 seconds a small hosted model (through a Hugging Face token) looks at the picture and names what is there; the find-by-name detector then draws live boxes for those names. So the camera labels things beyond its 80 built-in kinds by itself. The switch shows how many looks were made today and what they cost.
 - **Timeline**: a section further down the page. The program remembers what it saw and when, with a small picture of each object (never of people). The chat can use it too: `where did you last see the bottle?`, `who came by today?`
 - **Describe**: the eye button on the video. The assistant looks at the whole picture and says what it sees in a few sentences. This sends the whole picture to the API.
@@ -33,6 +37,7 @@ Limits to know before the demo:
 - Three models work together on the picture: a fast local detector on every frame, a slower local one that finds things by name, and (with Auto-discover on) a small hosted one that suggests the names. Claude answers the questions.
 - Auto-discover sends a small picture of the whole view, with anyone in it, to a Hugging Face inference provider every few seconds. It costs about half a cent an hour and stops for the day at `lookout.daily_budget_usd` (50 cents). Its names can be wrong; the local detector then looks for things that are not there.
 - Looking for people by name is refused, and a find that lands on a person is dropped: people are only ever recognised by their enrolled face.
+- QR codes and barcodes are read on this laptop by OpenCV, with no model and no internet (`codes` in `config.yaml`; `enabled: false` switches it off). The program shows a code's text to you and does nothing else with it: it is not logged, remembered, spoken or given to the assistant. A picture sent for a click, for Describe or for Auto-discover can still show a code. Hold a code close and flat: at the usual picture size a QR code is read once it fills about half the picture's height, and a barcode when it is about a third to two thirds of the picture wide. A larger picture from the phone reads from farther away. `tools\make_codes_clip.py` makes a short test clip with both kinds of code, to try this without a camera.
 - The memory is a file on this computer (`data/memory.sqlite3`). It records labels, the names of enrolled people, times and small pictures of objects, and deletes what is older than one day (`memory.keep_days`); **Clear memory** in the Timeline deletes everything at once. A chat question sends its text lines, without pictures, to the assistant.
 - Asking by voice sends the sound of the question to the browser's speech service (Microsoft or Google) to be turned into text, and a "Natural" or online voice sends the text of the answer there to be spoken. The Claude API itself has no speech: Claude writes the answers, the browser does the listening and the speaking.
 - Take photos of a person only with their permission. Photos, face data and what you write about people stay on this laptop.
@@ -77,6 +82,14 @@ Already done on this laptop. To repeat it on another one:
    ```
 
    Every line should start with `OK` or `NOTE`. A `FAIL` line says what to fix.
+
+## One start button
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File tools\make_shortcut.ps1
+```
+
+This puts a **Robot Car Vision** shortcut on your desktop. A double-click runs `start_demo.cmd`: a black window opens, the models load, and the page opens in the browser after about a minute. Closing the black window stops the program. A second double-click while it is still starting is refused with a line that says so; once the page runs, it just opens the page. `start_demo.cmd --source phone` passes extra words on to the program.
 
 ## Settings
 

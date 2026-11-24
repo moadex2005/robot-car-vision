@@ -8,6 +8,12 @@
       "port": 5000
     },
     {
+      "name": "demo-codes",
+      "runtimeExecutable": ".venv\\Scripts\\python.exe",
+      "runtimeArgs": ["-m", "car_vision.app", "--file", "data/samples/codes_clip.mp4"],
+      "port": 5000
+    },
+    {
       "name": "demo-phone",
       "runtimeExecutable": ".venv\\Scripts\\python.exe",
       "runtimeArgs": ["-m", "car_vision.app", "--source", "phone"],

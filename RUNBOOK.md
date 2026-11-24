@@ -34,7 +34,7 @@ The page starts with the laptop camera.
 3. Ask a follow-up in **Ask about this**, like "What is it made of?". The answer is about that object.
 4. A person the camera knows steps in: the page says "Hello" with their name. A click on them shows one line: their name and role.
 5. Type a thing in **Look for** on the video, like `keys`, and press **Find**: it is drawn with a yellow outline of its shape.
-6. Hold a QR code to the camera: the video marks it. Click its pill under **In view** to read what it says.
+6. Hold a QR code close to the camera, filling about half the picture: the video marks it. Click its pill under **In view** to read what it says.
 7. Press the eye button on the video: the assistant describes the whole scene in a few sentences.
 8. Press the microphone beside the chat (Edge or Chrome; the browser asks for permission the first time) and ask "Where did you last see the bottle?". To hear the answer, press the speaker button in the top bar: a small box opens with the **Speak the answers** switch.
 9. Scroll down to the **Timeline**: what the camera saw and when, with small pictures of objects, never of people.

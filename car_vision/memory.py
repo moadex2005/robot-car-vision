@@ -38,6 +38,12 @@ fresh one is started.
 
 Pictures are kept only for objects, never for people. Only the standard
 library is used.
+
+A watched thing that appeared (M25, ``appeared``) is one more kind of row in
+the same table: kind ``watch``, first and last seen both the moment it
+appeared, never a picture. It is listed, deleted and cleared with the
+sightings, so the table needs no new column and a file from before still opens
+as it is.
 """
 
 from __future__ import annotations
@@ -48,12 +54,14 @@ import threading
 import time
 from collections.abc import Callable, Hashable
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 from typing import Any
 
 log = logging.getLogger(__name__)
 
 KINDS = ("object", "person")
+WATCH = "watch"                 # the kind of a row that says a watched thing appeared (M25)
 PLACE_WORDS = {"left": "on the left", "middle": "in the middle", "right": "on the right"}
 
 WRITE_EVERY_SECONDS = 2.0       # the file is written at most this often
@@ -73,7 +81,7 @@ DAY = 86400.0
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS sightings (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,  -- never reused, even after deletes
-    kind        TEXT NOT NULL,                      -- "object" or "person"
+    kind        TEXT NOT NULL,                      -- "object", "person" or "watch" (a watched thing appeared)
     label       TEXT NOT NULL,                      -- "person" for people
     name        TEXT,                               -- the recognised person's name, else NULL
     first_seen  REAL NOT NULL,                      -- seconds since 1970
@@ -95,7 +103,7 @@ class Sighting:
     """One remembered visit of one thing, as stored in the file."""
 
     id: int
-    kind: str              # "object" or "person"
+    kind: str              # "object", "person" or "watch"
     label: str             # the detector's label or the typed name; "person" for people
     name: str | None       # the recognised person's display name, else None
     first_seen: float      # seconds since 1970, as time.time() gives
@@ -187,6 +195,18 @@ class SightingLog:
             self._extend(thing, name, place, float(confidence), now, picture)
             if self._write_due(now):
                 self._write_and_tidy(now)
+
+    def appeared(self, label: str, place: str, now: float, name: str | None = None) -> None:
+        """Note that a watched thing appeared (M25): one row of kind "watch", never with a picture.
+
+        ``label`` is the watched name ("bottle"), or "person" with the person's
+        ``name``. It is written with the next write, like a sighting that ended.
+        """
+        if place not in PLACE_WORDS:
+            raise ValueError(f"place must be 'left', 'middle' or 'right', not {place!r}")
+        with self._lock:
+            if not self._closed:
+                self._finished.append(_Followed(WATCH, label, name, now, now, place, 0.0, is_row=True, changed=True))
 
     # ----- what the web server and the assistant call -----
 
@@ -513,6 +533,8 @@ def _sighting(row: tuple) -> Sighting:
 
 def _summary_line(kind: str, label: str, name: str | None, first_seen: float, last_seen: float,
                   place: str, now: float) -> str:
+    if kind == WATCH:
+        return _watch_line(f"person {name}" if name else label, last_seen, place, now)
     if kind == "person":
         who = f"{name} (person)" if name else "an unrecognised person"
     else:
@@ -520,6 +542,29 @@ def _summary_line(kind: str, label: str, name: str | None, first_seen: float, la
     where = PLACE_WORDS.get(place, "somewhere in the picture")
     return (f"{who}: last seen {time_ago(now - last_seen)} {where},"
             f" in view for {duration(last_seen - first_seen)}")
+
+
+def _watch_line(what: str, at: float, place: str, now: float) -> str:
+    """The latest appearance of a watched thing: '10:42 the watched bottle appeared, on the left'
+    ('... the watched person Mohamed Adel appeared ...' for a person)."""
+    where = PLACE_WORDS.get(place, "somewhere in the picture")
+    return f"{clock_time(at, now)} the watched {what} appeared, {where}"
+
+
+def clock_time(at: float, now: float) -> str:
+    """The local time of a moment: '10:42' today, 'yesterday 10:42', else '21 November 10:42'."""
+    moment, today = time.localtime(at), time.localtime(now)
+    hours = time.strftime("%H:%M", moment)
+    days = (_local_date(today) - _local_date(moment)).days
+    if days == 0:
+        return hours
+    if days == 1:
+        return f"yesterday {hours}"
+    return f"{moment.tm_mday} {time.strftime('%B', moment)} {hours}"
+
+
+def _local_date(moment: time.struct_time) -> date:
+    return date(moment.tm_year, moment.tm_mon, moment.tm_mday)
 
 
 def time_ago(seconds: float) -> str:

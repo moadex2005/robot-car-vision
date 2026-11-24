@@ -19,7 +19,9 @@ again. /api/scene asks the assistant to describe the whole picture.
 
 /api/search starts looking for things by a typed name (the "Look for" field on
 the video, or a sentence like "find my keys") and stops it; the page follows the
-search in the status. /api/memory gives what the camera remembers (the Timeline),
+search in the status. /api/watch watches for things ("tell me when a bottle
+appears") and stops; the page shows a quiet notice when one appears, never
+spoken. /api/memory gives what the camera remembers (the Timeline),
 a small picture of a remembered object, and empties the memory. /api/discover
 switches auto-discover on and off (a small hosted model names what is in view).
 /api/voice/say and /api/voice/hear are the hosted voice (voice.py): an answer's
@@ -130,6 +132,8 @@ MAX_SEARCH_CHARS = 300           # a typed "Look for" text is never longer (6 na
 SEARCH_SHAPE = ('Send what to look for as JSON, like {"names": ["power bank", "keys"]} '
                 'or {"text": "power bank, keys"}.')
 NOTHING_TO_FIND = "Type what to look for, like power bank or keys."
+WATCH_SHAPE = 'Send what to watch for as JSON, like {"names": ["bottle", "keys"]}.'
+NOTHING_TO_WATCH = "Type what to watch for, like bottle or keys."
 NAME_SEPARATORS = re.compile(r",|\band\b", re.IGNORECASE)   # "power bank, keys and the remote"
 MEMORY_LIMIT = 50                # sightings the Timeline asks for when it does not say
 MOST_SIGHTINGS = 200             # ... and at most
@@ -565,6 +569,17 @@ def search_names(body: Any) -> list[Any] | str:
     if len(text) > MAX_SEARCH_CHARS:
         return f"That is too long to look for. Please keep it under {MAX_SEARCH_CHARS} characters."
     return split_names(text)
+
+
+def watch_names(body: Any) -> list[Any] | str:
+    """The names from a POST /api/watch body ({"names": [...]}), not yet checked, or the reason
+    the shape is wrong. The pipeline checks the names themselves."""
+    names = body.get("names") if isinstance(body, dict) and set(body) == {"names"} else None
+    if not isinstance(names, list):
+        return WATCH_SHAPE
+    if not names:
+        return NOTHING_TO_WATCH
+    return names
 
 
 def memory_of(pipeline: Any) -> Any:
@@ -1190,6 +1205,26 @@ def create_app(pipeline: Any, assistant: Any, camera_file: Path | None = None,
     @app.delete("/api/search")
     def search_stop() -> Any:
         pipeline.search([])
+        return jsonify(ok=True)
+
+    # ---- watching for things: a quiet notice when one appears (M25) ----------------------
+
+    @app.post("/api/watch")
+    def watch_start() -> Any:
+        names = watch_names(request.get_json(silent=True))
+        if isinstance(names, str):
+            return jsonify(error=names), 400
+        try:
+            pipeline.watch(names)                     # replaces the list; returns at once
+        except ValueError as error:
+            return jsonify(error=str(error)), 400
+        # The names as the status shows them: a known person's name as they were enrolled.
+        watched = pipeline.status().get("watch", {}).get("names", [])
+        return jsonify(ok=True, names=[str(entry["name"]) for entry in watched])
+
+    @app.delete("/api/watch")
+    def watch_stop() -> Any:
+        pipeline.watch([])
         return jsonify(ok=True)
 
     # ---- auto-discover ----------------------------------------------------------------------

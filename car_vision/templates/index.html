@@ -641,6 +641,52 @@
   @container (max-width: 520px) {
     .find-chip-state { display: none; }   /* a very narrow video: the names only, the state is in their title */
   }
+  /* Watching for things (M25): the bell beside Find, a quiet chip per watched name (a grey bell,
+     a fainter edge than the search chips, never their yellow) with a small round button that
+     stops watching that one, and the notice among the banners. All solid: they lie over the
+     moving picture. The notice's bell rings once as it comes in, never again. */
+  .bell { flex: none; width: 1em; height: 1em; }
+  .finder-button.watch-button {
+    aspect-ratio: 1; padding: 0;
+    display: grid; place-items: center;
+    background: #3a3a3c; color: #f5f5f7;
+  }
+  .watch-button .bell { width: 1.1rem; height: 1.1rem; }
+  .find-chip.watch-chip { gap: 0.35rem; padding-right: 0.3rem; border-color: rgba(255, 255, 255, 0.14); }
+  .watch-chip .bell { color: #a1a1a6; }
+  .watch-chip.is-in-view .bell, .watch-chip.is-in-view .find-chip-state { color: #f5f5f7; }
+  .watch-chip.is-failed .find-chip-state { color: #ff6961; }
+  .watch-chip-stop {
+    flex: none; display: grid; place-items: center;
+    width: 1.7rem; height: 1.7rem; margin-left: 0.1rem; padding: 0;
+    border: 0; border-radius: 50%;
+    background: #3a3a3c; color: #f5f5f7;
+    font: inherit; font-size: 1rem; line-height: 1;
+    cursor: pointer;
+    transition: transform 0.45s var(--spring);
+  }
+  .watch-chip-stop:hover { transform: scale(1.08); }
+  .watch-chip-stop:active { transform: scale(0.92); transition-duration: 0.12s; }
+  .watch-chip-stop:focus-visible { outline: 2px solid #fff; outline-offset: 1px; }
+  .notices { display: flex; flex-direction: column; align-items: center; gap: 8px; }
+  .notices:empty { display: none; }
+  .capsule.watch-notice {
+    max-width: 100%;
+    color: #f5f5f7; font-size: clamp(1rem, 1.4vw, 1.3rem); font-weight: 600;
+    background: #1c1c1e;
+    border: 1px solid rgba(255, 255, 255, 0.28);
+    box-shadow: 0 12px 30px rgba(0, 0, 0, 0.3);
+    transition: opacity 0.45s var(--ease-out), transform 0.45s var(--ease-out);
+  }
+  .watch-notice .bell { transform-origin: 50% 20%; animation: bell-ring 0.9s var(--ease-out) 0.25s 1; }
+  .capsule.watch-notice.is-leaving { opacity: 0; transform: translateY(-8px) scale(0.97); }
+  @keyframes bell-ring {
+    0%, 100% { transform: none; }
+    20% { transform: rotate(14deg); }
+    40% { transform: rotate(-10deg); }
+    60% { transform: rotate(6deg); }
+    80% { transform: rotate(-3deg); }
+  }
   .is-full .frame-button .expand { display: none; }
   .is-full .frame-button .shrink { display: block; }
 
@@ -1138,6 +1184,7 @@
     margin: 0; color: var(--grey); font-size: 0.85rem; font-variant-numeric: tabular-nums;
     white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
   }
+  .moment-mark .bell { width: 1.45rem; height: 1.45rem; }   /* a watched thing appeared (M25) */
 
   /* ---- footer ---- */
   .footer {
@@ -1335,6 +1382,11 @@
       .stage:not(.is-full) .banners { padding: 8px calc(3 * 40px + 2 * 8px + 16px) 8px 8px; }
     }
     .greeting, .photo-capsule { font-size: 0.95rem; padding: 0.5em 0.95em; overflow-wrap: anywhere; }
+    .capsule.watch-notice { font-size: 0.95rem; padding: 0.5em 0.95em; overflow-wrap: anywhere; }
+    /* The notice: under the buttons and as wide as the picture, not squeezed beside them. */
+    .stage:not(.is-full) .notices { position: absolute; top: calc(10px + 2.6rem + 8px); left: 10px; right: 10px; align-items: flex-start; }
+    .watch-chip-stop { width: 40px; height: 40px; }             /* easy to touch, inside the 44 px chip */
+    .find-chip.watch-chip { padding-right: 2px; }
     .offline { font-size: 1.3rem; overflow-wrap: anywhere; }
     .offline small { font-size: 0.85rem; }
     .capsule.camera-off-capsule { font-size: 1rem; }
@@ -1689,12 +1741,30 @@
               <input id="finderText" type="text" maxlength="{{ max_search_chars }}" spellcheck="false"
                      placeholder="Look for ...">
               <button class="finder-button" id="finderFind" type="submit">Find</button>
+              <!-- Watch for: tell me when the names typed here come into view (a quiet notice, never spoken). -->
+              <button class="finder-button watch-button" id="finderWatch" type="button"
+                      aria-label="Tell me when it appears" title="Tell me when it appears">
+                <svg class="bell" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+                  <path d="M6.5 16.5V11a5.5 5.5 0 0 1 11 0v5.5l1.5 1.5H5z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/>
+                  <path d="M10 20.5a2 2 0 0 0 4 0" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+                </svg>
+              </button>
             </form>
             <ul class="find-chips" id="findChips" aria-label="What is being looked for" aria-live="off" hidden></ul>
+            <ul class="find-chips watch-chips" id="watchChips" aria-label="What is being watched for" aria-live="off" hidden></ul>
+            <!-- The bell, copied into the watch chips, the notices and the Timeline (cloned, never parsed from text). -->
+            <template id="bellIcon">
+              <svg class="bell" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+                <path d="M6.5 16.5V11a5.5 5.5 0 0 1 11 0v5.5l1.5 1.5H5z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/>
+                <path d="M10 20.5a2 2 0 0 0 4 0" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+              </svg>
+            </template>
             <button class="finder-button stop" id="finderStop" type="button" hidden>Stop</button>
           </div>
           <div class="banners">
             <div class="greetings" id="greetings" aria-live="polite"></div>
+            <!-- A watched thing appeared: one quiet capsule at a time, never spoken; a screen reader may read it. -->
+            <div class="notices" id="notices" aria-live="polite"></div>
             <!-- While photos of a person are taken: what they should do, also in the full view. -->
             <div class="capsule photo-capsule" id="photoCapsule" hidden></div>
           </div>
@@ -2071,6 +2141,76 @@ function findRequest(text) {
     names.push(words.join(" "));
   }
   return names.length <= FIND_MAX_NAMES ? names.join(", ") : null;
+}
+
+// ---- watch by words: is this sentence nothing but a request to watch for something? ----
+//
+// watchRequest(text) gives { names } to watch for, { stop: true } for "stop watching", or null:
+// then the sentence goes on to findRequest and the assistant as before. Strict like findRequest:
+// the whole sentence, 1 to 4 names (commas, "and" or "or" between them), the little words "the",
+// "my", "a", "an", "any" and "some" dropped, with or without "please" or "can you" before it:
+//   "tell me when a bottle appears" -> bottle      "tell me when you see my keys" -> keys
+//   "let me know when Mohamed arrives" -> Mohamed  "watch for the remote" -> remote
+//   "keep an eye out for the cat" -> cat           "stop watching" -> stop
+// "appears" may also be "arrives", "shows up", "turns up", "comes", "comes in", "comes back",
+// "comes into view", "is back", "is here" or "is in view". Every name needs a little word before it
+// ("the remote"), except a person's: after "tell me when" (or "let me know when") a name without
+// one must start with a capital and the sentence must end in a person coming (WATCH_COMING:
+// "Mohamed arrives"), so "tell me when dinner arrives" goes to the assistant; after "tell me when
+// you see" it must start with a capital. After "watch for" every name needs a little word and
+// has no capital, as after "where is".
+// Left for the assistant: any other ending ("tell me when the store opens", "... you were built"),
+// a word that is not part of a thing's name (FIND_NOT_A_NAME and WATCH_NOT_A_NAME: "let me know
+// when it arrives", "tell me when the next train arrives", "watch for the weather"), "watch for"
+// without a little word ("watch for updates"), more than 4 names, or a sentence over 80 characters.
+const WATCH_STOP = /^stop\s+watching$/i;
+const WATCH_SEE = /^(?:tell\s+me|let\s+me\s+know)\s+when\s+you\s+see\s+(.+)$/i;
+const WATCH_WHEN = /^(?:tell\s+me|let\s+me\s+know)\s+when\s+(.+?)\s+(appears?|arrives?|shows?\s+up|turns?\s+up|comes?(?:\s+(?:in|back|into\s+view))?|(?:is|are)\s+(?:back|here|in\s+view))$/i;
+const WATCH_COMING = /^(?:arrives|comes|comes back|comes in|is here|is in view|shows up|appears)$/i;   // a person coming
+const WATCH_FOR = /^(?:watch|keep\s+an\s+eye\s+out|look\s+out)\s+for\s+(.+)$/i;
+const WATCH_LITTLE_WORDS = ["the", "my", "a", "an", "any", "some"];
+const WATCH_NOT_A_NAME = [
+  "appear", "appears", "arrive", "arrives", "come", "comes", "came", "show", "shows", "turn", "turns",
+  "up", "back", "view", "see", "seen", "next", "new", "tomorrow", "tonight", "soon", "later", "ready",
+  "open", "opens", "closed", "result", "results", "update", "updates", "release", "releases",
+];
+const WATCH_MAX_NAMES = 4;     // in one sentence; the server checks the whole list (watch.max_names)
+
+function watchRequest(text) {
+  const sentence = asText(text).replace(/[‘’]/g, "'").replace(/\s+/g, " ").trim()
+    .replace(/[.!?]+$/, "").replace(/,?\s+please$/i, "").trim()
+    .replace(/^(?:(?:can|could|would)\s+you\s+)?(?:please\s+)?/i, "");
+  if (!sentence || sentence.length > FIND_MAX_CHARS) return null;
+  if (WATCH_STOP.test(sentence)) return { stop: true };
+  const see = WATCH_SEE.exec(sentence);
+  const when = see ? null : WATCH_WHEN.exec(sentence);
+  const forWhat = see || when ? null : WATCH_FOR.exec(sentence);
+  if (!see && !when && !forWhat) return null;
+  // May a name without a little word be taken, as a person's name with a capital?
+  const people = Boolean(see) || Boolean(when && WATCH_COMING.test(when[2].replace(/\s+/g, " ")));
+  const names = watchedNames((see || when || forWhat)[1], people, !forWhat);
+  return names ? { names } : null;
+}
+
+// The names of a watch sentence, or null when one of them is not a plain name. Every name needs
+// a little word before it, except, when `people`, one that starts with a capital (a person's
+// name). `capitals`: a capital is allowed inside a name ("the Coke bottle").
+function watchedNames(text, people, capitals) {
+  const names = [];
+  for (const part of text.split(/\s*,\s*|\s+and\s+|\s+or\s+/i)) {
+    const all = part.split(" ").filter(Boolean);
+    const little = all.length > 0 && WATCH_LITTLE_WORDS.includes(all[0].toLowerCase());
+    if (!little && !(people && all.length && /^\p{Lu}/u.test(all[0]))) return null;
+    const words = all.filter((word) => !WATCH_LITTLE_WORDS.includes(word.toLowerCase()));
+    if (!words.length || words.length > FIND_MAX_WORDS) return null;
+    for (const word of words) {
+      const small = word.toLowerCase();
+      if (FIND_NOT_A_NAME.includes(small) || WATCH_NOT_A_NAME.includes(small)) return null;
+      if (!/^[\p{L}\p{N}-]+$/u.test(word) || (!capitals && /^\p{Lu}\p{Ll}/u.test(word))) return null;
+    }
+    names.push(words.join(" "));
+  }
+  return names.length <= WATCH_MAX_NAMES ? names : null;
 }
 
 // ---- the page coming alive: compact bar, slow headline, sections that rise in ----
@@ -3278,10 +3418,16 @@ form.addEventListener("submit", (event) => {
 });
 
 // Send what is in the chat field (typed, or heard by the microphone). False when nothing was sent.
-// A sentence that is only a request to find something starts a search instead (findRequest).
+// A sentence that is only a request to find something starts a search instead (findRequest),
+// and one that is only a request to watch for something starts a watch (watchRequest).
 function sendChat() {
   const question = input.value.trim();
   if (!question || busy) return false;
+  const watched = watchRequest(question);      // "tell me when a bottle appears", "stop watching"
+  if (watched !== null) {
+    watchFromChat(question, watched);
+    return true;
+  }
   const wanted = findRequest(question);
   if (wanted !== null) findFromChat(question, wanted);
   else askChat(question);
@@ -6412,6 +6558,7 @@ function clearSearch() {
   chipItems.clear();
   findChips.hidden = true;
   finderStop.hidden = true;
+  clearWatch();                // the program is not running: nothing watched is shown either
   fitFinderRoom();
 }
 
@@ -6428,6 +6575,7 @@ function drawSearch(status, number) {
   drawChips(search);
   const cameraUp = status.connected === true && !status.ended && !status.error;
   followFind(search, number, cameraUp);
+  drawWatch(status, number);   // the watch chips, the notices and this page's own watch request
 }
 
 // ---- the words: plain English, with "a" or "an" and the plural right ----
@@ -6716,6 +6864,407 @@ finderStop.addEventListener("click", async () => {
   } catch (error) {
     showCaption("", "Program not running: the search could not be stopped.", true, CAPTION_MS);
   }
+});
+
+// ---- watching for things: "tell me when a bottle appears" ----
+//
+// The server watches: POST /api/watch with the whole list of names, DELETE stops, and every
+// status says what is watched (status.watch.names) and what appeared (status.watch.events).
+// The page
+//   1. starts a watch from the bell beside Find (for the names typed in the field) or from words
+//      in the chat, typed or spoken (watchRequest); a new name joins the names watched already;
+//   2. answers that once, in its own words, where a find's answer goes, spoken only when voice is
+//      on (it answers what the visitor just did): "I'll tell you when I see a bottle.";
+//   3. shows a quiet chip per watched name, with a small button that stops watching that one;
+//   4. shows a notice for each event it has not shown yet: a capsule among the banners for
+//      NOTICE_MS, one at a time, and "(1)" before the tab's title while the page is in the
+//      background. The notice is never spoken, by either voice, in any mode: showNotice and
+//      the functions it uses call no say(), speak() or answerArrived(), and ask the server for
+//      nothing. A screen reader may read it (aria-live="polite" on #notices).
+
+const NOTICE_MS = 8000;        // a notice stays this long ...
+const NOTICE_FADE_MS = 450;    // ... then fades out in this long
+const NOTICE_RECENT_S = 10;    // on a fresh page only events this young count, so a reload replays nothing
+const NOTICE_STALE_S = 60;     // a notice that waited (the page was in the background) longer than this is dropped
+const WATCH_STATES = ["watching", "loading", "waiting", "failed"];
+const WATCH_WORDS = { loading: "getting ready", waiting: "waiting for room", failed: "could not start" };
+
+const finderWatch = byId("finderWatch"), watchChips = byId("watchChips"), notices = byId("notices");
+const bellIcon = byId("bellIcon");
+const watchItems = new Map();  // a name in small letters -> its chip, reused so it does not pop again
+const pageTitle = document.title;
+
+let watchNow = { names: [], events: [] };   // the newest status.watch, read
+let watching = null;           // this page's own request, until it is answered: { names, deliver, ... }
+let noticeAfter = null;        // the largest event id shown or passed over; null on a fresh page
+const noticeQueue = [];        // notices still to show: { text, at }
+// This page's own list of watched names: changed at once on every start and stop (so two quick
+// presses never lose a name), and replaced by the server's list once a status asked for after the
+// last change arrives. Changes go to the server one after the other (watchSent).
+let watchList = [];
+let watchListFrom = 0;         // statuses numbered below this are older than the last change
+let watchSending = 0;          // changes on their way to the server
+let watchSent = Promise.resolve();
+let noticeShown = null;        // the capsule on screen, or null
+let unseenNotices = 0;         // notices that came while the page was in the background
+
+const isRecord = (value) => Boolean(value) && typeof value === "object";
+const bell = () => bellIcon.content.firstElementChild.cloneNode(true);
+// "Bottle", "Mohamed Adel": the first letter as a capital.
+function capitalised(text) {
+  return text.charAt(0).toUpperCase() + text.slice(1);
+}
+
+function readWatch(raw) {
+  const watch = isRecord(raw) ? raw : {};
+  return {
+    names: asList(watch.names).filter(isRecord).map((entry) => ({
+      name: asText(entry.name), state: WATCH_STATES.includes(entry.state) ? entry.state : "watching",
+      inView: entry.in_view === true, person: entry.person === true,
+    })).filter((entry) => entry.name),
+    events: asList(watch.events).filter(isRecord).map((event) => ({
+      id: Number(event.id), name: asText(event.name), place: asText(event.place), at: Number(event.at),
+    })).filter((event) => Number.isSafeInteger(event.id) && event.id > 0 && event.name),
+  };
+}
+
+// Every status poll (from drawSearch): the chips, the notices, then this page's own request.
+function drawWatch(status, number) {
+  watchNow = readWatch(status.watch);
+  if (!watchSending && number >= watchListFrom) watchList = watchNow.names.map((entry) => entry.name);
+  drawWatchChips(watchNow);
+  takeEvents(watchNow.events);
+  followWatch(status, number);
+}
+
+// ---- the watch chips ----
+
+function watchChipText(entry) {
+  if (entry.state !== "watching") return WATCH_WORDS[entry.state];
+  return entry.inView ? "in view" : "watching";
+}
+
+function watchChip() {
+  const item = make("li", "find-chip watch-chip");
+  const stop = make("button", "watch-chip-stop", "×");
+  stop.type = "button";
+  stop.addEventListener("click", () => stopWatchingOne(item.dataset.name));
+  item.append(bell(), make("span", "find-chip-name"), make("span", "find-chip-state"), stop);
+  return item;
+}
+
+function drawWatchChips(watch) {
+  const chips = watch.names.map((entry) => ({ name: entry.name, text: watchChipText(entry),
+                                              inView: entry.state === "watching" && entry.inView,
+                                              failed: entry.state === "failed" }));
+  if (!changed("watchChips", chips)) return;
+  const keys = new Set(chips.map((chip) => chip.name.toLowerCase()));
+  for (const key of [...watchItems.keys()]) if (!keys.has(key)) watchItems.delete(key);
+  const items = chips.map((chip) => {
+    const key = chip.name.toLowerCase();
+    const item = watchItems.get(key) || watchChip();
+    watchItems.set(key, item);
+    item.dataset.name = chip.name;
+    setText(item.children[1], chip.name);
+    setText(item.children[2], chip.text);
+    item.classList.toggle("is-in-view", chip.inView);
+    item.classList.toggle("is-failed", chip.failed);
+    item.title = "Watching for " + chip.name + ": " + chip.text;
+    const label = "Stop watching for " + chip.name;
+    if (item.lastChild.getAttribute("aria-label") !== label) {
+      item.lastChild.setAttribute("aria-label", label);
+      item.lastChild.title = label;
+    }
+    return item;
+  });
+  const same = items.length === watchChips.children.length && items.every((item, i) => watchChips.children[i] === item);
+  if (!same) watchChips.replaceChildren(...items);
+  watchChips.hidden = items.length === 0;
+  fitFinderRoom();
+}
+
+// The small button on a chip: watch for the others only (or for nothing).
+async function stopWatchingOne(name) {
+  const rest = watchList.filter((other) => !sameName(other, name));
+  finderText.focus({ preventScroll: true });   // the button goes with its chip
+  try {
+    const { response, data } = await sendWatchList(rest);
+    if (!response.ok || !data || data.ok !== true) showCaption("", errorText(data, response, "Please try again."), true, CAPTION_MS);
+  } catch (error) {
+    showCaption("", "Program not running: the watch could not be changed.", true, CAPTION_MS);
+  }
+}
+
+// The program is not running: no chips, no notices, and the next page of events counts as fresh.
+function clearWatch() {
+  watchChips.replaceChildren();
+  watchItems.clear();
+  watchChips.hidden = true;
+  watchNow = { names: [], events: [] };
+  watchList = [];
+  watchListFrom = 0;
+  noticeQueue.length = 0;
+  notices.replaceChildren();
+  noticeShown = null;
+  noticeAfter = null;
+  unseenNotices = 0;
+  drawTitle();
+  if (watching) watchAnswered(watching, "Program not running: the watch could not be followed.", "problem");
+}
+
+// ---- the notice: shown, never spoken ----
+
+// The events not shown yet: a larger id than the last one shown. On a fresh page (or after the
+// program was not running, or started again) only events of the last NOTICE_RECENT_S seconds.
+function takeEvents(events) {
+  if (!events.length) {
+    if (noticeAfter === null) noticeAfter = 0;   // nothing has appeared yet: every event to come is new
+    return;
+  }
+  const newest = Math.max(...events.map((event) => event.id));
+  if (noticeAfter !== null && newest < noticeAfter) noticeAfter = null;   // the program started again
+  const recent = Date.now() / 1000 - NOTICE_RECENT_S;
+  for (const event of events) {
+    const fresh = noticeAfter === null ? event.at >= recent : event.id > noticeAfter;
+    if (fresh) queueNotice(capitalised(event.name) + " appeared, " + placeWords(event.place), event.at);
+  }
+  noticeAfter = Math.max(noticeAfter || 0, newest);
+}
+
+function queueNotice(text, at) {
+  noticeQueue.push({ text, at });
+  if (document.visibilityState === "hidden") {
+    unseenNotices += 1;
+    drawTitle();
+  }
+  showNotice();
+}
+
+// One capsule at a time: it comes in once (and its bell rings once), stays NOTICE_MS, fades out,
+// and the next one follows. While the page is in the background the notices wait for it; one that
+// waited longer than NOTICE_STALE_S is dropped (the title counted it, and the Timeline holds it).
+function showNotice() {
+  if (noticeShown || document.visibilityState === "hidden") return;
+  const stale = Date.now() / 1000 - NOTICE_STALE_S;
+  while (noticeQueue.length && noticeQueue[0].at < stale) noticeQueue.shift();
+  if (!noticeQueue.length) return;
+  const capsule = make("div", "capsule watch-notice");
+  capsule.append(bell(), make("span", "", noticeQueue.shift().text));
+  noticeShown = capsule;
+  notices.append(capsule);
+  setTimeout(() => {
+    capsule.classList.add("is-leaving");
+    setTimeout(() => {
+      capsule.remove();
+      if (noticeShown !== capsule) return;     // cleared meanwhile
+      noticeShown = null;
+      showNotice();
+    }, NOTICE_FADE_MS);
+  }, NOTICE_MS);
+}
+
+// "(2) Robot Car Vision" while notices came in the background; the plain title once it is looked at.
+function drawTitle() {
+  const title = unseenNotices ? "(" + unseenNotices + ") " + pageTitle : pageTitle;
+  if (document.title !== title) document.title = title;
+}
+
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState !== "visible") return;
+  unseenNotices = 0;
+  drawTitle();
+  showNotice();
+});
+
+// ---- starting a watch, and its one answer ----
+
+// "bottle, keys and the remote" -> ["bottle", "keys", "remote"]: a little word before a name goes,
+// so "the remote" is the everyday detector's remote.
+function typedNames(text) {
+  return text.split(/,|\band\b/i).map((part) => part.trim().replace(/^(?:the|my|a|an)\s+/i, "").trim())
+    .filter(Boolean);
+}
+
+// Watch for `names` too (the names watched already stay). `reply.deliver(text, kind)` gives the
+// answer: kind "answer" (spoken when voice is on), "refused" (shown, never spoken) or "problem".
+async function startWatch(names, reply) {
+  if (watching) watchAnswered(watching, "A newer request replaced this one.", "problem");
+  const mine = { ...reply, names: null, fromPoll: Infinity, timer: 0 };
+  watching = mine;
+  const before = [...watchList];
+  const all = [...before];
+  for (const name of names) if (!all.some((other) => sameName(other, name))) all.push(name);
+  let result = null;
+  try {
+    result = await sendWatchList(all);
+  } catch (error) {
+    result = null;
+  }
+  if (watching !== mine) return;           // replaced meanwhile
+  if (!result) {
+    watchAnswered(mine, "Program not running: the watch could not be started.", "problem");
+    return;
+  }
+  const { response, data } = result;
+  if (response.status === 400 && data && typeof data.error === "string") {
+    watchAnswered(mine, data.error, "refused");
+    return;
+  }
+  if (!response.ok || !data || data.ok !== true || !Array.isArray(data.names)) {
+    watchAnswered(mine, errorText(data, response, "Please try again."), "problem");
+    return;
+  }
+  // The names this request is about, as the status shows them (a person's as enrolled).
+  const shown = data.names.map(asText);
+  const added = shown.filter((name) => !before.some((other) => sameName(other, name)));
+  const asked = shown.filter((name) => names.some((typed) => sameName(typed, name)));
+  mine.names = added.length ? added : asked.length ? asked : shown.slice(-names.length);
+  mine.fromPoll = pollCount + 1;           // only a status asked for after the server took the list
+  mine.timer = setTimeout(() => watchTimedOut(mine), FIND_WAIT_MS);
+  if (mine.started) mine.started();
+}
+
+// One status for this page's own request: answer once none of its names is getting ready (or
+// at once while the camera is off: nothing is judged then).
+function followWatch(status, number) {
+  const mine = watching;
+  if (!mine || mine.names === null || number < mine.fromPoll) return;
+  const entries = mine.names.map((name) => watchNow.names.find((entry) => sameName(entry.name, name)) || null);
+  if (entries.some((entry) => entry === null)) {
+    watchAnswered(mine, "The watch was changed on another page.", "problem");
+    return;
+  }
+  const cameraOff = isRecord(status.camera) && status.camera.on === false;
+  if (!cameraOff && entries.some((entry) => entry.state === "loading")) return;
+  watchAnswered(mine, watchSentences(entries, status), "answer");
+}
+
+// Still getting ready after FIND_WAIT_MS (the finder's first load): answer as for a thing not in view.
+function watchTimedOut(mine) {
+  if (watching !== mine) return;
+  const entries = mine.names.map((name) => {
+    const entry = watchNow.names.find((other) => sameName(other.name, name));
+    return { name, state: "watching", inView: false, person: Boolean(entry && entry.person) };
+  });
+  watchAnswered(mine, watchSentences(entries, null), "answer");
+}
+
+function watchAnswered(mine, text, kind) {
+  clearTimeout(mine.timer);
+  if (watching === mine) watching = null;
+  mine.deliver(text, kind);
+}
+
+// "I'll tell you when I see a bottle." / "A bottle is in view right now, on the left. I'll tell
+// you when it appears again." A person: "I'll tell you when I see Mohamed Adel." (no "a").
+function watchSentences(entries, status) {
+  const there = entries.filter((entry) => entry.state === "watching" && entry.inView);
+  const later = entries.filter((entry) => ["watching", "loading"].includes(entry.state) && !entry.inView);
+  const waiting = entries.filter((entry) => entry.state === "waiting");
+  const failed = entries.filter((entry) => entry.state === "failed");
+  const parts = there.map((entry) => {
+    const place = status ? placeInView(status, entry) : "";
+    return capitalised(isInView(entry)) + " in view right now" + (place ? ", " + placeWords(place) : "") + ".";
+  });
+  if (there.length) parts.push("I'll tell you when " + appearsAgain(there) + " again.");
+  if (later.length) parts.push("I'll tell you when I see " + joinWith(later.map(watchedThing), "or") + ".");
+  if (waiting.length) parts.push("I'll watch for " + joinWith(waiting.map(watchedThing), "and") + " as soon as the finder has room.");
+  if (failed.length) parts.push("I can't watch for " + joinWith(failed.map(watchedThing), "or") + ": the finder could not start.");
+  return parts.join(" ");
+}
+
+const watchedThing = (entry) => (entry.person ? entry.name : anyOf(entry.name));   // "a bottle", "any keys"
+
+// "a bottle is", "some keys are", "Mohamed Adel is"
+function isInView(entry) {
+  if (entry.person) return entry.name + " is";
+  return looksPlural(entry.name) ? "some " + entry.name + " are" : anyOf(entry.name) + " is";
+}
+
+// "it appears", "they appear", "Mohamed Adel appears"
+function appearsAgain(entries) {
+  if (entries.length > 1 || (looksPlural(entries[0].name) && !entries[0].person)) return "they appear";
+  return entries[0].person ? entries[0].name + " appears" : "it appears";
+}
+
+// Where a watched thing in view is: the third of the picture its surest pill's box is in, or "".
+function placeInView(status, entry) {
+  const mine = asList(status.objects).filter(isRecord).filter((thing) =>
+    sameName(asText(entry.person ? thing.name : thing.label), entry.name));
+  if (!mine.length) return "";
+  const best = mine.reduce((a, b) => (Number(b.confidence) > Number(a.confidence) ? b : a));
+  const box = asList(best.box).map(Number);
+  if (box.length !== 4 || !box.every(Number.isFinite)) return "";
+  const middle = (box[0] + box[2]) / 2;
+  return middle < 1 / 3 ? "left" : middle < 2 / 3 ? "middle" : "right";
+}
+
+// "Stop watching": everything. The answer goes where the request came from.
+async function stopWatching(reply) {
+  if (watching) watchAnswered(watching, "The watch was stopped.", "problem");
+  const had = watchList.length > 0;
+  try {
+    const { response, data } = await sendWatchList([]);
+    if (!response.ok || !data || data.ok !== true) {
+      reply.deliver(errorText(data, response, "Please try again."), "problem");
+      return;
+    }
+  } catch (error) {
+    reply.deliver("Program not running: the watch could not be stopped.", "problem");
+    return;
+  }
+  reply.deliver(had ? "I've stopped watching." : "I wasn't watching for anything.", "answer");
+}
+
+// Watch for exactly these names from now on ([] stops): this page's list changes at once, and the
+// server is asked after any change still on its way. Gives { response, data }, or throws offline.
+function sendWatchList(names) {
+  watchList = [...names];
+  watchSending += 1;
+  const sending = watchSent.then(() => (names.length ? postJson("/api/watch", { names }) : sendJson("DELETE", "/api/watch")));
+  watchSent = sending.catch(() => null);
+  return sending.finally(() => {
+    watchSending -= 1;
+    if (!watchSending) watchListFrom = pollCount + 1;   // the server's list counts again from the next status
+  });
+}
+
+// The chat field, its microphone, the stage microphone and conversation mode (through sendChat).
+function watchFromChat(question, request) {
+  addMessage("question", question);
+  input.value = "";
+  setBusy(true);
+  const thinking = addThinking("Getting ready");
+  const reply = {
+    deliver: (text, kind) => {
+      thinking.remove();
+      setBusy(false);
+      addMessage(kind === "problem" ? "error" : "answer", text);
+      // Spoken when voice is on; a conversation speaks it and goes on. A refusal is never spoken.
+      answerArrived("chat", text, kind === "problem", kind === "refused");
+      input.focus({ preventScroll: true });
+    },
+  };
+  if (request.stop) stopWatching(reply);
+  else startWatch(request.names, reply);
+}
+
+// The bell beside Find: watch for the names typed in the field; the answer is shown in the caption.
+finderWatch.addEventListener("click", () => {
+  const text = finderText.value.trim();
+  if (!text) {
+    finderText.focus({ preventScroll: true });
+    return;
+  }
+  const question = "Watch for " + text;
+  showCaption(question, "Getting ready ...", false, CAPTION_WAIT_MS);
+  captionWait = { where: "stage", question };
+  startWatch(typedNames(text), {
+    started: () => {
+      if (finderText.value.trim() === text) finderText.value = "";   // taken: the chips show it now
+    },
+    deliver: (answer, kind) => answerArrived("stage", answer, kind === "problem", kind === "refused"),
+  });
 });
 
 // ---- auto-discover: a small hosted model names what is in view ---------------------------
@@ -7203,7 +7752,7 @@ function readMoment(raw) {
   if (!raw || typeof raw !== "object" || !Number.isSafeInteger(raw.id) || raw.id < 1) return null;
   const first = Number(raw.first_seen), last = Number(raw.last_seen);
   if (!Number.isFinite(first) || !Number.isFinite(last)) return null;
-  const kind = raw.kind === "person" ? "person" : "object";
+  const kind = ["person", "watch"].includes(raw.kind) ? raw.kind : "object";   // "watch": a watched thing appeared
   return { id: raw.id, kind, label: asText(raw.label), name: raw.name == null ? "" : asText(raw.name),
            first, last, place: asText(raw.place), picture: kind === "object" && raw.has_picture === true };
 }
@@ -7235,20 +7784,34 @@ function howLong(seconds) {
   return countOf(seconds / 3600, "hour");
 }
 
-// "seen 3 minutes ago · in view for 2 minutes · on the left"
+// "seen 3 minutes ago · in view for 2 minutes · on the left"; a watched thing that appeared:
+// "at 10:42 · 3 minutes ago"
 function momentDetail(moment, now) {
+  if (moment.kind === "watch") {
+    const clock = new Date(moment.last * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+    return "at " + clock + " · " + timeAgo(now - moment.last);
+  }
   return "seen " + timeAgo(now - moment.last) + " · in view for " + howLong(moment.last - moment.first) +
          " · " + placeWords(moment.place);
 }
 
-const momentName = (moment) => (moment.kind === "person" ? moment.name || "Unrecognised person" : moment.label);
+// "Bottle appeared, on the left" for a watched thing (a person by their name).
+function momentName(moment) {
+  if (moment.kind === "watch") return capitalised(moment.name || moment.label) + " appeared, " + placeWords(moment.place);
+  return moment.kind === "person" ? moment.name || "Unrecognised person" : moment.label;
+}
 
-// A row: the small picture (objects only) or a letter in its place, the name and one line of detail.
+// A row: the small picture (objects only), a small bell (a watched thing appeared) or a letter in
+// its place, the name and one line of detail.
 function momentItem(moment) {
   const item = make("li", "moment");
   const address = moment.picture ? pictureAddress(moment.id) : null;
   let face;
-  if (address) {
+  if (moment.kind === "watch") {
+    face = make("span", "moment-mark");
+    face.append(bell());
+    face.setAttribute("aria-hidden", "true");
+  } else if (address) {
     face = make("img", "moment-picture");
     face.alt = "";                     // the name stands beside it
     face.loading = "lazy";

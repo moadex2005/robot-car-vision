@@ -103,6 +103,15 @@ detector after the visitor's own names, 6 in all, through the same rounds
 as a search. Their finds are marked "discovered", never "found", and are
 drawn like everyday ones.
 
+Watching for things (watch(), M25): "tell me when a bottle appears". A watched
+name is in view when the everyday detector sees it (one of its labels), when
+that person's face is recognised (an enrolled person's name), or when the open
+detector surely finds it (any other name: given to it after the visitor's own
+names and before discovered ones). It appears when it has been in view for
+APPEAR_SECONDS after it was away (see Watcher). Each appearance is one event in
+status()["watch"] and one entry in the memory. Nothing about a watch is spoken,
+and no reaction is made of it.
+
 The memory (memory.SightingLog): every tracked thing of every processed frame
 is told to the sighting log, which decides what is worth keeping. A small
 picture is cut for an object only now and then (PictureTimer), never for a
@@ -205,6 +214,7 @@ HINT_CAMERA_OFF = "Cancelled: the camera was switched off"
 
 MOST_NAMES = 6                           # search(): at most this many names at once ...
 LONGEST_NAME = 40                        # ... each at most this many characters
+TOO_MANY_NAMES = "Look for at most {} things at once."
 NAME_MARKS = " -'’"                 # besides letters and digits: space, hyphen, apostrophes (' and ’)
 NAMED_ID_OFFSET = 100_000                # named track numbers are kept apart from the everyday ones
 NAMED_HOLD_SECONDS = 1.0                 # a named find stays on screen this long without being seen again
@@ -252,6 +262,12 @@ EVERYDAY_VARIANTS = frozenset({
     "plant", "houseplant", "purse", "bag", "ball", "doughnut", "fridge", "remote control",
     "computer mouse", "laptop computer", "mug", "hair dryer", "teddy", "glass", "notebook computer",
 })
+
+# Watching for things (M25): a quiet event when a watched thing comes into view.
+APPEAR_SECONDS = 1.0                     # a watched thing appears once in view this long after being away
+MOST_EVENTS = 10                         # status()["watch"]["events"] keeps the newest this many
+START_AWAY_SECONDS = 3.0                 # a thing there at the start is announced once away this long, then back
+TOO_MANY_WATCHED = "Watch for at most {} things at once."
 
 MEMORY_SHARE_SECONDS = 5.0               # the memory's summary goes into the WorldState this often
 PICTURE_EVERY_SECONDS = 5.0              # the sighting log is given a new picture of a thing at most this often
@@ -358,6 +374,8 @@ class Search:
     # How each own name is shown, fixed when the visitor searched: enrolling someone later may
     # change how a name is answered, never its text (the page knows the search by it).
     shown: tuple[str, ...] = ()
+    watched: tuple[str, ...] = ()      # watched names given to the open detector after the own ones (M25)
+    watch_ready: bool = False          # the watched names were ready already (only discovered ones changed)
 
     @property
     def object_names(self) -> tuple[str, ...]:
@@ -367,8 +385,8 @@ class Search:
 
     @property
     def finder_names(self) -> tuple[str, ...]:
-        """Every name the open detector is given: the own ones first."""
-        return self.object_names + self.discovered
+        """Every name the open detector is given: the own ones first, then the watched, then the discovered."""
+        return self.object_names + self.watched + self.discovered
 
 
 @dataclass(frozen=True)
@@ -379,6 +397,28 @@ class Discovery:
     state: str = "off"                 # "off", "looking" or "paused"
     note: str = ""                     # why it is paused, in plain words
     round: int = 0                     # goes up with every discover(); a look thread of an older round ends
+
+
+@dataclass(frozen=True)
+class Watch:
+    """The things to watch for (watch()). Replaced as a whole, under the pipeline's lock."""
+
+    names: tuple[str, ...] = ()            # as cleaned (clean_names)
+    people: tuple[PersonName, ...] = ()    # the names that are enrolled people's: their faces answer them
+    shown: tuple[str, ...] = ()            # how each name is shown: a person's name as enrolled
+
+    def person(self, name: str) -> PersonName | None:
+        """The person a watched name means, or None for a thing."""
+        return next((person for person in self.people if person.typed == name), None)
+
+    def text(self, name: str) -> str:
+        """How a watched name is shown, e.g. "bottle" or "Mohamed Adel"."""
+        return self.shown[self.names.index(name)] if name in self.names else name
+
+    @property
+    def finder_names(self) -> tuple[str, ...]:
+        """The names only the open detector can answer: not people's, not everyday labels."""
+        return tuple(name for name in self.names if self.person(name) is None and not everyday_label(name))
 
 
 @dataclass(frozen=True)
@@ -479,6 +519,8 @@ class Pipeline:
         if self.look_picture_width < 32:
             raise ConfigError("lookout.picture_width must be 32 pixels or more")
         self.look_budget = float(require(self._lookout_settings, "daily_budget_usd", (int, float)))
+        # Watching for things (M25): read here, so a wrong setting shows before the models load.
+        watch_most, watch_again_after = watch_settings(section(config, "watch"))
 
         self._notes: list[str] = []
         self._recognition_off = RECOGNITION_OFF
@@ -541,6 +583,17 @@ class Pipeline:
         self._open_lock = threading.Lock()     # held by whoever uses the open detector (see the module docstring)
 
         self._discovery = Discovery()          # auto-discover, under self._lock
+        # Watching for things (M25). Under self._lock: the list, what the loop last decided, the events.
+        self.watch_most: int = watch_most      # watch.max_names
+        self._watch = Watch()
+        self._watch_seen: dict[str, bool] = {}     # judged name -> in view, from the last frame shown
+        self._watch_events: list[dict[str, Any]] = []   # the newest MOST_EVENTS events, oldest first
+        self._watch_last_at: dict[str, float] = {}  # name -> wall-clock time of its last event
+        self._watch_count = 0                  # events so far in this run: the next event's id is one more
+        # Only the loop thread uses these.
+        self._watcher = Watcher(watch_again_after)
+        self._finder_looked: set[str] = set()  # names (folded) the open detector looked for in this round
+        self._looked_round = 0                 # ... that round
         self._discovered_names: dict[str, tuple[float, int]] = {}   # name -> (last mentioned, its place in that look)
         self._look_lock = threading.Lock()     # one look thread talks to the lookout at a time
 
@@ -748,6 +801,8 @@ class Pipeline:
             discovery, discovered_names = self._discovery, self._discovered_list_locked()
             codes, code_frame_size = self._shown_codes
             view = self._view
+            watch, watch_seen = self._watch, dict(self._watch_seen)
+            watch_events, watch_last_at = list(self._watch_events), dict(self._watch_last_at)
         on_person, maybes = (view.on_person, view.maybes) if view is not None else ((), ())
         # While the stream is down nothing new is seen, so old sightings are left out,
         # and so is everything seen by the camera used before the last switch.
@@ -775,6 +830,7 @@ class Pipeline:
             "error": error,
             "search": search_status(search, found, snapshot.frame_size[0], bool(looked and fresh),
                                     maybes, people_seen),
+            "watch": watch_status(watch, search, watch_seen, fresh, camera_on, watch_events, watch_last_at),
             "discover": self._discover_status(discovery, discovered_names, search),
         }
 
@@ -824,6 +880,23 @@ class Pipeline:
         self._prepare_in_background(finder)
         if on:
             threading.Thread(target=self._look_now_and_then, args=(work,), name="lookout", daemon=True).start()
+
+    def watch(self, names: Sequence[str]) -> None:
+        """Watch for these things from now on (it replaces the list); [] stops watching.
+
+        The names are checked as search() checks them, with at most
+        watch.max_names; anything else raises ValueError with a plain message.
+        An enrolled person's name is allowed (their face answers it) and shown as
+        enrolled. Returns at once: the loop decides on each frame what is in view
+        and what appeared (status()["watch"]). A name only the open detector can
+        answer starts a finder round, as a search does.
+        """
+        wanted = clean_names(names, self.watch_most, TOO_MANY_WATCHED)
+        with self._lock:
+            self._watch = watch_of(wanted, self._enrolled_people())
+            work = self._new_finder_round_locked(self._search.names, self._discovered_list_locked())
+        log.info("Watching for %d thing(s)", len(wanted))     # the names themselves stay off the log
+        self._prepare_in_background(work)
 
     def sightings(self) -> SightingLog | None:
         """The camera's memory, for the web routes; None when the memory is off."""
@@ -990,22 +1063,26 @@ class Pipeline:
         None when there is nothing to prepare.
         """
         old = self._search
+        # Watched names come after the own ones and before the discovered ones, 6 in all (M25).
+        watched = names_after(own, self._watch.finder_names)
         # The order of names already given is kept, so the open detector is not set again
         # (and its tracks restarted) just because the lookout named things in another order.
-        extra = in_earlier_order(names_after(own, discovered), old.discovered)
+        extra = in_earlier_order(names_after(own + watched, discovered), old.discovered)
         people = people_among(own, self._enrolled_people())
-        if not always and (own, extra, people) == (old.names, old.discovered, old.people):
+        if not always and (own, watched, extra, people) == (old.names, old.watched, old.discovered, old.people):
             return None
-        new = Search(own, "off", "", old.round + 1, extra, people=people)
+        new = Search(own, "off", "", old.round + 1, extra, people=people, watched=watched)
         keep_text = not always and own == old.names and len(old.shown) == len(own)
         new = replace(new, shown=old.shown if keep_text else tuple(text_of(new, name) for name in own))
         objects = new.object_names
         # People's names alone need no open detector: such a search is ready at once.
         own_ready = bool(own) and (not objects or (objects == old.object_names and (
             old.state == "ready" or (old.state == "loading" and old.own_ready))))
+        watch_ready = bool(watched) and watched == old.watched and (
+            old.state == "ready" or (old.state == "loading" and old.watch_ready))
         finder = new.finder_names
         state = "loading" if finder else ("ready" if own else "off")
-        self._search = replace(new, state=state, own_ready=own_ready)
+        self._search = replace(new, state=state, own_ready=own_ready, watch_ready=watch_ready)
         self._drop_finds_not_wanted_locked(finder)
         return self._search.round if finder else None
 
@@ -1024,6 +1101,7 @@ class Pipeline:
         """After enrolling: the next frame answers the own names with the new list of people."""
         with self._lock:
             objects = self._search.object_names
+            self._watch = with_new_people(self._watch, self._enrolled_people())    # a watched name may be a person now
             work = self._new_finder_round_locked(self._search.names, self._search.discovered)
             if self._search.object_names != objects:
                 self._looked_for = None         # a name went back to the finder: the page waits until it looked
@@ -1545,6 +1623,7 @@ class Pipeline:
         self._everyday_epoch += 1
         self._view = None
         self._found = self._discovered = ()
+        self._watch_seen = {}                   # the new picture is watched afresh (the list is kept)
         self._shown_codes = ((), (0, 0))
         self._looked_for = None                 # the finder has not looked at the new camera yet
         self._error = None
@@ -1596,6 +1675,7 @@ class Pipeline:
         self._frame_size = None
         self._forget_named_finds()
         self._forget_codes()
+        self._watch_afresh()
         if self._last_drawn is not None and self._drawn_from != generation:
             self._last_drawn = np.full_like(self._last_drawn, DARK_LEVEL)
             self._drawn_from = generation
@@ -1623,11 +1703,11 @@ class Pipeline:
             self._memory.remember(check.faces, detections, now)
             self._take_photo_if_ready(frame, check.boxes, now, generation)
         faces = self._memory.current(detections, now)
-        shown, named, looked = self._add_named_finds(frame, detections, faces, search, now)
-        looked = looked or (bool(search.names) and not search.object_names)   # people's names: the faces answer
-        # The visitor's own finds stand out in yellow; discovered ones are drawn like everyday ones.
+        shown, named, finder_ran = self._add_named_finds(frame, detections, faces, search, now)
+        looked = finder_ran or (bool(search.names) and not search.object_names)   # people's names: the faces answer
+        # The visitor's own finds stand out in yellow; discovered (and watched) ones are drawn like everyday ones.
         found = tuple(find for find in named if label_among(find.label, search.names))
-        discovered = tuple(find for find in named if not label_among(find.label, search.names))
+        discovered = tuple(find for find in named if label_among(find.label, search.discovered))
         maybes = tuple(find for find in found if not is_sure(find, self.sure_confidence, self._sure_tracks))
         on_people = tuple(find for find in named if self._guard.on_a_person(find, now))
         codes = self._codes_to_show(frame, index, now)
@@ -1662,6 +1742,7 @@ class Pipeline:
             phone_not_heard = self._picture is None
         self._remember(frame, shown, faces, named, memory_epochs, untold=maybes + on_people,
                        people=self._guard.recent_boxes(now))
+        self._watch_for_things(detections, faces, named, maybes, search, finder_ran, generation, width, now)
         self._last_drawn = drawn
         self._drawn_from = generation
         came_back = self._lost_line is not None and index > 0    # this camera had dropped out and returned
@@ -1705,6 +1786,7 @@ class Pipeline:
             self._memory = FaceMemory()
             self._forget_named_finds()              # their boxes are in the old size's pixels too
             self._forget_codes()                    # ... and so are the codes'
+            self._watch_afresh()                    # what is in view at first in the new size did not appear
             with self._lock:
                 self._epoch += 1
                 self._everyday_epoch += 1
@@ -1729,6 +1811,8 @@ class Pipeline:
             return detections, (), False
         if self._named.search_round != search.round:
             self._named_tick = 0                    # a new list of names runs on its first ready frame
+        if search.state == "loading" and search.own_ready:
+            self._named = held_own_finds(self._named, search.names, now)
         fresh = self._detect_named(frame, search)
         shown, self._named = merge_named(detections, self._named, fresh, search.round, now, names,
                                          own=search.names, sure=self.sure_confidence, sure_tracks=self._sure_tracks,
@@ -1772,6 +1856,78 @@ class Pipeline:
         self._sure_tracks = set()
         self._named_tick = 0
         self._open_tracks_stale = True
+
+    # ---- watching for things (the loop thread) ----
+    #
+    # watch() only swaps the list under the lock. Everything else is decided here, from each
+    # frame's results: which watched things are in view, and which of them appeared (Watcher).
+    # Each appearance becomes one event in status()["watch"] and one entry in the memory.
+    # Nothing is spoken and no reaction is made of it: the page shows a quiet notice.
+
+    def _watch_for_things(self, detections: Sequence[Detection], faces: Sequence[RecognizedFace],
+                          named: Sequence[Detection], maybes: Sequence[Detection], search: Search,
+                          finder_ran: bool, generation: int, width: int, now: float) -> None:
+        """Decide for this frame which watched things are in view and which of them appeared."""
+        with self._lock:
+            watch = self._watch
+        self._watcher.keep(watch.names)
+        looked = self._finder_looked_for(search, finder_ran)
+        people = people_in_view(watch.people, detections, faces)
+        appeared = []
+        for name in watch.names:
+            judged, place = watched_place(name, watch, search, looked, detections, people, named, maybes, width)
+            if judged and self._watcher.look(name, place is not None, now):
+                appeared.append((name, place))
+        self._publish_watch(watch, appeared, generation, now)
+
+    def _finder_looked_for(self, search: Search, finder_ran: bool) -> set[str]:
+        """The names (folded) the open detector has looked for in this search round and picture.
+
+        A finder name is judged only after that: while the open detector loads or
+        is given new names, its things are neither in view nor away.
+        """
+        if search.round != self._looked_round:
+            self._looked_round, self._finder_looked = search.round, set()
+        if finder_ran:
+            self._finder_looked |= {name.casefold() for name in search.finder_names}
+        return self._finder_looked
+
+    def _publish_watch(self, watch: Watch, appeared: Sequence[tuple[str, str]], generation: int,
+                       now: float) -> None:
+        """Put what was decided into the status, and tell the memory about each event once."""
+        wall_clock = time.time()
+        events = []
+        with self._lock:
+            if self._generation != generation:
+                return                              # another camera meanwhile: it is watched afresh
+            self._watch_seen = {name: self._watcher.in_view(name, now)
+                                for name in watch.names if self._watcher.judged(name)}
+            for name, place in appeared:
+                self._watch_count += 1
+                events.append({"id": self._watch_count, "name": watch.text(name), "place": place,
+                               "at": wall_clock, "person": watch.person(name) is not None})
+                self._watch_last_at[name] = wall_clock
+            self._watch_events = (self._watch_events + events)[-MOST_EVENTS:]
+        for event in events:
+            log.info("Watch event %d: a watched thing appeared", event["id"])   # its name stays off the log
+            self._remember_appeared(event)
+
+    def _remember_appeared(self, event: dict[str, Any]) -> None:
+        """Tell the memory that a watched thing appeared (never with a picture). Errors are logged once."""
+        if self._sightings is None:
+            return
+        label, name = ("person", event["name"]) if event["person"] else (event["name"], None)
+        try:
+            self._sightings.appeared(label, event["place"], event["at"], name)
+        except Exception:
+            self._memory_error("Telling the memory that a watched thing appeared failed")
+
+    def _watch_afresh(self) -> None:
+        """A new camera or frame size: what is in view at first did not appear (see Watcher)."""
+        self._watcher.start_afresh()
+        self._finder_looked = set()
+        with self._lock:
+            self._watch_seen = {}
 
     # ---- codes (the loop thread) -------------------------------------------------
     #
@@ -1855,17 +2011,23 @@ class Pipeline:
                 sightings.seen(key, "person" if person else "object", detection.label,
                                self._person_card(face).name if face is not None else None,
                                place_of(detection.box, width), float(detection.confidence), wall_clock,
-                               None if no_picture else self._picture_for(key, detection.box, frame, now))
+                               None if no_picture else self._picture_for(key, detection.box, frame, now, faces))
             if self._pictures is not None:
                 self._pictures.forget_old(now)
         except Exception:
             self._memory_error("Telling the memory what was seen failed")
 
-    def _picture_for(self, key: Hashable, box: Box, frame: np.ndarray, now: float) -> bytes | None:
-        """A small JPEG of the thing for the sighting log, when one is due (see PictureTimer); else None."""
+    def _picture_for(self, key: Hashable, box: Box, frame: np.ndarray, now: float,
+                     faces: Sequence[RecognizedFace] = ()) -> bytes | None:
+        """A small JPEG of the thing for the sighting log, when one is due (see PictureTimer); else None.
+
+        Every face of the view in it is covered with grey first (cover_faces), so a kept
+        picture never shows a face: a phone held beside a cheek shows the phone only.
+        """
         if self._pictures is None or box_area(box) == 0 or not self._pictures.due(key, now):
             return None
-        return self._encode(shrunk(cut_out(frame, box), PICTURE_MAX_SIDE))
+        covered = cover_faces(frame, [face.box for face in faces])
+        return self._encode(shrunk(cut_out(covered, box), PICTURE_MAX_SIDE))
 
     def _tick_memory(self) -> None:
         """On every turn of the loop, also with nothing in view: the log's periodic work (writing)."""
@@ -2191,12 +2353,13 @@ def codes_in_view(codes: Sequence[Code], size: tuple[int, int]) -> list[dict[str
 # ---- looking for things by name --------------------------------------------------------
 
 
-def clean_names(names: Sequence[str]) -> tuple[str, ...]:
+def clean_names(names: Sequence[str], most: int = MOST_NAMES, too_many: str = TOO_MANY_NAMES) -> tuple[str, ...]:
     """The names to look for, trimmed, with repeats dropped (in any case); () stops looking.
 
-    Raises ValueError with a plain message for anything but a list of 1 to 6
-    names, each 1 to 40 letters (any script), digits, spaces, hyphens or
-    apostrophes with at least one letter or digit, and none a word for people.
+    Raises ValueError with a plain message for anything but a list of 1 to `most`
+    names (6 for a search), each 1 to 40 letters (any script), digits, spaces,
+    hyphens or apostrophes with at least one letter or digit, and none a word
+    for people. `too_many` is the message for too many, with {} for `most`.
     """
     if isinstance(names, str) or not isinstance(names, Sequence):
         raise ValueError("Give the names as a list, like [\"power bank\", \"keys\"].")
@@ -2205,8 +2368,8 @@ def clean_names(names: Sequence[str]) -> tuple[str, ...]:
         name = clean_name(name)
         if all(name.casefold() != other.casefold() for other in kept):
             kept.append(name)
-    if len(kept) > MOST_NAMES:
-        raise ValueError(f"Look for at most {MOST_NAMES} things at once.")
+    if len(kept) > most:
+        raise ValueError(too_many.format(most))
     return tuple(kept)
 
 
@@ -2480,6 +2643,18 @@ def merge_named(everyday: Sequence[Detection], kept: NamedFinds, fresh: Sequence
     return shown + named, NamedFinds(search_round, finds)
 
 
+def held_own_finds(kept: NamedFinds, own: Sequence[str], now: float) -> NamedFinds:
+    """The finds of the visitor's own names, counted as seen now (M25).
+
+    Used while the open detector is given new names (a watch or auto-discover
+    changed them) but the own names stayed the same: the open detector cannot
+    look meanwhile, and the search's answer must hold, so its finds stay until
+    the new round has looked instead of vanishing after NAMED_HOLD_SECONDS.
+    """
+    return replace(kept, finds=tuple((find, now if label_among(find.label, own) else seen_at)
+                                     for find, seen_at in kept.finds))
+
+
 def renewed_finds(earlier: Sequence[tuple[Detection, float]], fresh: Sequence[Detection],
                   now: float) -> tuple[tuple[Detection, float], ...]:
     """The finds after a run: all fresh ones, plus the earlier tracked ones it missed this time.
@@ -2696,6 +2871,175 @@ def wanted_tracks(found: Sequence[Detection], maybes: Sequence[Detection], shown
     people = [shown[index].track_id for index, face in face_owners(shown, faces).items()
               if face.person_id in wanted_people]
     return [track for track in sure + people if track is not None]
+
+
+# ---- watching for things (M25) -----------------------------------------------------------
+#
+# "Tell me when a bottle appears." The Watcher decides on the loop thread when a watched
+# thing appears; the functions around it say what is in view and what the status shows.
+
+
+def watch_settings(settings: dict[str, Any]) -> tuple[int, float]:
+    """(watch.max_names, watch.again_after_seconds), checked. Raises ConfigError when one is wrong."""
+    most = require(settings, "max_names", int)
+    if not 1 <= most <= MOST_NAMES:
+        raise ConfigError(f"watch.max_names must be from 1 to {MOST_NAMES}, got {most}")
+    again_after = float(require(settings, "again_after_seconds", (int, float)))
+    if again_after < 0:
+        raise ConfigError("watch.again_after_seconds must be 0 or more")
+    return most, again_after
+
+
+def everyday_label(name: str) -> bool:
+    """True when the name is one of the everyday detector's own labels, in any case ("Bottle")."""
+    return name.casefold() in EVERYDAY_LABELS
+
+
+def watch_of(names: Sequence[str], enrolled: dict[str, str]) -> Watch:
+    """The Watch for these cleaned names (enrolled: person id -> name as enrolled).
+
+    A name of an enrolled person is shown as enrolled; a second name for the same
+    person ("mohamed" and "Mohamed Adel") is dropped, so nobody is listed twice.
+    """
+    people = people_among(names, enrolled)
+    kept: list[str] = []
+    shown: list[str] = []
+    for name in names:
+        person = next((person for person in people if person.typed == name), None)
+        text = person.shown if person is not None else name
+        if not label_among(text, shown):
+            kept.append(name)
+            shown.append(text)
+    return Watch(tuple(kept), tuple(person for person in people if person.typed in kept), tuple(shown))
+
+
+def with_new_people(watch: Watch, enrolled: dict[str, str]) -> Watch:
+    """The same watch after enrolling: which names are people's is decided again; the texts stay."""
+    return replace(watch, people=people_among(watch.names, enrolled))
+
+
+def watched_place(name: str, watch: Watch, search: Search, looked: Collection[str],
+                  detections: Sequence[Detection], people: dict[str, list[Box]],
+                  named: Sequence[Detection], maybes: Sequence[Detection], width: int) -> tuple[bool, str | None]:
+    """Whether a watched name can be judged on this frame, and its place when it is in view (else None).
+
+    - An enrolled person's name: in view when their face is recognised (`people`, see people_in_view).
+    - An everyday label: in view when the everyday detector sees it.
+    - Any other name: in view when the open detector surely finds it; a maybe never counts, a
+      find on a person does (keys in a hand). It is judged only once the open detector has
+      looked for it in this round (`looked`, folded names); without room it is not judged at all.
+    The place is that of the surest one.
+    """
+    if watch.person(name) is not None:
+        boxes = people.get(name, [])
+        return True, place_of(boxes[0], width) if boxes else None
+    if everyday_label(name):
+        mine = [detection for detection in detections if label_among(detection.label, [name])]
+    elif label_among(name, search.finder_names) and name.casefold() in looked:
+        mine = [find for find in named if label_among(find.label, [name]) and not any(find is m for m in maybes)]
+    else:
+        return False, None
+    if not mine:
+        return True, None
+    return True, place_of(max(mine, key=lambda detection: detection.confidence).box, width)
+
+
+def watch_state(name: str, watch: Watch, search: Search, judged: bool) -> str:
+    """One watched name's state: "watching", "loading", "waiting" (no room in the open
+    detector) or "failed". "loading" also until the loop has judged it once (`judged`)."""
+    if watch.person(name) is not None or everyday_label(name):
+        state = "ready"
+    elif label_among(name, search.names):
+        state = own_state(search)                   # the visitor searches for it too
+    elif label_among(name, search.watched):
+        state = "ready" if search.state == "loading" and search.watch_ready else search.state
+    else:
+        return "waiting"
+    if state == "failed":
+        return "failed"
+    return "watching" if state == "ready" and judged else "loading"
+
+
+def watch_status(watch: Watch, search: Search, seen: dict[str, bool], fresh: bool, camera_on: bool,
+                 events: Sequence[dict[str, Any]], last_at: dict[str, float]) -> dict[str, Any]:
+    """status()["watch"]: each watched name with its state, and the newest events, oldest first.
+
+    `seen` is what the loop last decided (judged name -> in view). While the camera
+    is off nothing is judged, so a name is "watching" then, never "getting ready".
+    """
+    names = []
+    for name in watch.names:
+        judged = name in seen or not camera_on
+        names.append({"name": watch.text(name), "state": watch_state(name, watch, search, judged),
+                      "in_view": bool(fresh and camera_on and seen.get(name, False)),
+                      "last_at": last_at.get(name), "person": watch.person(name) is not None})
+    return {"names": names, "events": [dict(event) for event in events]}
+
+
+@dataclass
+class WatchedThing:
+    """What the Watcher knows about one watched name in the present picture (monotonic seconds)."""
+
+    started_at: float                  # its first judged frame
+    since: float | None = None         # when the stretch it is in view now began
+    last_seen: float | None = None     # the last frame it was in view
+    quiet: bool = False                # it appeared: no event until away again_after seconds
+    at_start: bool = False             # it was there at the start: no event until away START_AWAY_SECONDS
+
+
+class Watcher:
+    """Decides when a watched thing appears. Only the loop thread uses it; every time is handed in.
+
+    A thing appears when it has been in view for APPEAR_SECONDS without a break
+    longer than NAMED_HOLD_SECONDS, after not being in view. One event per
+    appearance. After it, the thing stays quiet until it has been out of view
+    for `again_after` seconds, however often it flickers. A thing in view
+    within APPEAR_SECONDS of its first judged frame (when the watch began, or
+    the first second of a new picture) was there already: it gives no event
+    until it has been out of view for START_AWAY_SECONDS (a bottle taken away
+    for a moment and put back is announced then).
+    """
+
+    def __init__(self, again_after: float) -> None:
+        self.again_after = again_after
+        self._things: dict[str, WatchedThing] = {}
+
+    def look(self, name: str, seen: bool, now: float) -> bool:
+        """One judged frame for this name. True when it appeared on this frame."""
+        thing = self._things.setdefault(name, WatchedThing(started_at=now))
+        if not seen:
+            return False
+        away = now - thing.last_seen if thing.last_seen is not None else math.inf
+        if away > NAMED_HOLD_SECONDS:               # back after a real break: a new stretch in view
+            thing.since = now
+            if away >= self.again_after:
+                thing.quiet = False
+            if away >= START_AWAY_SECONDS:
+                thing.at_start = False
+        thing.last_seen = now
+        if thing.since - thing.started_at < APPEAR_SECONDS:
+            thing.at_start = True                   # in view from the start: it did not appear
+        if thing.quiet or thing.at_start or now - thing.since < APPEAR_SECONDS:
+            return False
+        thing.quiet = True
+        return True
+
+    def in_view(self, name: str, now: float) -> bool:
+        """True when the thing was in view within the last NAMED_HOLD_SECONDS."""
+        thing = self._things.get(name)
+        return thing is not None and thing.last_seen is not None and now - thing.last_seen <= NAMED_HOLD_SECONDS
+
+    def judged(self, name: str) -> bool:
+        """True once the name was judged on a frame of the present picture."""
+        return name in self._things
+
+    def keep(self, names: Collection[str]) -> None:
+        """Forget the names no longer watched; a name watched again starts afresh."""
+        self._things = {name: thing for name, thing in self._things.items() if name in names}
+
+    def start_afresh(self) -> None:
+        """A new camera or frame size: every name is judged afresh, as when the watch began."""
+        self._things = {}
 
 
 # ---- what a click points at ----------------------------------------------------------

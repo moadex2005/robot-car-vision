@@ -49,6 +49,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import ipaddress
 import logging
 import math
 import re
@@ -144,6 +145,7 @@ NOT_JSON = 'Send the request as JSON (Content-Type: application/json), with {} w
 OTHER_WEBSITE = "Requests from other websites are refused."
 
 HEAR_PATH = "/api/voice/hear"    # the one changing request that is not JSON: its body is a WAV recording
+WRONG_HOST = "Open this page by its own address, like http://127.0.0.1:5000/, not through another name."
 MAX_RECORDING_BYTES = 2_000_000  # a recording above this is refused before it is read
 SAY_SHAPE = 'Send the text to speak as JSON, like {"text": "Hello."}.'
 HEAR_LANGUAGES = ("en", "ar")
@@ -610,6 +612,37 @@ def own_origin(host_url: str) -> str:
     return host_url.rstrip("/")
 
 
+def host_name(host: str) -> str:
+    """The name in a Host header without its port: "127.0.0.1" for "127.0.0.1:5000",
+    "::1" for "[::1]:5000", "" for a header that cannot be read."""
+    host = host.strip()
+    if host.startswith("["):
+        end = host.find("]")
+        return host[1:end] if end > 0 else ""
+    return host.rsplit(":", 1)[0] if host.count(":") == 1 else host
+
+
+def names_this_computer(host: str, laptop: bool) -> bool:
+    """True when the Host header names this computer by its own address, not by a web name.
+
+    A hostile website can point its own name at 127.0.0.1 (or at this laptop's
+    network address) and so make a browser treat this server as "the same
+    website": the Origin then matches the Host, and the same-origin rule in
+    refusal() is fooled. Such a request always carries the website's name in
+    the Host header. So the page answers only to `localhost` and to a plain
+    address: this computer itself through the laptop's door, and also a
+    private network address through the phone door.
+    """
+    name = host_name(host).lower()
+    if name == "localhost":
+        return True
+    try:
+        address = ipaddress.ip_address(name)
+    except ValueError:
+        return False                              # a web name: never this page's own address
+    return address.is_loopback or (not laptop and address.is_private)
+
+
 def refusal(method: str, path: str, origin: str | None, mimetype: str, host_url: str) -> tuple[str, int] | None:
     """Why a request must be refused, as (message, status), or None when it may go on.
 
@@ -785,8 +818,10 @@ def create_app(pipeline: Any, assistant: Any, camera_file: Path | None = None,
 
     @app.before_request
     def only_this_page() -> Any:
-        """Refuse what another website could send (see refusal). An unknown address or a wrong
-        method is left to Flask, so it still answers 404 or 405."""
+        """Refuse what another website could send (see names_this_computer and refusal). An
+        unknown address or a wrong method is left to Flask, so it still answers 404 or 405."""
+        if not names_this_computer(request.host, from_the_laptop()):
+            return answer(WRONG_HOST, 403)            # every address: the page and the video too
         if request.routing_exception is not None:
             return None
         refused = refusal(request.method, request.path, request.headers.get("Origin"),

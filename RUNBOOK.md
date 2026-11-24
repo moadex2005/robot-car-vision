@@ -33,13 +33,15 @@ The page starts with the laptop camera.
 2. Click an object: after a few seconds the details panel says what it is, with a short description and specifications.
 3. Ask a follow-up in **Ask about this**, like "What is it made of?". The answer is about that object.
 4. A person the camera knows steps in: the page says "Hello" with their name. A click on them shows one line: their name and role.
-5. Type a thing in **Look for** on the video, like `keys`, and press **Find**: it is drawn with a yellow outline of its shape.
+5. Type a thing in **Look for** on the video, like `keys` or `glasses`, and press **Find**: it is drawn with a yellow outline of its shape. Type a known person's name: they are found by their face.
 6. Hold a QR code close to the camera, filling about half the picture: the video marks it. Click its pill under **In view** to read what it says.
 7. Press the eye button on the video: the assistant describes the whole scene in a few sentences.
 8. Press the microphone beside the chat (Edge or Chrome; the browser asks for permission the first time) and ask "Where did you last see the bottle?". To hear the answer, press the speaker button in the top bar: a small box opens with the **Speak the answers** switch.
 9. Scroll down to the **Timeline**: what the camera saw and when, with small pictures of objects, never of people.
 
 The round camera button at the top right of the video turns the camera off. The page then says "Camera off". Press it again to turn the camera on.
+
+More to show if there is time: type `bottle` in **Look for** and press the bell (or say "tell me when a bottle appears"), take the bottle away and bring it back: a quiet notice appears, with no sound. Press **EN** in the top bar to get **ع**: the assistant answers in Arabic.
 
 ## If something fails
 
@@ -51,7 +53,7 @@ The round camera button at the top right of the video turns the camera off. The 
 | The phone does not connect | Same network for both? Type the address exactly as IP Webcam shows it. |
 | The video is slow or late | Close extra tabs of the page. Set **Picture from the phone** to **Automatic**. Switch **Auto-discover** off. |
 | The assistant says it is not available | Check the internet. Check the API key is in `.env`, then start again. |
-| No voice | Open the speaker button, switch on **Speak the answers**, press **Test**. Natural voices need Edge and the internet. |
+| No voice | Open the speaker button, switch on **Speak the answers**, press **Test**. Natural voices need Edge and the internet; in another browser switch on **Hosted voice** there. |
 | A person is not recognised | More light, face the camera, come closer. Take their photos again in **People**. |
 | Look for finds nothing, or the first search is slow | The first search loads a second model: wait a few seconds. Try a plainer word, or move closer. |
 | Everything is stuck | Close the black window. Double-click **Robot Car Vision** again. |
